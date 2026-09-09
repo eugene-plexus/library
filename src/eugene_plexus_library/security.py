@@ -1,6 +1,6 @@
 """Security primitives: token verification and at-rest envelopes.
 
-The library is never the trust root. The watchdog generates the
+The library is never the trust root. The agent generates the
 per-restart HMAC signing key and the install-wide master key (libsodium
 secretbox) and distributes both via env vars
 (`EUGENE_PLEXUS_LIBRARY_AUTH_SIGNING_KEY`,
@@ -13,7 +13,7 @@ secretbox) and distributes both via env vars
     hundred lines of token verification is a cheaper duplication than
     the shared library it would otherwise justify.
   * Secretbox envelope `seal` / `open_envelope` for at-rest encryption
-    of `sensitive` config fields. The wire shape matches the watchdog's
+    of `sensitive` config fields. The wire shape matches the agent's
     `MasterKeyEnvelope` in common.yaml, so an envelope written by one
     component opens in another given the same master key.
 """
@@ -100,7 +100,7 @@ def decode_token(
 @dataclass(frozen=True)
 class Envelope:
     """Canonical shape of an at-rest encrypted secret. Wire-identical
-    to the watchdog's `MasterKeyEnvelope` schema in common.yaml so
+    to the agent's `MasterKeyEnvelope` schema in common.yaml so
     envelopes round-trip across components if both hold the same
     master key."""
 

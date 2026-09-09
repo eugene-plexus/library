@@ -28,8 +28,8 @@ Discovery and guidance are one response on purpose: the moment you are choosing 
 
 - **Not a store.** No managed directory, no content addressing, no blob cache. Model roots are paths you choose, in this component's own config.
 - **Not in the request path.** No inference traffic passes through here. The gateway never calls it.
-- **Not the launcher.** Launching is composed by the caller: read a profile here, then `POST /v1/runtimes` on the [`watchdog`](https://github.com/eugene-plexus/watchdog) with the model's `path` and the profile's `flags`. A profile's field names are `RuntimeSpec`'s field names precisely so that composition is a copy rather than a translation. This service holds no engine knowledge and never calls the watchdog.
-- **Not a validator of engine flags.** It stores `flags` as given. Validation belongs where the curated flag surface lives — the watchdog's engine adapter, when a runtime is actually created. Two validators would mean two copies of engine knowledge and one of them going stale.
+- **Not the launcher.** Launching is composed by the caller: read a profile here, then `POST /v1/runtimes` on the [`agent`](https://github.com/eugene-plexus/agent) with the model's `path` and the profile's `flags`. A profile's field names are `RuntimeSpec`'s field names precisely so that composition is a copy rather than a translation. This service holds no engine knowledge and never calls the agent.
+- **Not a validator of engine flags.** It stores `flags` as given. Validation belongs where the curated flag surface lives — the agent's engine adapter, when a runtime is actually created. Two validators would mean two copies of engine knowledge and one of them going stale.
 
 ## Status
 
@@ -144,7 +144,7 @@ pip install -e ".[dev]"
 python -m eugene_plexus_library
 ```
 
-Binds `127.0.0.1:8082` by default. Under the watchdog the port comes from the topology via `EUGENE_PLEXUS_LIBRARY_BIND_PORT`.
+Binds `127.0.0.1:8082` by default. Under the agent the port comes from the topology via `EUGENE_PLEXUS_LIBRARY_BIND_PORT`.
 
 ### Configuration
 

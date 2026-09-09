@@ -1,8 +1,8 @@
 """Bearer auth: reads take a service token, writes do not.
 
-Verify-only role — the watchdog issues tokens, this component validates
+Verify-only role — the agent issues tokens, this component validates
 them. Tests mint JWTs directly against a known signing key, standing in
-for the watchdog.
+for the agent.
 
 The split under test is the one that matters here: the runtime dashboard
 resolving a `modelPath` back to a library entry arrives with a service
@@ -32,7 +32,7 @@ _JWT_ALG = "HS256"
 
 
 def _issue(*, signing_key: bytes, sub: str, aud: str, ttl_seconds: int = 60) -> str:
-    """Mint a JWT exactly the way the watchdog would."""
+    """Mint a JWT exactly the way the agent would."""
     issued_at = int(time.time())
     claims = {"sub": sub, "aud": aud, "iat": issued_at, "exp": issued_at + ttl_seconds}
     return jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
@@ -162,7 +162,7 @@ def test_an_operator_token_can_write(authed_client: TestClient, operator_token: 
 
 
 def test_no_signing_key_means_auth_disabled(client: TestClient) -> None:
-    """The dev / standalone path. Production spawns via the watchdog
+    """The dev / standalone path. Production spawns via the agent
     always supply the key."""
     assert client.get("/v1/models").status_code == 200
 

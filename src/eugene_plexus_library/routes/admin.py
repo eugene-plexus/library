@@ -32,7 +32,7 @@ async def restart() -> RestartResult:
         scheduled=True,
         delayMs=_EXIT_DELAY_MS,
         message=(
-            f"Process exiting in {_EXIT_DELAY_MS}ms. The watchdog is expected to "
+            f"Process exiting in {_EXIT_DELAY_MS}ms. The agent is expected to "
             "relaunch it; running standalone, relaunch manually."
         ),
     )

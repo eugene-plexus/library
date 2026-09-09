@@ -3,7 +3,7 @@
 The repo id is a **query parameter**, not a path segment. It contains a
 slash and may be one or two segments (`unsloth/Qwen3.8-27B-GGUF`, but
 also `gpt2`), so `%2F` in a path would be mangled by intermediaries —
-and every UI call to this component goes through the watchdog's proxy —
+and every UI call to this component goes through the agent's proxy —
 while `{owner}/{name}` as two parameters cannot address the
 single-segment canonical repos that also exist.
 """

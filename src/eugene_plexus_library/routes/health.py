@@ -26,7 +26,7 @@ async def healthz(request: Request) -> Health:
 
     **No filesystem call happens here.** The answer comes from the last
     scan's per-root results, not from stat'ing the roots on this
-    request. The watchdog polls this endpoint continuously, and a dead
+    request. The agent polls this endpoint continuously, and a dead
     network share is precisely the case where a stat blocks for tens of
     seconds — turning the health probe into the thing that hangs. The
     reported state is therefore "as of the last scan", which is also the

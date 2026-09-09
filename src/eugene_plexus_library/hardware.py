@@ -1,7 +1,7 @@
 """What this host has to spend on a model.
 
 The input to every fit verdict, and the reason the guidance surface
-lives in this component: the watchdog's `HostAccelerator` answers "which
+lives in this component: the agent's `HostAccelerator` answers "which
 engine build do I fetch" and its own description says the
 VRAM-and-quant-fit surface belongs here.
 
@@ -21,7 +21,7 @@ that OOMs, and hiding total conceals what quitting a browser buys back.
 
 `ctypes` on Windows, `/proc/meminfo` on Linux, `sysctl` on macOS, and
 `nvidia-smi` / `rocm-smi` / `xpu-smi` for accelerators. Deliberately not
-`psutil`: the library is `pip install -e`'d into the watchdog's venv so
+`psutil`: the library is `pip install -e`'d into the agent's venv so
 the supervisor can spawn it, and every dependency added here has to be
 added there too — a lesson this project has now learned four times.
 

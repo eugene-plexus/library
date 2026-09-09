@@ -212,9 +212,9 @@ FIELDS: list[ConfigField] = [
 ]
 
 # NOTE on what is NOT in this schema:
-# The bind port. Ports are owned by the watchdog topology and passed to
+# The bind port. Ports are owned by the agent topology and passed to
 # spawned children via EUGENE_PLEXUS_LIBRARY_BIND_PORT. Two sources of
-# truth on a port is the trap where the watchdog spawns at one and the
+# truth on a port is the trap where the agent spawns at one and the
 # component's own config claims another.
 
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}

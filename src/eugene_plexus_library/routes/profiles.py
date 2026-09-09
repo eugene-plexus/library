@@ -1,6 +1,6 @@
 """Profile routes: the per-model launch settings.
 
-Flags are **stored, not validated**. The validator is the watchdog's
+Flags are **stored, not validated**. The validator is the agent's
 engine adapter `flagSchema`, and it runs when a runtime is actually
 created. A profile is allowed to be wrong; the runtime that uses one is
 not, and that is where an unknown flag becomes a 400. Validating in both

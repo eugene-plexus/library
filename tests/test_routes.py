@@ -163,7 +163,7 @@ def test_profile_crud(configured_client: TestClient, models_dir: Path) -> None:
 
 
 def test_flags_are_stored_not_validated(configured_client: TestClient, models_dir: Path) -> None:
-    """The validator is the watchdog's adapter schema, at
+    """The validator is the agent's adapter schema, at
     runtime-creation time. A profile is allowed to be wrong."""
     model_id = _one_model(configured_client, models_dir)
 
@@ -200,10 +200,18 @@ def test_an_unknown_engine_is_rejected_by_the_schema(
     configured_client: TestClient, models_dir: Path
 ) -> None:
     """`EngineKind` is a closed enum: an engine is supported exactly when
-    an adapter exists for it."""
+    an adapter exists for it.
+
+    The value here is deliberately one that will never be an engine. This
+    test used `vllm` until specs 811112b, when M4 made `vllm` real and the
+    profile started being accepted — a passing contract change looking
+    exactly like a broken test. A negative test wants a value the enum
+    cannot grow into, not the next thing on the roadmap.
+    """
     model_id = _one_model(configured_client, models_dir)
     response = configured_client.post(
-        f"/v1/models/{model_id}/profiles", json={"name": "x", "engine": "vllm"}
+        f"/v1/models/{model_id}/profiles",
+        json={"name": "x", "engine": "not_an_engine"},
     )
 
     assert response.status_code == 422

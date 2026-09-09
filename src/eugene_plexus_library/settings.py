@@ -35,13 +35,13 @@ class Settings(BaseSettings):
 
     safe_mode: bool = False
     """Skip the persisted config at startup and run on built-in
-    defaults. Set by the watchdog as EUGENE_PLEXUS_LIBRARY_SAFE_MODE=1
+    defaults. Set by the agent as EUGENE_PLEXUS_LIBRARY_SAFE_MODE=1
     after a boot failed on bad config, so the operator can reach
     /v1/config to fix it. PATCH still writes through to `config_file`,
     so the repair survives the next boot."""
 
     auth_signing_key: str | None = None
-    """Base64 32-byte HMAC key from the watchdog at spawn time. Absent
+    """Base64 32-byte HMAC key from the agent at spawn time. Absent
     means unauthenticated — the dev/standalone path only."""
 
     service_token: str | None = None

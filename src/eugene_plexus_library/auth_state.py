@@ -1,6 +1,6 @@
 """Auth state for the library's verify-only role.
 
-Built once at startup from the env vars the watchdog threads in when it
+Built once at startup from the env vars the agent threads in when it
 spawns this child:
 
   * `EUGENE_PLEXUS_LIBRARY_AUTH_SIGNING_KEY` — base64 of the 32-byte HMAC
@@ -8,7 +8,7 @@ spawns this child:
   * `EUGENE_PLEXUS_LIBRARY_SERVICE_TOKEN` — long-lived JWT
     (`aud: service:library`). Captured but not consumed: the library
     makes no outbound calls to peer components, and deliberately so —
-    it never calls the watchdog, because launching is composed by the
+    it never calls the agent, because launching is composed by the
     caller rather than delegated down here.
   * `EUGENE_PLEXUS_LIBRARY_MASTER_KEY` — base64 of the 32-byte secretbox
     key, for at-rest decryption of `sensitive` config fields. The
@@ -18,7 +18,7 @@ spawns this child:
 
 If `AUTH_SIGNING_KEY` is unset, the library runs in `auth_disabled=True`
 mode: route dependencies short-circuit and let everything through.
-That's the dev/standalone path. Production via the watchdog always
+That's the dev/standalone path. Production via the agent always
 supplies the env var.
 """
 
@@ -47,7 +47,7 @@ class AuthState:
 
     master_key: bytes | None
     """At-rest secretbox key. Only set once the operator has logged in
-    at the watchdog. No config field is `sensitive` yet, so nothing
+    at the agent. No config field is `sensitive` yet, so nothing
     currently uses it; the store is wired for it so M3's HuggingFace
     token needs no plumbing."""
 
@@ -94,7 +94,7 @@ def load_auth_state(
             )
         log.warning(
             "EUGENE_PLEXUS_LIBRARY_AUTH_SIGNING_KEY not set — running unauthenticated "
-            "(dev/standalone mode). Production spawns via watchdog always supply this."
+            "(dev/standalone mode). Production spawns via agent always supply this."
         )
         return AuthState(signing_key=None, service_token=None, master_key=None)
 

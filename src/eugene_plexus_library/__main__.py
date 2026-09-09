@@ -12,10 +12,10 @@ from .app import create_app
 from .config import ConfigStore
 from .settings import load_settings
 
-# Bind port when the watchdog doesn't supply one — i.e. standalone runs.
+# Bind port when the agent doesn't supply one — i.e. standalone runs.
 # Under supervision the topology owns it, which is the only source of
 # truth: a port in this component's own config would be a second one,
-# and the watchdog spawning at 8082 while the config claims 9000 is a
+# and the agent spawning at 8082 while the config claims 9000 is a
 # failure nobody can see from either side.
 _DEFAULT_PORT = 8082
 
