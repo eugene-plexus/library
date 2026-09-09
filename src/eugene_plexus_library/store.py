@@ -1,11 +1,17 @@
-"""Persistent state: the model cache and the profile store.
+"""Persistent state: the model cache, the profile store, and downloads.
 
-Two things live here and they are not equally important.
+Three things live here and they are not equally important.
 
 **Profiles are the only thing this component owns.** They are the
 operator's tuning work — the flags that took an afternoon to get right —
 and nothing on disk can reproduce them. Everything else here is a cache
 of what a scan found and can be rebuilt by scanning again.
+
+**Download records are persisted for one reason:** a 40 GB transfer
+interrupted by a restart has to be resumable, and a record that only
+lived in memory would leave a `.part` file on disk with nothing able to
+continue it. Anything in flight when the process stops comes back
+`paused`, because the transfer that owned it is gone.
 
 That asymmetry decides the behaviour everywhere else:
 
@@ -43,6 +49,8 @@ from pathlib import Path
 from typing import Any
 
 from ._generated.models import (
+    Download,
+    DownloadState,
     LibraryModel,
     ModelFileRole,
     ModelProfile,
@@ -74,6 +82,7 @@ class StateStore:
         self._lock = threading.RLock()
         self._models: dict[str, LibraryModel] = {}
         self._profiles: dict[str, list[ModelProfile]] = {}
+        self._downloads: dict[str, Download] = {}
         self._by_path: dict[str, LibraryModel] = {}
         self._last_scan_at: datetime | None = None
 
@@ -109,6 +118,7 @@ class StateStore:
 
             self._models = {}
             self._profiles = {}
+            self._downloads = {}
             for entry in raw.get("models") or []:
                 try:
                     model = LibraryModel.model_validate(entry)
@@ -126,6 +136,29 @@ class StateStore:
                         log.warning("dropping unreadable profile record: %s", exc)
                 if profiles:
                     self._profiles[model_id] = profiles
+
+            for entry in raw.get("downloads") or []:
+                try:
+                    record = Download.model_validate(entry)
+                except Exception as exc:
+                    log.warning("dropping unreadable download record: %s", exc)
+                    continue
+                # Nothing is transferring: this process just started, so
+                # a record that claims to be in flight is describing a
+                # transfer that died with the last one. `paused` is the
+                # honest state, and it is the one `resume` accepts.
+                if record.state in (
+                    DownloadState.queued,
+                    DownloadState.resolving,
+                    DownloadState.downloading,
+                    DownloadState.verifying,
+                ):
+                    record.state = DownloadState.paused
+                    record.message = (
+                        "paused: the process restarted while this was transferring. "
+                        "The bytes already fetched are still on disk; resume to continue."
+                    )
+                self._downloads[record.id] = record
 
             stamp = raw.get("lastScanAt")
             if isinstance(stamp, str):
@@ -151,6 +184,9 @@ class StateStore:
                 model_id: [p.model_dump(mode="json", exclude_none=True) for p in profiles]
                 for model_id, profiles in self._profiles.items()
             },
+            "downloads": [
+                d.model_dump(mode="json", exclude_none=True) for d in self._downloads.values()
+            ],
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # Same directory so `os.replace` stays on one filesystem and is
@@ -400,3 +436,38 @@ class StateStore:
         for index, profile in enumerate(profiles):
             if profile.id != keep and profile.default:
                 profiles[index] = profile.model_copy(update={"default": False})
+
+    # -- downloads ---------------------------------------------------------
+
+    def list_downloads(self) -> list[Download]:
+        """Every record, live objects included.
+
+        Returned by reference rather than copied, deliberately: the
+        download manager mutates a record's progress fields many times a
+        second, and a snapshot would either be stale or cost a full model
+        copy per chunk written.
+        """
+        with self._lock:
+            return list(self._downloads.values())
+
+    def get_download(self, download_id: str) -> Download | None:
+        with self._lock:
+            return self._downloads.get(download_id)
+
+    def put_download(self, record: Download) -> None:
+        """Insert or update one record and flush the state file.
+
+        Called at phase transitions, not per chunk: writing the state
+        file on every megabyte of a 40 GB transfer would be forty
+        thousand rewrites of a file whose other contents did not change.
+        """
+        with self._lock:
+            self._downloads[record.id] = record
+            self._write_locked()
+
+    def delete_download(self, download_id: str) -> bool:
+        with self._lock:
+            if self._downloads.pop(download_id, None) is None:
+                return False
+            self._write_locked()
+            return True

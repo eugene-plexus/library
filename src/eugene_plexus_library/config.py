@@ -14,9 +14,10 @@ into an add/remove list of directory pickers rather than a text field,
 because asking someone to comma-separate Windows paths is asking for a
 bug report.
 
-No field is `sensitive` yet — model roots are paths, not credentials —
-but the at-rest envelope machinery is wired in anyway so M3's
-HuggingFace token needs no plumbing work.
+`hfToken` is the one `sensitive` field: redacted in `GET`, accepted in
+`PATCH`, and sealed at rest with the master key. That machinery was
+wired in at M2 with nothing using it, precisely so adding this field
+needed no plumbing work.
 """
 
 from __future__ import annotations
@@ -47,6 +48,9 @@ REDACTED = "<redacted>"
 CATEGORY_LABELS: dict[str, str] = {
     "library": "Model library",
     "scanning": "Scanning",
+    "catalogue": "Model catalogue",
+    "downloads": "Downloads",
+    "guidance": "Hardware guidance",
     "logging": "Logging",
 }
 
@@ -95,6 +99,100 @@ FIELDS: list[ConfigField] = [
         category="scanning",
         valueType=ConfigValueType.boolean,
         default=False,
+    ),
+    ConfigField(
+        key="catalogueEnabled",
+        label="Search and download models",
+        description=(
+            "Allow this component to reach the upstream model catalogue "
+            "to search, describe and download models. Turn it off for an "
+            "air-gapped install: nothing outbound is attempted and the "
+            "search screen says so plainly instead of timing out. "
+            "Scanning the directories you already have is unaffected "
+            "either way."
+        ),
+        category="catalogue",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
+        key="catalogueBaseUrl",
+        label="Catalogue address",
+        description=(
+            "Where the catalogue lives. Change this only for a private "
+            "or mirrored hub that speaks the same API — a regional "
+            "mirror, or an enterprise instance. Hardcoding the public "
+            "hub would make this component useless behind either."
+        ),
+        category="catalogue",
+        valueType=ConfigValueType.url,
+        default="https://huggingface.co",
+    ),
+    ConfigField(
+        key="hfToken",
+        label="Catalogue access token",
+        description=(
+            "A token from your account on the catalogue. Needed for "
+            "gated models — the ones whose licence you have to accept on "
+            "their own page — and for private repositories. Worth "
+            "setting even without either: the hub's own response tells "
+            "unauthenticated clients that a token raises the request "
+            "limit and speeds up transfers. Stored encrypted."
+        ),
+        category="catalogue",
+        valueType=ConfigValueType.secret,
+        sensitive=True,
+    ),
+    ConfigField(
+        key="downloadLayout",
+        label="Where downloads land",
+        description=(
+            "How a downloaded file is filed under the model directory "
+            "you picked. `publisher_repo` makes "
+            "`<root>/<publisher>/<repo>/<file>`, which is the layout LM "
+            "Studio uses and the one most people already have. `flat` "
+            "drops the file straight into the root. Either way the file "
+            "keeps its own upstream name — nothing is renamed, hashed, "
+            "or hidden in a cache."
+        ),
+        category="downloads",
+        valueType=ConfigValueType.enum,
+        default="publisher_repo",
+        enumValues=["publisher_repo", "flat"],
+    ),
+    ConfigField(
+        key="maxConcurrentDownloads",
+        label="Downloads at once",
+        description=(
+            "How many transfers run simultaneously. One is the default "
+            "and usually right: two large downloads sharing a connection "
+            "both finish later than one after the other, and the "
+            "progress bar you are watching is the one you started "
+            "first. Raise it if your link is faster than the hub's "
+            "per-connection throughput."
+        ),
+        category="downloads",
+        valueType=ConfigValueType.integer,
+        default=1,
+        minimum=1,
+        maximum=8,
+    ),
+    ConfigField(
+        key="guidanceContextLength",
+        label="Assumed context length",
+        description=(
+            "The context size quant recommendations are calculated at, "
+            "when nothing else says. This is the number that decides "
+            "which quant gets recommended: the KV cache grows linearly "
+            "with it, so a model that fits comfortably at 8k may not fit "
+            "at all at 128k. A config field rather than a constant "
+            "because both answers are correct for different people."
+        ),
+        category="guidance",
+        valueType=ConfigValueType.integer,
+        default=8192,
+        minimum=256,
+        maximum=1048576,
     ),
     ConfigField(
         key="logLevel",
@@ -310,6 +408,37 @@ class ConfigStore:
             log.warning("modelRoots is %s, expected a list; treating as empty", type(raw).__name__)
             return []
         return [Path(item).expanduser() for item in raw if isinstance(item, str) and item.strip()]
+
+    def catalogue_enabled(self) -> bool:
+        return bool(self.get("catalogueEnabled"))
+
+    def catalogue_base_url(self) -> str:
+        value = self.get("catalogueBaseUrl")
+        return value if isinstance(value, str) and value.strip() else "https://huggingface.co"
+
+    def hf_token(self) -> str | None:
+        """The real token, never the redaction.
+
+        `as_document` replaces a sensitive value with the redacted
+        marker for the wire; this reads through to what is actually
+        stored, and is the only path that should.
+        """
+        value = self.get("hfToken")
+        if not isinstance(value, str) or not value.strip() or value == REDACTED:
+            return None
+        return value.strip()
+
+    def download_layout(self) -> str:
+        value = self.get("downloadLayout")
+        return value if value in ("publisher_repo", "flat") else "publisher_repo"
+
+    def max_concurrent_downloads(self) -> int:
+        value = self.get("maxConcurrentDownloads")
+        return value if isinstance(value, int) and value > 0 else 1
+
+    def guidance_context_length(self) -> int:
+        value = self.get("guidanceContextLength")
+        return value if isinstance(value, int) and value > 0 else 8192
 
     def _write_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

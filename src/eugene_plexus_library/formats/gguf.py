@@ -160,6 +160,22 @@ class GgufError(Exception):
     is the only thing they will see explaining a missing model."""
 
 
+class GgufTruncated(GgufError):
+    """The header ran past the end of what was available.
+
+    Distinct from a malformed file, because a remote header read over
+    HTTP Range cannot know the KV block's size in advance: a 1 MB probe
+    of a 248k-vocab model is short by ~10 MB, and that is a signal to
+    fetch more rather than a broken file. `needed` is the offset the
+    parser was reaching for when it ran out, so one more ranged request
+    finishes the job.
+    """
+
+    def __init__(self, message: str, *, needed: int) -> None:
+        super().__init__(message)
+        self.needed = needed
+
+
 def _is_number(value: Any) -> TypeGuard[int | float]:
     """`bool` is an `int` in Python, and a stray `True` in a numeric
     metadata field would otherwise arrive downstream as `1.0`."""
@@ -333,6 +349,20 @@ class _Reader:
     def __init__(self, fh: BinaryIO, path: Path) -> None:
         self._fh = fh
         self._path = path
+        # Measured once, not per skip. The header cannot grow while it
+        # is being read, and re-measuring inside `skip` would cost two
+        # seeks per stepped-over string -- 248,320 of them on a real
+        # large-vocab model, each one discarding the buffered read-ahead
+        # this reader depends on.
+        self._end = fh.seek(0, 2)
+        fh.seek(0)
+        # The offset is tracked here rather than asked of the stream.
+        # `raw` runs once per key, per scalar and per stepped-over
+        # string -- half a million times on a 248k-vocab model -- and a
+        # `tell()` in that loop measurably slowed the whole scan when it
+        # was tried. This is also exact, which a buffered `tell()` after
+        # a short read is not.
+        self._pos = 0
 
     def _fail(self, message: str) -> GgufError:
         return GgufError(f"{self._path.name}: {message}")
@@ -340,7 +370,12 @@ class _Reader:
     def raw(self, count: int) -> bytes:
         data = self._fh.read(count)
         if len(data) != count:
-            raise self._fail(f"truncated: wanted {count} bytes, got {len(data)}")
+            raise GgufTruncated(
+                f"{self._path.name}: truncated: wanted {count} bytes at offset "
+                f"{self._pos}, got {len(data)}",
+                needed=self._pos + count,
+            )
+        self._pos += count
         return data
 
     def scalar(self, tag: int) -> Any:
@@ -358,7 +393,22 @@ class _Reader:
         return self.raw(size).decode("utf-8", errors="replace")
 
     def skip(self, count: int) -> None:
-        self._fh.seek(count, 1)
+        """Step over a value without reading it.
+
+        Bounds-checked rather than a bare relative `seek`: seeking past
+        the end of an in-memory buffer succeeds silently, so a short
+        probe window would surface as a truncation at some later,
+        misleading offset instead of at the array that overran.
+        """
+        target = self._pos + count
+        if target > self._end:
+            raise GgufTruncated(
+                f"{self._path.name}: truncated: wanted to reach offset {target}, "
+                f"stream ends at {self._end}",
+                needed=target,
+            )
+        self._fh.seek(target)
+        self._pos = target
 
     def value(self, tag: int, *, key: str, lengths: dict[str, int]) -> Any:
         if tag == T_STRING:
@@ -389,7 +439,7 @@ class _Reader:
         return None
 
     def tell(self) -> int:
-        return self._fh.tell()
+        return self._pos
 
 
 def read_metadata(path: Path) -> GgufMetadata:
@@ -402,36 +452,50 @@ def read_metadata(path: Path) -> GgufMetadata:
     as a malformed one.
     """
     with path.open("rb") as fh:
-        reader = _Reader(fh, path)
+        return read_metadata_stream(fh, name=path.name)
 
-        magic = reader.raw(4)
-        if magic != MAGIC:
-            raise GgufError(f"{path.name}: not a GGUF file (magic {magic!r})")
 
-        version = int(reader.scalar(T_UINT32))
-        if version < 2 or version > 3:
-            # v1 predates the current KV encoding; anything above 3 does
-            # not exist yet and would be parsed on a guess.
-            raise GgufError(f"{path.name}: unsupported GGUF version {version}")
+def read_metadata_stream(fh: BinaryIO, *, name: str = "<stream>") -> GgufMetadata:
+    """The same parse, over any seekable binary stream.
 
-        tensor_count = reader.length(limit=1 << 32, what="tensor count")
-        kv_count = reader.length(limit=_MAX_KV, what="kv count")
+    Exists so a *remote* header can be read: M3's preflight fetches the
+    first few megabytes of a file over HTTP Range and parses them from a
+    buffer, which is what lets quant guidance be built on
+    `general.file_type` rather than on a filename. A buffer that stops
+    inside the KV block raises `GgufTruncated` carrying the offset it
+    wanted, so the caller fetches exactly that much and retries instead
+    of guessing a window size.
+    """
+    reader = _Reader(fh, Path(name))
 
-        kv: dict[str, Any] = {}
-        lengths: dict[str, int] = {}
-        for _ in range(kv_count):
-            key = reader.string()
-            tag = int(reader.scalar(T_UINT32))
-            kv[key] = reader.value(tag, key=key, lengths=lengths)
+    magic = reader.raw(4)
+    if magic != MAGIC:
+        raise GgufError(f"{name}: not a GGUF file (magic {magic!r})")
 
-        return GgufMetadata(
-            version=version,
-            tensor_count=tensor_count,
-            kv_count=kv_count,
-            header_bytes=reader.tell(),
-            kv=kv,
-            array_lengths=lengths,
-        )
+    version = int(reader.scalar(T_UINT32))
+    if version < 2 or version > 3:
+        # v1 predates the current KV encoding; anything above 3 does
+        # not exist yet and would be parsed on a guess.
+        raise GgufError(f"{name}: unsupported GGUF version {version}")
+
+    tensor_count = reader.length(limit=1 << 32, what="tensor count")
+    kv_count = reader.length(limit=_MAX_KV, what="kv count")
+
+    kv: dict[str, Any] = {}
+    lengths: dict[str, int] = {}
+    for _ in range(kv_count):
+        key = reader.string()
+        tag = int(reader.scalar(T_UINT32))
+        kv[key] = reader.value(tag, key=key, lengths=lengths)
+
+    return GgufMetadata(
+        version=version,
+        tensor_count=tensor_count,
+        kv_count=kv_count,
+        header_bytes=reader.tell(),
+        kv=kv,
+        array_lengths=lengths,
+    )
 
 
 def strip_shard_suffix(stem: str) -> str:

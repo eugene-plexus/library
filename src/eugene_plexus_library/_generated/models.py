@@ -749,10 +749,13 @@ class SkipReason(StrEnum):
       not parse. Reported rather than skipped silently.
     * `unsupported_format` — a model format with no scanner yet.
       MLX is the reserved case.
-    * `incomplete_download` — a partial file from an interrupted
-      download. Reserved for M3, which is when `.part` files start
-      landing in scanned roots; better to have the reason before
-      then than to surface a half-fetched 40 GB model as broken.
+    * `incomplete_download` — a `.part` file from a download that
+      is in flight, paused, or failed. No longer reserved: the
+      downloader writes these into scanned roots by design, and a
+      `paused` download is *expected* to leave one there. The
+      matching `Download` record, if there is one, is what says
+      whether it can be resumed; a `.part` with no record behind it
+      is litter and can be deleted by hand.
 
     """
 
@@ -764,6 +767,390 @@ class SkipReason(StrEnum):
     unreadable_header = 'unreadable_header'
     unsupported_format = 'unsupported_format'
     incomplete_download = 'incomplete_download'
+
+
+class CatalogueSort(StrEnum):
+    """
+    Ordering for a catalogue search. `trending` is upstream's own
+    trending score, which is the closest thing to "what is worth
+    looking at this week" — and, honestly, the ranking most likely
+    to surface a keyword-stuffed finetune above an official release.
+    The index is upstream's; we can filter and describe better than
+    their search page but we cannot fix what it ranks.
+
+    """
+
+    downloads = 'downloads'
+    likes = 'likes'
+    trending = 'trending'
+    modified = 'modified'
+    created = 'created'
+
+
+class GateKind(StrEnum):
+    """
+    Whether upstream restricts the *bytes*. `open` is unrestricted;
+    `auto` needs a token and one click-through on the model page;
+    `manual` needs a human approval that can take days.
+
+    A three-valued enum rather than upstream's own
+    `false | "auto" | "manual"`, which would be a boolean-or-string
+    union in every generated client for no gain. `open` is the
+    normalization of `false`.
+
+    The three cases are distinguished because a gated repo browses
+    perfectly — metadata, file list, sizes and digests are all
+    public — and **only the download 401s.** Warning about it on
+    the detail screen is the difference between a legible
+    prerequisite and a mysterious failure after the operator has
+    chosen a quant and pressed the button.
+
+    """
+
+    open = 'open'
+    auto = 'auto'
+    manual = 'manual'
+
+
+class QuantSource(StrEnum):
+    """
+    **Where the tier came from, and this field is load-bearing.**
+    `filename` at listing time, because the hub exposes no
+    per-file quant and the name is all there is — the very thing
+    a local scan refuses to trust. `metadata` after a preflight
+    has read `general.file_type` over HTTP Range.
+
+    Fit is computed from `sizeBytes`, which is authoritative
+    either way, so a mislabelled file changes what is displayed
+    and never what is promised.
+
+    """
+
+    filename = 'filename'
+    metadata = 'metadata'
+
+
+class CatalogueFile(BaseModel):
+    """
+    One file in an upstream repo, with whatever it can be verified against.
+    """
+
+    path: str = Field(
+        ...,
+        description='Repo-relative path, which is **not** a filename: split\nquants live in subdirectories (`BF16/…-00001-of-00002.gguf`).\nThe download writes the basename.\n',
+    )
+    sizeBytes: int = Field(..., ge=0)
+    sha256: str | None = Field(
+        None,
+        description='Content digest, for the large files — every weight file is\nLFS-backed and carries one. Note that the entry also has a\n40-hex `oid` beside it upstream which is the sha1 of the\n136-byte LFS *pointer*, not of the model: verifying against\nthat passes on any download at all. This field is the real\none.\n',
+    )
+    gitBlobSha1: str | None = Field(
+        None,
+        description='For the small non-LFS files — `config.json`, the tokenizer\nfiles, the safetensors index — which have no content digest\nupstream. They are still verifiable:\n`sha1("blob <len>\\0" + bytes)`, checked exactly against a\nreal repo. Between this and `sha256` every file has\nsomething to check, so nothing is written unverified.\n',
+    )
+    role: ModelFileRole | None = None
+    lfs: bool | None = Field(
+        None,
+        description='Whether upstream stores this through LFS. Decides which\ndigest is present, and also which redirect shape the\ndownload meets — a 302 to a signed CDN URL for LFS, a 307\nto an internal path for the rest, both mandatory to follow.\n',
+    )
+
+
+class CatalogueRecommendation(BaseModel):
+    """
+    Which candidate to take, and why. **The largest one that fully
+    fits at the requested context** — not the largest that runs at
+    all, because partial offload is a decision the operator should
+    make knowingly rather than inherit from a recommendation.
+
+    """
+
+    label: str = Field(..., description="The recommended candidate's `label`.")
+    reason: str = Field(
+        ...,
+        description='Prose, naming the numbers: what fits, at what context,\nagainst how much free memory. Differentiator #6 is "show\n*why*"; a bare recommendation with no arithmetic is the\nthing the source complaint is complaining about.\n',
+    )
+    lowQualityWarning: str | None = Field(
+        None,
+        description='Present when the largest thing that fits is below ~4 bits\nper weight, naming the alternatives — shorter context,\npartial offload, a smaller model. Recommending a 1.81-bpw\nquant without comment is how a first impression becomes\n"this thing is stupid", and the failure is ours rather than\nthe model\'s.\n',
+    )
+
+
+class MatchedOn(StrEnum):
+    """
+    `digest` is certain — the local file's hash was known and
+    matched. `name_and_size` is a strong guess and labelled as
+    one, because the library deliberately never hashes model
+    content (a 40 GB read per scan is not on the table), so for
+    most entries name and size is all there is to compare.
+
+    """
+
+    digest = 'digest'
+    name_and_size = 'name_and_size'
+
+
+class AlreadyOwned(BaseModel):
+    """
+    This candidate is already on the disk. The join only this
+    component can make, since it holds both the catalogue and the
+    library — and it is what stops a 16 GB re-download of a file the
+    operator already has.
+
+    """
+
+    modelId: str = Field(..., description='The local `LibraryModel.id`.')
+    path: str = Field(..., description='Where it already is.')
+    matchedOn: MatchedOn | None = Field(
+        None,
+        description="`digest` is certain — the local file's hash was known and\nmatched. `name_and_size` is a strong guess and labelled as\none, because the library deliberately never hashes model\ncontent (a 40 GB read per scan is not on the table), so for\nmost entries name and size is all there is to compare.\n",
+    )
+
+
+class CatalogueCard(BaseModel):
+    """
+    The model card, as published.
+    """
+
+    repo: str
+    revision: str | None = None
+    markdown: str = Field(
+        ...,
+        description='The README verbatim. **Untrusted content** — written by\nwhoever uploaded the model — so a renderer must not execute\nanything in it and should not follow its links blindly.\n',
+    )
+    frontMatter: dict[str, Any] | None = Field(
+        None,
+        description="The card's YAML front matter as upstream parsed it: license,\nbase model, tags. Structured, so a UI can show the license\nwithout regexing prose.\n",
+    )
+    fetchedAt: AwareDatetime | None = None
+
+
+class DownloadSpec(BaseModel):
+    """
+    What to fetch and where to put it. The file list is explicit
+    rather than inferred from the repo: "download the model" has to
+    mean something exact by the time it reaches the transfer loop,
+    and the catalogue detail response has already grouped the repo
+    into candidates whose `files` can be passed straight through.
+
+    """
+
+    repo: str = Field(..., description='Upstream repo id.')
+    revision: str | None = Field(
+        'main',
+        description='Resolved to a commit at start and pinned for the life of\nthe download, so a resume days later fetches the same bytes\nit began with.\n',
+    )
+    files: list[str] = Field(
+        ...,
+        description='Repo-relative paths. Every shard of a split candidate, the\nprojector if the operator wants vision, and for safetensors\nthe sidecars as well as the weights. Take these from\n`CatalogueCandidate.files` and `CatalogueModel.projectors`.\n',
+        min_length=1,
+    )
+    root: str | None = Field(
+        None,
+        description='Which configured model root to write under. Must be one of\nthem — this component will not write outside the\ndirectories the operator nominated. Defaults to the first,\nwhich is what the `path_list` config type has promised\nsince M2.\n',
+    )
+    subdirectory: str | None = Field(
+        None,
+        description='Relative destination under `root`, overriding the configured\nlayout. Path traversal is rejected; the result must stay\ninside the root.\n',
+    )
+    filename: str | None = Field(
+        None,
+        description='Override the written name of the **single-file** case. Rarely\nwanted: the upstream name is what the operator recognises,\nwhat the library will call it, and what\n`Runtime.modelAlias` defaults to — plainly-named files are\nthe point. Rejected when `files` holds more than one entry,\nbecause renaming one shard of a set breaks the set.\n',
+    )
+
+
+class DownloadState(StrEnum):
+    """
+    Named phases rather than a percentage, following M1's engine
+    install for the same reason: the phases fail differently and the
+    operator needs to know which one they are in. A stall in
+    `downloading` is the network, a stall in `verifying` is the
+    disk, and `verifying` *failing* is the one that means the bytes
+    are wrong.
+
+    * `queued` — accepted, waiting on `maxConcurrentDownloads`.
+    * `resolving` — asking upstream for the commit, sizes and
+      digests. Where a gated repo's 401 surfaces.
+    * `paused` — operator-stopped; the `.part` is kept and shows up
+      in the next scan as `incomplete_download`.
+    * `cancelled` — operator-abandoned; the `.part` is removed.
+    * `failed` — the retry budget is spent. `resume` runs the same
+      loop again.
+
+    """
+
+    queued = 'queued'
+    resolving = 'resolving'
+    downloading = 'downloading'
+    verifying = 'verifying'
+    done = 'done'
+    failed = 'failed'
+    paused = 'paused'
+    cancelled = 'cancelled'
+
+
+class Basis(StrEnum):
+    """
+    `metadata` when the model's own declared shape produced the
+    KV term — a local model, or a remote one after a preflight.
+    `estimate` when only the file size was available, which is
+    every catalogue candidate until someone preflights it.
+
+    The honest distinction between "this is arithmetic" and
+    "this is a guess with a number on it", and the field a UI
+    should hang a "check this file" affordance off.
+
+    """
+
+    metadata = 'metadata'
+    estimate = 'estimate'
+
+
+class FitVerdict(StrEnum):
+    """
+    * `fits` — inside **free** VRAM. Fully offloaded, no host memory
+      in the generation path.
+    * `tight` — inside total VRAM but not free VRAM. It would fit on
+      an idle GPU; something is holding memory right now, and
+      closing it is the operator's call.
+    * `split` — needs host memory as well. Runnable with partial
+      offload, materially slower, and a decision rather than a
+      failure.
+    * `no` — larger than VRAM and RAM together.
+
+    Four values rather than a percentage because a percentage of
+    *what* — VRAM, or VRAM plus RAM? — is precisely the ambiguity
+    the operator is trying to resolve, and because the four have
+    different advice. `tight` and `split` are the two the field
+    usually collapses into "won't fit", and they are the two worth
+    naming.
+
+    """
+
+    fits = 'fits'
+    tight = 'tight'
+    split = 'split'
+    no = 'no'
+
+
+class Source(StrEnum):
+    """
+    `override` when the caller supplied the budget. That is how
+    a model gets scored against **another** host's memory, which
+    is the only honest answer in a deployment where the GPU is
+    in a different building — and a UI should say which machine
+    a verdict is about.
+
+    """
+
+    detected = 'detected'
+    override = 'override'
+
+
+class MemoryBudget(BaseModel):
+    """
+    What a fit verdict was measured against. **Free and total both,
+    and free is what decides the verdict.** Measured on the dev box
+    with nothing unusual running: 2.9 GiB of a 32 GiB card was
+    already held and a third of RAM was in use — so scoring against
+    total would have promised a fit that OOMs, and hiding total
+    would have concealed what quitting a browser buys back.
+
+    """
+
+    vramFreeBytes: int | None = Field(None, ge=0)
+    vramTotalBytes: int | None = Field(None, ge=0)
+    largestGpuFreeBytes: int | None = Field(
+        None,
+        description='The biggest single card\'s free memory. Separate from the sum\nbecause llama.cpp splits layers across GPUs by default, so\n"fits on one card" and "fits across all of them" are\ndifferent questions with different performance — and two\nreplicas on two cards, which is M5\'s case, needs the\nper-card number rather than the total.\n',
+        ge=0,
+    )
+    ramAvailableBytes: int | None = Field(None, ge=0)
+    ramTotalBytes: int | None = Field(None, ge=0)
+    gpuCount: int | None = Field(None, ge=0)
+    unifiedMemory: bool | None = Field(
+        None,
+        description='Apple silicon, where the VRAM/RAM split does not exist and\nthe real ceiling is the wired limit rather than a separate\npool. Reported because the naive reading of "VRAM" on a\n96 GB Mac is zero, which would tell one of the better\nlocal-inference boxes on the market that it has no GPU.\n',
+    )
+    source: Source | None = Field(
+        None,
+        description="`override` when the caller supplied the budget. That is how\na model gets scored against **another** host's memory, which\nis the only honest answer in a deployment where the GPU is\nin a different building — and a UI should say which machine\na verdict is about.\n",
+    )
+
+
+class KvCacheType(StrEnum):
+    """
+    Element type assumed for the KV cache, which halves or quarters
+    the cache term. `f16` is the default and llama.cpp's own.
+
+    Present as a parameter because it is a launch flag
+    (`--cache-type-k`) and therefore part of the question: "does
+    this fit" has no answer that is independent of how it will be
+    launched. A profile that sets the flag and a fit query that
+    assumed `f16` disagree, and the operator should be able to see
+    both.
+
+    """
+
+    f16 = 'f16'
+    q8_0 = 'q8_0'
+    q4_0 = 'q4_0'
+
+
+class Os(StrEnum):
+    windows = 'windows'
+    linux = 'linux'
+    macos = 'macos'
+
+
+class Arch(StrEnum):
+    x64 = 'x64'
+    arm64 = 'arm64'
+
+
+class Vendor(StrEnum):
+    nvidia = 'nvidia'
+    amd = 'amd'
+    intel = 'intel'
+    apple = 'apple'
+    unknown = 'unknown'
+
+
+class Gpu(BaseModel):
+    index: int = Field(
+        ...,
+        description="The device index, which is what goes in\n`CUDA_VISIBLE_DEVICES` in a profile's `env` — the mechanism\nbehind two replicas on two cards.\n",
+        ge=0,
+    )
+    name: str
+    vendor: Vendor | None = None
+    vramTotalBytes: int = Field(..., ge=0)
+    vramFreeBytes: int | None = Field(
+        None,
+        description='Absent when the platform will not say. On a fresh desktop\nthis is around 2.9 GiB below total before anything is\nlaunched, which is 11% of a 24 GB card.\n',
+        ge=0,
+    )
+    computeCapability: str | None = None
+    driverVersion: str | None = None
+
+
+class QuantTier(BaseModel):
+    tier: str = Field(
+        ...,
+        description='The label as it appears in filenames, e.g. `Q4_K_M`, `IQ3_XXS`.',
+    )
+    family: str | None = Field(
+        None,
+        description='`legacy` (`Q4_0`, `Q8_0`), `k_quant` (`Q4_K_M` — mixed\nprecision per tensor), `i_quant` (`IQ*` — importance-matrix\nquantized), `dynamic` (`UD-*` — per-tensor choices made by\nthe publisher), or `unquantized` (`F16`, `BF16`, `F32`).\n',
+    )
+    nominalBitsPerWeight: float | None = Field(
+        None,
+        description="The tier's nominal width. The *actual* figure for a specific\nfile is `CatalogueCandidate.bitsPerWeight`, computed from its\nreal size — mixed-precision schemes do not land on their\nnominal value.\n",
+    )
+    summary: str = Field(..., description='What this tier does, in one sentence.')
+    guidance: str | None = Field(
+        None,
+        description='When it is a sensible choice. Describes the **shape** of the\nquality curve — noticeable degradation below roughly 4 bits\nper weight, severe below 3 — and never a per-model\njudgement. Which of `IQ2_S` and `Q2_K` is better for a given\nmodel is upstream research and not ours to invent; a\nfabricated quality score is worse than none, the same rule\nthat makes an unrecognised `general.file_type` degrade to\nthe raw number.\n',
+    )
 
 
 class ConfigField(BaseModel):
@@ -920,6 +1307,190 @@ class SkippedPath(BaseModel):
     )
 
 
+class CatalogueSearchResult(BaseModel):
+    """
+    One upstream repository. **No sizes and no fit verdict** — see
+    `searchCatalogue`: upstream's search response carries neither
+    and synthesizing them would cost a call per row.
+
+    """
+
+    repo: str = Field(..., description='Full repo id, e.g. `unsloth/Qwen3.8-27B-GGUF`.')
+    owner: str | None = Field(
+        None,
+        description='The publisher. Prominent on purpose — "which quant publisher\ndo I trust" is how people navigate this catalogue, and it is\nthe fastest signal that separates an official release from a\nreupload.\n',
+    )
+    name: str | None = None
+    formats: list[ModelFormat] | None = Field(
+        None,
+        description='What this repo appears to serve, from its tags and library\nmetadata. Approximate at search time — a repo can hold both\nformats, and only the detail call reads the file list.\n',
+    )
+    gated: GateKind | None = None
+    private: bool | None = None
+    downloads: int | None = Field(None, ge=0)
+    likes: int | None = Field(None, ge=0)
+    trendingScore: float | None = None
+    pipelineTag: str | None = Field(
+        None, description="Upstream's task label, e.g. `text-generation`."
+    )
+    libraryName: str | None = None
+    license: str | None = None
+    tags: list[str] | None = None
+    createdAt: AwareDatetime | None = None
+    lastModified: AwareDatetime | None = Field(
+        None,
+        description='Worth showing next to popularity: a repo with millions of\ndownloads and no change in a year is a different\nproposition from one updated last week.\n',
+    )
+
+
+class DownloadFile(BaseModel):
+    path: str = Field(..., description='Repo-relative source path.')
+    destinationPath: str = Field(
+        ...,
+        description='Absolute path this file will occupy when it is done. While\nit is in flight the bytes live at this path plus `.part`.\n',
+    )
+    sizeBytes: int | None = Field(None, ge=0)
+    bytesDownloaded: int | None = Field(None, ge=0)
+    state: DownloadState
+    sha256: str | None = Field(
+        None, description='Expected content digest, when upstream published one.'
+    )
+    verified: bool | None = Field(
+        None,
+        description='Whether the finished file matched its digest. Verification\nhappens **before** the `.part` is renamed into place, so a\nfile that exists at `destinationPath` was verified — and one\nthat failed stays a `.part` with the record in `failed`,\nnever silently retried into the same bytes.\n',
+    )
+    role: ModelFileRole | None = None
+    error: str | None = None
+
+
+class Fit(BaseModel):
+    """
+    Whether a model runs on a given memory budget at a given
+    context, **with the arithmetic attached**. One computation, three
+    callers: per candidate in the catalogue, on a local model, and
+    inside a preflight.
+
+    It is an estimate and says so. The overhead allowance is flat,
+    MoE models hold experts differently, and llama.cpp's own
+    allocation shifts between builds — so the inputs are all
+    reported, which is what makes a wrong answer diagnosable instead
+    of merely wrong.
+
+    """
+
+    verdict: FitVerdict
+    requiredBytes: int = Field(
+        ..., description='`weightsBytes + kvCacheBytes + overheadBytes`.', ge=0
+    )
+    weightsBytes: int | None = Field(
+        None,
+        description='Summed over every file in the candidate, shards included.',
+        ge=0,
+    )
+    kvCacheBytes: int | None = Field(
+        None,
+        description='`contextLength × attentionLayers × headCountKv ×\n(keyLength + valueLength) × bytes per element`. The term\nthat goes wrong: see `attentionLayers`.\n',
+        ge=0,
+    )
+    overheadBytes: int | None = Field(
+        None,
+        description='Compute buffers, the graph, the accelerator context. A flat\nallowance, and the reason this is an estimate rather than a\ncalculation.\n',
+        ge=0,
+    )
+    contextLength: int = Field(
+        ...,
+        description='The context this verdict is for. Change it and the verdict changes.',
+        ge=1,
+    )
+    kvCacheType: KvCacheType | None = None
+    attentionLayers: int | None = Field(
+        None,
+        description='Layers that actually hold a KV cache, which on a hybrid\nattention/SSM model is a small fraction of the total. Where\nthis is known from metadata the cache figure is real; where\nit is not, it is assumed equal to the layer count and\n`notes` says so — an assumption that is safe in the\npessimistic direction and, on one verified current model,\nwrong by 4.1×.\n',
+        ge=0,
+    )
+    basis: Basis = Field(
+        ...,
+        description='`metadata` when the model\'s own declared shape produced the\nKV term — a local model, or a remote one after a preflight.\n`estimate` when only the file size was available, which is\nevery catalogue candidate until someone preflights it.\n\nThe honest distinction between "this is arithmetic" and\n"this is a guess with a number on it", and the field a UI\nshould hang a "check this file" affordance off.\n',
+    )
+    budget: MemoryBudget | None = None
+    notes: list[str] | None = Field(
+        None,
+        description='The assumptions in words: full offload, F16 KV cache, layer\ncount assumed to be attention count, the overhead allowance\nused. Guidance that does not state its assumptions cannot be\nargued with, and this one will sometimes be wrong.\n',
+    )
+
+
+class ModelFit(BaseModel):
+    """
+    A local model's fit, plus which model it is about.
+    """
+
+    modelId: str
+    path: str | None = None
+    fit: Fit
+    maxContextLength: int | None = Field(
+        None,
+        description="The largest context that still `fits` in free VRAM,\ncomputed by solving the same arithmetic for context instead\nof asserting it. More useful than a yes/no at one context:\nit is the number that goes in a profile's `-c`, and it\nanswers the question a launch actually asks.\n",
+        ge=0,
+    )
+    modelContextLength: int | None = Field(
+        None,
+        description="What the model was trained for, for comparison. These two\nare frequently far apart — a current 27B declares 262144 and\nalmost nobody can hold that — and showing only the model's\nnumber is the comfortable lie M2 named.\n",
+        ge=0,
+    )
+
+
+class HostHardware(BaseModel):
+    """
+    What this host has to spend, as detected. Deliberately **not**
+    shared with the watchdog's `HostAccelerator`: that answers "which
+    engine build do I fetch" and its own description already says the
+    VRAM-and-fit surface belongs here. The two overlap on `os` and
+    `arch` and diverge on everything else, so this duplicates two
+    enums rather than coupling two surfaces that will evolve apart.
+    When they disagree it is because they are on different hosts,
+    which is information rather than a bug.
+
+    """
+
+    hostname: str = Field(
+        ...,
+        description='Which machine these numbers are from. Load-bearing in a\nmulti-host deployment: a driver lives next to its engine, so\nthe GPU that will load the model is not necessarily on the\nhost that measured this.\n',
+    )
+    os: Os
+    arch: Arch
+    cpuCount: int | None = Field(None, ge=1)
+    ramTotalBytes: int | None = Field(None, ge=0)
+    ramAvailableBytes: int | None = Field(
+        None,
+        description='What is actually free, which is a third less than total on\nan ordinary desktop. The number scoring uses.\n',
+        ge=0,
+    )
+    unifiedMemory: bool | None = None
+    gpus: list[Gpu] | None = None
+    detectedAt: AwareDatetime | None = Field(
+        None,
+        description='Free memory moves constantly, so a verdict computed from a\ncached reading needs a timestamp on it.\n',
+    )
+    warnings: list[str] | None = Field(
+        None,
+        description='What could not be detected and what was assumed instead — no\nvendor tool on PATH, an accelerator whose free memory is\nunreadable, a platform whose memory model is not the one\nassumed. Named rather than silently defaulted: a fit verdict\ncomputed from a wrong budget is worse than no verdict, and\nthree of the detection paths in this component are\nunverified on real hardware (AMD, Intel, and Apple unified\nmemory).\n',
+    )
+
+
+class QuantTable(BaseModel):
+    """
+    Static reference content: what the quant tiers mean. Served from
+    here so there is one copy to maintain as upstream's families
+    churn, and so a headless install can print it.
+
+    """
+
+    tiers: list[QuantTier]
+    updatedAt: AwareDatetime | None = Field(
+        None, description='When this table was last revised, since the families move.'
+    )
+
+
 class LibraryModel(BaseModel):
     """
     One launchable model on this host.
@@ -1060,9 +1631,248 @@ class Scan(BaseModel):
     error: str | None = Field(None, description='Populated when `state` is `failed`.')
 
 
+class CatalogueSearchPage(BaseModel):
+    results: list[CatalogueSearchResult]
+    nextCursor: str | None = Field(
+        None,
+        description="Pass back as `cursor` for the next page. Absent on the last\npage. Opaque — it is upstream's own continuation token and\ncarries no page arithmetic.\n",
+    )
+    cachedAt: AwareDatetime | None = Field(
+        None,
+        description='When this answer was fetched upstream. Present because\nresults are cached for a short window to stay inside the\n500-request/300-second API budget, and a client showing\npopularity numbers should know they are minutes old.\n',
+    )
+
+
+class CatalogueCandidate(BaseModel):
+    """
+    One downloadable, launchable choice. **Shards are already
+    summed here** — scoring the file named on the launch line
+    understates a split candidate by the size of every other shard
+    (verified: 46.55 GiB for shard 1 of a model that is 50.90 GiB).
+
+    """
+
+    label: str = Field(
+        ...,
+        description='What to show in the list: the quant tier for GGUF\n(`Q4_K_M`, `UD-IQ3_XXS`), or the variant directory for a\nsafetensors repo.\n',
+    )
+    format: ModelFormat
+    files: list[CatalogueFile] = Field(
+        ...,
+        description='Every file this candidate needs, in the order a download\nshould fetch them. For a split GGUF, all shards. For\nsafetensors, the weights **and** the sidecars — `config.json`\nand the tokenizer files are not optional. Pass these\nstraight to `DownloadSpec.files`.\n',
+    )
+    sizeBytes: int = Field(
+        ...,
+        description='Sum over `files`. The number the fit verdict is computed from.',
+        ge=0,
+    )
+    quantization: str | None = Field(
+        None,
+        description='Quant tier, e.g. `Q4_K_M`. GGUF only — a safetensors model\nis sized, not tiered.\n',
+    )
+    quantSource: QuantSource | None = Field(
+        None,
+        description='**Where the tier came from, and this field is load-bearing.**\n`filename` at listing time, because the hub exposes no\nper-file quant and the name is all there is — the very thing\na local scan refuses to trust. `metadata` after a preflight\nhas read `general.file_type` over HTTP Range.\n\nFit is computed from `sizeBytes`, which is authoritative\neither way, so a mislabelled file changes what is displayed\nand never what is promised.\n',
+    )
+    bitsPerWeight: float | None = Field(
+        None,
+        description='`sizeBytes × 8 / parameters`. The one quality-adjacent\nnumber here that is arithmetic rather than judgement, and\nthe only thing that makes three upstream naming schemes\ncomparable: on one verified repo it ordered all 25\ncandidates monotonically from 1.81 to exactly 16.00 for\nBF16 — that last value being the check that the parameter\ncount is real.\n\nAbsent when upstream states no parameter count.\n',
+    )
+    dtype: str | None = Field(
+        None, description='Dominant tensor dtype, for safetensors candidates.'
+    )
+    fit: Fit | None = None
+    alreadyOwned: AlreadyOwned | None = None
+    gated: bool | None = Field(
+        None,
+        description="Convenience copy of the repo's gate, on the row the operator\nis about to click.\n",
+    )
+
+
+class CataloguePreflight(BaseModel):
+    """
+    What one remote file says about itself, read over HTTP Range
+    without downloading it. See `preflightCatalogueFile` for the
+    cost, which is the point of the endpoint.
+
+    """
+
+    repo: str
+    resolvedCommit: str | None = None
+    file: str
+    format: ModelFormat
+    bytesRead: int = Field(
+        ...,
+        description='How much of the remote file this cost. Reported so the\nnumber is visible rather than assumed: ~11 MB for a\nlarge-vocab GGUF, ~11 KB for a safetensors header. The GGUF\nfigure is mostly tokenizer — the metadata worth having sits\non the far side of the vocabulary, which is why the read is\nnot smaller.\n',
+        ge=0,
+    )
+    quantization: str | None = Field(
+        None,
+        description='The tier, from `general.file_type`. Machine-read, not guessed.',
+    )
+    fileType: int | None = Field(
+        None,
+        description='Raw `general.file_type`. Reported alongside the label rather\nthan instead of it, for M2\'s reason: the quant families\nchurn and an unrecognised value must degrade to "here is the\nnumber", never to a plausible neighbour.\n',
+    )
+    agreesWithFilename: bool | None = Field(
+        None,
+        description='Whether the metadata tier and the filename tier match. When\nfalse both are reported and neither is silently preferred.\nThis is the check the whole endpoint exists to make\npossible.\n',
+    )
+    architecture: str | None = None
+    blockCount: int | None = Field(
+        None, description='Total layers the file declares.', ge=0
+    )
+    attentionLayers: int | None = Field(
+        None,
+        description='How many of those layers actually hold a KV cache. **Not\nthe same number** on a hybrid model: one current release\ndeclares 65 blocks with a full-attention interval of 4, so\n16 layers carry KV and the naive arithmetic overestimates\nthe cache by 4.1× at every context length. This field is\nwhat stops guidance from being confidently wrong about an\nentire class of modern models.\n',
+        ge=0,
+    )
+    contextLength: int | None = Field(None, ge=0)
+    parameters: int | None = Field(
+        None,
+        description='Exact count, for safetensors, from the summed tensor shapes\nin the header. Absent for GGUF, which does not carry one —\nthe same asymmetry the local scan meets, reproduced over the\nnetwork at wildly different cost.\n',
+        ge=0,
+    )
+    dtype: str | None = None
+    vocabSize: int | None = Field(None, ge=0)
+    capabilities: ModelCapabilities | None = None
+    recommendedSampling: RecommendedSampling | None = None
+    fit: Fit | None = None
+    shardCount: int | None = Field(
+        None,
+        description="From the file's own `split.count`, when it is a shard.\nProbing the **first** shard is enough — verified: shard 1 of\na split model carries the complete KV block.\n",
+        ge=1,
+    )
+
+
+class Download(BaseModel):
+    """
+    One transfer job over N files. Records persist after they finish;
+    `DELETE` forgets one.
+
+    """
+
+    id: str
+    state: DownloadState
+    repo: str
+    revision: str | None = None
+    resolvedCommit: str | None = Field(
+        None,
+        description='The commit this download is pinned to. A resume that finds\nupstream serving a different digest for the same path\nreports it here rather than appending new bytes to old ones.\n',
+    )
+    root: str | None = None
+    destinationDirectory: str | None = Field(
+        None,
+        description='Absolute directory the files will land in, resolved **before\nthe first byte moves** so the operator can see where their\nmodel is going while there is still time to change it.\n',
+    )
+    files: list[DownloadFile]
+    bytesTotal: int | None = Field(None, ge=0)
+    bytesDownloaded: int | None = Field(None, ge=0)
+    bytesPerSecond: float | None = Field(
+        None, description='Recent rate, not an average over the whole job.', ge=0.0
+    )
+    etaSeconds: int | None = Field(None, ge=0)
+    attempts: int | None = Field(
+        None,
+        description='How many times the transfer has been (re)started, including\nautomatic retries. Visible because a 40 GB fetch over a\ndomestic link will meet transient failures, and the\ndifference between a flaky connection and a dead one is\nthis number moving.\n',
+        ge=0,
+    )
+    modelId: str | None = Field(
+        None,
+        description='The library entry this download became, filled in after the\npost-completion scan of the destination directory. This is\nwhat closes discovery → download → library → profile →\nlaunch without the UI polling for a model to appear.\n',
+    )
+    startedAt: AwareDatetime | None = None
+    finishedAt: AwareDatetime | None = None
+    error: str | None = None
+    errorCode: str | None = Field(
+        None,
+        description='Upstream\'s own error code when it gave one — `GatedRepo` is\nthe one that will actually happen, and it means "accept the\nlicence on the model page" rather than anything the operator\ncan fix here. Carried through so the UI can say that instead\nof surfacing a bare 401.\n',
+    )
+    restartedFromZero: bool | None = Field(
+        None,
+        description='True when a resume found the remote file had changed and\ndiscarded the partial. Surfaced rather than silent: the\noperator is about to re-spend bandwidth they already spent,\nand the reason is that upstream requantized under the same\nfilename.\n',
+    )
+    message: str | None = Field(
+        None, description='What the current phase is doing, for the progress dialog.'
+    )
+
+
 class LibraryModelList(BaseModel):
     models: list[LibraryModel]
     lastScanAt: AwareDatetime | None = Field(
         None,
         description='When the walk that produced this list finished. Omitted\nbefore the first scan. Present here as well as on `Scan` so\na browser rendering the list can say how stale it is\nwithout a second call.\n',
     )
+
+
+class CatalogueModel(BaseModel):
+    """
+    One upstream repo, resolved: what it is, what can be downloaded
+    from it, and which of those this host can run.
+
+    """
+
+    repo: str
+    owner: str | None = None
+    name: str | None = None
+    revision: str = Field(
+        ..., description='The revision that was asked for, e.g. `main`.'
+    )
+    resolvedCommit: str | None = Field(
+        None,
+        description='The commit `revision` resolved to, from upstream\'s\n`X-Repo-Commit`. Reported because `main` moves — repos are\nrequantized and re-uploaded under the same filenames — and\na download pins this so a later resume can tell "the\ntransfer broke" from "the file I was fetching is gone".\n',
+    )
+    gated: GateKind | None = None
+    private: bool | None = None
+    downloads: int | None = Field(None, ge=0)
+    likes: int | None = Field(None, ge=0)
+    trendingScore: float | None = None
+    license: str | None = None
+    tags: list[str] | None = None
+    pipelineTag: str | None = None
+    libraryName: str | None = None
+    createdAt: AwareDatetime | None = None
+    lastModified: AwareDatetime | None = None
+    formats: list[ModelFormat] | None = Field(
+        None, description='Formats actually present in the file list.'
+    )
+    parameters: int | None = Field(
+        None,
+        description="Parameter count, when upstream states one. For a GGUF repo\nit comes from the hub's own repo-level metadata and is\nexact — which is what makes `bitsPerWeight` computable with\nno extra request, and is the inverse of the local case where\na GGUF gives no parameter count at all.\n",
+        ge=0,
+    )
+    architecture: str | None = None
+    contextLength: int | None = Field(
+        None,
+        description='Context the model was trained for, per upstream. Not what\nthis host can serve — that is what `candidates[].fit`\nanswers, at a context the caller chose.\n',
+        ge=0,
+    )
+    chatTemplate: bool | None = Field(
+        None, description='Whether upstream reports an embedded chat template.'
+    )
+    candidates: list[CatalogueCandidate] = Field(
+        ...,
+        description='The launchable choices, one per quant or per format variant,\nwith shards already summed. **This is the list the operator\npicks from**, and it is materially shorter than the file\nlist: one verified repo held 30 `.gguf` files and 25\ncandidates.\n',
+    )
+    projectors: list[CatalogueFile] | None = Field(
+        None,
+        description="Vision projectors offered by this repo, as their own list\nbecause a multimodal repo ships more than one precision of\nthem and the operator picks — and because a projector is\nnever a candidate on its own. Add the chosen one to the\ndownload's `files`.\n",
+    )
+    otherFiles: list[CatalogueFile] | None = Field(
+        None,
+        description='Files in the repo that are neither candidates nor\nprojectors: the imatrix calibration file, an MTP or draft\nmodel, documentation. Reported rather than hidden, for the\nsame reason the scan reports `skipped` — a listing that\nsilently drops files it did not understand is\nindistinguishable from one that is broken.\n',
+    )
+    totalSizeBytes: int | None = Field(
+        None,
+        description='Every file in the repo summed. Rarely what anyone wants to download.',
+        ge=0,
+    )
+    recommended: CatalogueRecommendation | None = None
+    warnings: list[str] | None = Field(
+        None,
+        description='Things to say before a download starts: the repo is gated,\nnothing here fits, the only thing that fits is a very low\nquant, upstream metadata was unreadable so the fit is a\nsize estimate.\n',
+    )
+
+
+class DownloadList(BaseModel):
+    downloads: list[Download]

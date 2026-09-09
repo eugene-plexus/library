@@ -149,6 +149,21 @@ class ScanManager:
             self._cancel.set()
         return self.snapshot()
 
+    async def wait(self) -> None:
+        """Block until the current walk finishes, if one is running.
+
+        For the post-download flow: a finished transfer needs the model
+        it just wrote to *be* a library entry before it can report which
+        entry that is, and polling `find_by_path` in a sleep loop is a
+        worse way to say the same thing. A failed scan is swallowed —
+        the caller wanted the walk to have happened, not to inherit its
+        error.
+        """
+        task = self._task
+        if task is not None and not task.done():
+            with contextlib.suppress(Exception):
+                await task
+
     async def shutdown(self) -> None:
         """Stop a walk in flight at process exit, without waiting for it
         to finish a 10 MB header read."""

@@ -26,8 +26,15 @@ classifiers = [
 # against a documented binary layout, and taking a dependency on a
 # tensor-loading stack to read a file header would pull torch-adjacent
 # weight into a component that never loads a tensor.
+#
+# `httpx` is the one addition M3 needs: the catalogue and the downloader
+# want async streaming with Range support, and stdlib urllib in a thread
+# would be a worse version of it. Note that this component is
+# `pip install -e`'d into the watchdog's venv so the supervisor can
+# spawn it, so a new runtime dependency has to be installed there too.
 dependencies = [
     "fastapi>=0.115,<1",
+    "httpx>=0.27,<1",
     "uvicorn[standard]>=0.32,<1",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3",
@@ -86,6 +93,24 @@ ignore = []
 # idiom for dependency injection but trips ruff's "no function calls in
 # defaults" rule. Allow it only in the dependency module that defines them.
 "src/eugene_plexus_library/dependencies.py" = ["B008"]
+# Same idiom, same rule: FastAPI wants Query() as an argument default.
+# Ruff happens to flag only the parameters annotated with an enum rather
+# than a builtin, so these two modules carry the ignore for consistency
+# with the rest of their own signatures — the alternative is one
+# parameter in five written as Annotated[] and the rest not.
+"src/eugene_plexus_library/routes/catalogue.py" = ["B008"]
+"src/eugene_plexus_library/routes/guidance.py" = ["B008"]
+# The downloader touches the filesystem from async functions: exists(),
+# stat(), unlink(), os.replace(), and buffered writes of 1 MiB chunks.
+# ASYNC240 wants those on a thread or through anyio.Path, and neither is
+# worth it here — they are sub-millisecond metadata calls, the chunk
+# writes are interleaved with awaits on the network, and the one
+# genuinely expensive operation (hashing a 40 GB file) already runs in a
+# worker thread. Taking a dependency on anyio.Path to wrap stat() would
+# add a runtime dependency to a component that is pip-installed into the
+# watchdog's venv, which is a real cost against no measured benefit.
+"src/eugene_plexus_library/downloads.py" = ["ASYNC240"]
+"tests/test_downloads.py" = ["ASYNC240", "E501"]
 
 # -----------------------------------------------------------------------------
 # Mypy

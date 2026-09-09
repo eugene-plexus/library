@@ -135,23 +135,43 @@ def read_header(path: Path) -> SafetensorsHeader:
     """
     with path.open("rb") as fh:
         raw_length = fh.read(8)
-        if len(raw_length) != 8:
-            raise SafetensorsError(f"{path.name}: truncated before header length")
-        (length,) = struct.unpack("<Q", raw_length)
-        if length == 0 or length > _MAX_HEADER:
-            raise SafetensorsError(f"{path.name}: implausible header length {length}")
+        length = header_length(raw_length, name=path.name)
         raw = fh.read(length)
         if len(raw) != length:
             raise SafetensorsError(
                 f"{path.name}: truncated header (wanted {length}, got {len(raw)})"
             )
+    return parse_header(raw, name=path.name)
 
+
+def header_length(raw_length: bytes, *, name: str = "<stream>") -> int:
+    """Decode the 8-byte length prefix that starts every safetensors file.
+
+    Split out because it is the whole of the first read a *remote*
+    header needs: eight bytes over HTTP Range say how many more to
+    fetch, which is why reading a safetensors header off the hub costs
+    ~11 KB and two requests where a GGUF costs ~11 MB.
+    """
+    if len(raw_length) != 8:
+        raise SafetensorsError(f"{name}: truncated before header length")
+    (length,) = struct.unpack("<Q", raw_length)
+    if length == 0 or length > _MAX_HEADER:
+        raise SafetensorsError(f"{name}: implausible header length {length}")
+    return int(length)
+
+
+def parse_header(raw: bytes, *, name: str = "<stream>") -> SafetensorsHeader:
+    """Parse the JSON header block, given exactly its bytes.
+
+    Takes bytes rather than a file so the same parse serves a local file
+    and a ranged read of a remote one.
+    """
     try:
         header = json.loads(raw)
     except ValueError as exc:
-        raise SafetensorsError(f"{path.name}: header is not valid JSON ({exc})") from exc
+        raise SafetensorsError(f"{name}: header is not valid JSON ({exc})") from exc
     if not isinstance(header, dict):
-        raise SafetensorsError(f"{path.name}: header is not a JSON object")
+        raise SafetensorsError(f"{name}: header is not a JSON object")
 
     metadata = header.pop("__metadata__", {})
     if not isinstance(metadata, dict):
@@ -159,23 +179,23 @@ def read_header(path: Path) -> SafetensorsHeader:
 
     parameters = 0
     dtype_counts: dict[str, int] = {}
-    for name, entry in header.items():
+    for tensor_name, entry in header.items():
         if not isinstance(entry, dict):
-            raise SafetensorsError(f"{path.name}: tensor {name!r} is not an object")
+            raise SafetensorsError(f"{name}: tensor {tensor_name!r} is not an object")
         shape = entry.get("shape")
         dtype = entry.get("dtype")
         if not isinstance(shape, list) or not isinstance(dtype, str):
-            raise SafetensorsError(f"{path.name}: tensor {name!r} has no shape/dtype")
+            raise SafetensorsError(f"{name}: tensor {tensor_name!r} has no shape/dtype")
         count = 1
         for dimension in shape:
             if not isinstance(dimension, int) or dimension < 0:
-                raise SafetensorsError(f"{path.name}: tensor {name!r} has a bad shape")
+                raise SafetensorsError(f"{name}: tensor {tensor_name!r} has a bad shape")
             count *= dimension
         parameters += count
         dtype_counts[dtype] = dtype_counts.get(dtype, 0) + count
 
     return SafetensorsHeader(
-        header_bytes=8 + length,
+        header_bytes=8 + len(raw),
         tensor_count=len(header),
         parameters=parameters,
         dtype_counts=dtype_counts,
