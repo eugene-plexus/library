@@ -1,0 +1,120 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eugene-plexus-library"
+version = "0.1.0"
+description = "Eugene Plexus library: the operator's own model directories, scanned and described, with named per-model launch profiles. Reads GGUF and HF safetensors; never takes custody of a file."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+authors = [
+    { name = "Eugene Plexus contributors" },
+]
+keywords = ["eugene-plexus", "llm", "gguf", "safetensors", "model-library", "fastapi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# No GGUF or safetensors library. Both readers are a few hundred lines
+# against a documented binary layout, and taking a dependency on a
+# tensor-loading stack to read a file header would pull torch-adjacent
+# weight into a component that never loads a tensor.
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.32,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "pyyaml>=6.0,<7",
+    "pyjwt>=2.9,<3",
+    "pynacl>=1.5,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.2",
+    "pytest-asyncio==0.26.0",
+    "httpx>=0.27,<1",          # FastAPI test client
+    "ruff==0.15.14",
+    "mypy==1.20.2",
+    "types-pyyaml>=6,<7",
+    "datamodel-code-generator==0.57.0",
+]
+
+[project.scripts]
+eugene-plexus-library = "eugene_plexus_library.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/eugene-plexus"
+Repository = "https://github.com/eugene-plexus/library"
+Specs = "https://github.com/eugene-plexus/specs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eugene_plexus_library"]
+
+# -----------------------------------------------------------------------------
+# Ruff (linter + formatter)
+# -----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "src/eugene_plexus_library/_generated",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "ASYNC",         # async-correctness
+    "SIM",           # simplifications
+    "RUF",
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]
+# FastAPI uses Depends() as an argument default, which is the framework's
+# idiom for dependency injection but trips ruff's "no function calls in
+# defaults" rule. Allow it only in the dependency module that defines them.
+"src/eugene_plexus_library/dependencies.py" = ["B008"]
+
+# -----------------------------------------------------------------------------
+# Mypy
+# -----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+# call-arg is disabled because mypy doesn't recognize pydantic's
+# `field: T = Field(default, ...)` defaults — every optional codegen'd
+# Pydantic field is reported as missing at the call site otherwise.
+disable_error_code = ["call-arg"]
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+exclude = [
+    "src/eugene_plexus_library/_generated",
+]
+
+[[tool.mypy.overrides]]
+module = "eugene_plexus_library._generated.*"
+ignore_errors = true
+
+# -----------------------------------------------------------------------------
+# Pytest
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
