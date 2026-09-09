@@ -49,6 +49,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 from datetime import UTC, datetime
 
 from ._generated.models import Arch, Gpu, HostHardware, Os, Vendor
@@ -133,6 +134,16 @@ def detect_arch() -> Arch:
 
 
 def _windows_memory() -> tuple[int | None, int | None]:
+    # `sys.platform`, not `platform.system()`, and checked inside the
+    # function rather than only at the call site: type checkers narrow on
+    # this exact comparison and nothing else, so it is what makes
+    # `ctypes.windll` -- which exists only on Windows -- check cleanly on
+    # a Linux CI runner *and* on a Windows dev box. A `type: ignore`
+    # cannot do both: it is required on Linux and flagged as unused on
+    # Windows, and this repo treats both as errors.
+    if sys.platform != "win32":  # pragma: no cover - unreachable on Windows
+        return None, None
+
     status = _MemoryStatusEx()
     status.dwLength = ctypes.sizeof(status)
     try:
@@ -201,10 +212,9 @@ def _macos_memory() -> tuple[int | None, int | None]:
 
 def host_memory() -> tuple[int | None, int | None]:
     """`(total, available)` in bytes, either possibly None."""
-    system = platform.system()
-    if system == "Windows":
+    if sys.platform == "win32":
         return _windows_memory()
-    if system == "Darwin":
+    if sys.platform == "darwin":
         return _macos_memory()
     return _linux_memory()
 
