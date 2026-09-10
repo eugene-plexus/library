@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "eugene-plexus-library"
 version = "0.1.0"
-description = "Eugene Plexus library: the operator's own model directories, scanned and described, with named per-model launch profiles. Reads GGUF and HF safetensors; never takes custody of a file."
+description = "Model library for Eugene Plexus: GGUF and safetensors metadata, launch profiles, catalogue discovery, resumable downloads, and hardware fit guidance. Your files stay yours."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"

@@ -1,6 +1,9 @@
-# Contributing to Eugene Plexus `inference-driver`
+# Contributing to Eugene Plexus `library`
 
-Thanks for your interest. This service implements the `inference-driver` OpenAPI contract from [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs) — please read this before opening a PR.
+This service implements the `library` contract from
+[`eugene-plexus/specs`](https://github.com/eugene-plexus/specs). It owns model
+scanning, metadata, profiles, catalogue discovery, downloads and fit guidance.
+Read the M2/M3 designs before changing file ownership or acquisition behavior.
 
 ## Developer Certificate of Origin (DCO)
 
@@ -33,15 +36,16 @@ If your change touches the HTTP API — endpoints, request/response shapes, sche
 PRs to this repo should generally cover one or more of:
 
 - **Implementation** of an existing spec endpoint (e.g. wiring up a stub).
-- **Adapter work** — new backend adapter, fixes to an existing one, refactors to the adapter base class.
-- **Reliability / performance** — better error handling, streaming improvements, etc.
+- **Model metadata and profiles** - GGUF/safetensors readers and launch settings.
+- **Discovery and downloads** - catalogue integration, resume and digest verification.
+- **Hardware guidance** - transparent fit arithmetic, not model-quality scoring.
 - **Tooling** — CI, type-checking, lint config, codegen script.
 
 ## Local setup
 
 ```bash
-git clone https://github.com/eugene-plexus/inference-driver
-cd inference-driver
+git clone https://github.com/eugene-plexus/library
+cd library
 python -m venv .venv
 . .venv/bin/activate           # or: .venv\Scripts\activate on Windows
 pip install -e ".[dev]"
@@ -64,7 +68,8 @@ After that, `git commit` runs `ruff check --fix` and `ruff format` on staged Pyt
 - **Ruff** for lint and format. `ruff check .` and `ruff format .` should both be clean before you push. CI enforces.
 - **Mypy strict** for type-checking. New code must type-check; the `_generated/` directory is excluded.
 - **No comments explaining what code does** — let names do the work. Reserve comments for *why* a non-obvious choice was made.
-- **Async-first.** Every adapter and route handler is `async`. Don't introduce synchronous I/O on the request path.
+- **Async-first on the request path.** Model scans and downloads must not block request handling.
+- **Files stay the user's.** No managed blob store or relocation of existing models.
 
 ## Running checks
 
@@ -74,15 +79,16 @@ ruff format --check .              # formatting
 mypy src/                          # type-check
 pytest                             # tests
 python scripts/codegen.py          # regenerate models from pinned specs
-git diff --exit-code src/.../_generated/   # codegen freshness
+git diff --exit-code src/eugene_plexus_library/_generated/   # codegen freshness
 ```
 
 ## Reporting issues
 
-File issues at <https://github.com/eugene-plexus/inference-driver/issues>. Useful issues include:
+File issues at <https://github.com/eugene-plexus/library/issues>. Useful issues include:
 
-- Concrete adapter failures with reproduction steps.
-- Spec-vs-impl divergence (the impl drifted from `inference-driver.yaml`).
-- Performance / latency regressions with measurements.
+- Model scan, metadata or download failures with reproduction steps.
+- Spec-vs-impl divergence (the impl drifted from `library.yaml`).
+- Incorrect fit guidance with model metadata and hardware measurements.
 
-For broader architectural questions about Eugene Plexus, file the issue on the [gateway repo](https://github.com/eugene-plexus/gateway) instead.
+Cross-component architecture questions belong in
+[specs issues](https://github.com/eugene-plexus/specs/issues).

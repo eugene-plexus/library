@@ -6,7 +6,10 @@
 
 The model library for the [Eugene Plexus](https://github.com/eugene-plexus) control plane. Point it at directories you already keep models in; it scans them, reads what each model actually is, and remembers the launch settings that worked. It also searches the upstream catalogue, tells you which quant your machine can actually run *and why*, and downloads the one you pick — resumably, verified, into a directory you chose.
 
-**The rule it exists to honour:** your model files stay yours. Your directories, your filenames, your layout. This service reads. It never relocates, renames, hash-addresses, or takes custody of anything. Delete Eugene Plexus and every model is still where it was, correctly named.
+**The rule it exists to honour:** your model files stay yours. Your directories,
+your filenames, your layout. Scanning never moves or modifies existing models;
+downloads write verified, plainly named files into a directory you chose. No
+content-addressed store. Delete Eugene Plexus and the models remain usable.
 
 ## What it holds
 
@@ -33,7 +36,12 @@ Discovery and guidance are one response on purpose: the moment you are choosing 
 
 ## Status
 
-**v0.1 (milestone M3), working.** Local scan, both formats, metadata, profiles, the config trio, catalogue search, model detail with fit scoring, the ranged metadata preflight, hardware detection, the quant table and resumable verified downloads are all wired end to end and exercised against the live hub.
+**M3 features live-verified; current M7 contracts (2026-09-10).** Local scan, both
+formats, metadata, profiles, config, catalogue search, fit scoring, ranged metadata
+preflight, quant guidance and resumable verified downloads are exercised against
+real files and the live hub. AMD, Intel and Apple unified-memory detection remain
+unverified on hardware. Guidance is an estimate, not a guarantee of runtime fit;
+the owning agent performs launch admission.
 
 Not here yet: MLX, relocating a moved model, and adopting a model's author-recommended sampling into anything (it is reported; the gateway owns request parameters).
 
@@ -41,26 +49,26 @@ Not here yet: MLX, relocating a moved model, and adopting a model's author-recom
 
 Defined in [`specs/openapi/library.yaml`](https://github.com/eugene-plexus/specs/blob/main/openapi/library.yaml). Port **8082**.
 
-| | |
-|---|---|
-| `GET /v1/models` | Every model. `?path=` for reverse lookup from an absolute path |
-| `GET /v1/models/{id}` | One model, with full metadata |
-| `DELETE /v1/models/{id}` | Forget a **missing** entry and its profiles. Never touches a file |
-| `GET`/`POST /v1/models/{id}/profiles` | List / create launch profiles |
-| `GET`/`PUT`/`DELETE /v1/models/{id}/profiles/{pid}` | Read / replace / delete one |
-| `GET`/`POST`/`DELETE /v1/scan` | State of / start / cancel the walk |
-| `GET`/`PATCH /v1/config`, `GET /v1/config/schema`, `POST /v1/config/test` | The standard config trio |
-| `GET /v1/catalogue/search` | Search upstream. Repos, cursor-paginated — no sizes, see below |
-| `GET /v1/catalogue/model` | One repo: its download candidates, each with a fit verdict |
-| `GET /v1/catalogue/model/card` | The model card prose, as Markdown |
-| `GET /v1/catalogue/model/preflight` | Read one remote file's real metadata over HTTP Range |
-| `GET /v1/hardware` | What this host has to spend: RAM, GPUs, free *and* total |
-| `GET /v1/models/{id}/fit` | Will a model you already have run here, and at what context |
-| `GET /v1/quants` | What the quant tiers mean |
-| `GET`/`POST /v1/downloads` | List / start downloads |
-| `GET`/`DELETE /v1/downloads/{id}` | Progress / cancel (removes the `.part`, never a finished file) |
-| `POST /v1/downloads/{id}/pause`, `.../resume` | Stop keeping the partial / continue from it |
-| `POST /v1/admin/restart`, `GET /healthz` | Meta |
+|                                                                           |                                                                   |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `GET /v1/models`                                                          | Every model. `?path=` for reverse lookup from an absolute path    |
+| `GET /v1/models/{id}`                                                     | One model, with full metadata                                     |
+| `DELETE /v1/models/{id}`                                                  | Forget a **missing** entry and its profiles. Never touches a file |
+| `GET`/`POST /v1/models/{id}/profiles`                                     | List / create launch profiles                                     |
+| `GET`/`PUT`/`DELETE /v1/models/{id}/profiles/{pid}`                       | Read / replace / delete one                                       |
+| `GET`/`POST`/`DELETE /v1/scan`                                            | State of / start / cancel the walk                                |
+| `GET`/`PATCH /v1/config`, `GET /v1/config/schema`, `POST /v1/config/test` | The standard config trio                                          |
+| `GET /v1/catalogue/search`                                                | Search upstream. Repos, cursor-paginated — no sizes, see below    |
+| `GET /v1/catalogue/model`                                                 | One repo: its download candidates, each with a fit verdict        |
+| `GET /v1/catalogue/model/card`                                            | The model card prose, as Markdown                                 |
+| `GET /v1/catalogue/model/preflight`                                       | Read one remote file's real metadata over HTTP Range              |
+| `GET /v1/hardware`                                                        | What this host has to spend: RAM, GPUs, free *and* total          |
+| `GET /v1/models/{id}/fit`                                                 | Will a model you already have run here, and at what context       |
+| `GET /v1/quants`                                                          | What the quant tiers mean                                         |
+| `GET`/`POST /v1/downloads`                                                | List / start downloads                                            |
+| `GET`/`DELETE /v1/downloads/{id}`                                         | Progress / cancel (removes the `.part`, never a finished file)    |
+| `POST /v1/downloads/{id}/pause`, `.../resume`                             | Stop keeping the partial / continue from it                       |
+| `POST /v1/admin/restart`, `GET /healthz`                                  | Meta                                                              |
 
 Search lists repos and detail scores candidates, because upstream's search response carries filenames without sizes: badging a fit verdict on a search row would cost one extra call per row, against a budget of 500 requests per five minutes.
 
@@ -103,12 +111,12 @@ Everything but `overhead` comes from the model's own metadata; that term is a fl
 
 The verdict has four values rather than a percentage, because a percentage *of what* is exactly the ambiguity you are trying to resolve:
 
-| | |
-|---|---|
-| `fits` | Inside **free** VRAM. Fully offloaded |
+|         |                                                                        |
+| ------- | ---------------------------------------------------------------------- |
+| `fits`  | Inside **free** VRAM. Fully offloaded                                  |
 | `tight` | Inside total but not free VRAM — something is holding memory right now |
-| `split` | Needs host memory too. Runnable, materially slower, and your call |
-| `no` | Larger than VRAM and RAM together |
+| `split` | Needs host memory too. Runnable, materially slower, and your call      |
+| `no`    | Larger than VRAM and RAM together                                      |
 
 **Free, not total, decides it.** On an idle desktop with nothing unusual running, 2.9 GiB of a 32 GiB card is already gone and a third of RAM is in use. Scoring against total promises a fit that OOMs; both numbers are reported so you can see what quitting something buys back.
 
@@ -116,13 +124,13 @@ The verdict has four values rather than a percentage, because a percentage *of w
 
 Most of the difficulty. A directory of GGUFs is not a list of models:
 
-| On disk | Why it isn't an entry |
-|---|---|
-| `mmproj-*.gguf` | A vision projector belonging to the model beside it. 931 MB in one real case, 1.8 GB in another. Detected by `general.type: mmproj`, not by filename |
-| `…-00002-of-00003.gguf` | Shard 2..N of one split model. Only the first shard goes on a launch line |
-| `adapter_model.safetensors` + `adapter_config.json` | A LoRA. `--lora` in `extraArgs` covers anyone who needs one now |
-| `models--org--name/snapshots/<older-rev>/` | A HuggingFace cache keeps one directory *per revision*. `refs/main` names the current one |
-| `blobs/`, `refs/`, `.no_exist/` | HF cache infrastructure. `.no_exist/` is a *negative* cache full of zero-byte files with real-looking names, so a naive "is there an `adapter_config.json`?" probe finds one |
+| On disk                                             | Why it isn't an entry                                                                                                                                                        |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mmproj-*.gguf`                                     | A vision projector belonging to the model beside it. 931 MB in one real case, 1.8 GB in another. Detected by `general.type: mmproj`, not by filename                         |
+| `…-00002-of-00003.gguf`                             | Shard 2..N of one split model. Only the first shard goes on a launch line                                                                                                    |
+| `adapter_model.safetensors` + `adapter_config.json` | A LoRA. `--lora` in `extraArgs` covers anyone who needs one now                                                                                                              |
+| `models--org--name/snapshots/<older-rev>/`          | A HuggingFace cache keeps one directory *per revision*. `refs/main` names the current one                                                                                    |
+| `blobs/`, `refs/`, `.no_exist/`                     | HF cache infrastructure. `.no_exist/` is a *negative* cache full of zero-byte files with real-looking names, so a naive "is there an `adapter_config.json`?" probe finds one |
 
 Every one of these is reported on `GET /v1/scan` under `skipped[]`, with a reason. A scanner that silently drops what it did not understand is indistinguishable from a broken one, and *"why isn't my model showing up"* with no answer is how a tool gets uninstalled.
 
