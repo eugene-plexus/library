@@ -156,9 +156,9 @@ def resolve_destination(
         # setting wanted. It wants this host's.
         raise DownloadError(
             "No model directories are configured, so there is nowhere to put a download. "
-            f"Add one under Config → Library → Model directories (`modelRoots`). Those are paths on the "
-            f"machine the library runs on ({socket.gethostname()}) — inside its container, "
-            "if it runs in one — and downloads land in the first of them.",
+            "Add one under Config → Library → Model directories (`modelRoots`). Those are "
+            f"paths on the machine the library runs on ({socket.gethostname()}) — inside its "
+            "container, if it runs in one — and downloads land in the first of them.",
             status=409,
             code="NoRootsConfigured",
         )
