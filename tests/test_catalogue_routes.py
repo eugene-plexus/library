@@ -13,7 +13,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_library import hub
+from eugene_plexus_library import hardware, hub
+from eugene_plexus_library._generated.models import Arch, Gpu, HostHardware, Os, Vendor
 
 TREE = [
     {
@@ -68,6 +69,45 @@ SEARCH = [
 ]
 
 
+GIB = 1024**3
+MIB = 1024**2
+
+# **A fixed machine, because the detail endpoint scores against the one
+# the tests run on.** `_budget` calls `hardware.detect()` per request, so
+# with nothing pinned the recommendation is decided by whatever else is
+# holding the GPU: this file passed with 30 GiB free and failed with
+# 509 MiB, as `TypeError: 'NoneType' object is not subscriptable`,
+# because `recommend()` returns None when nothing fits entirely. CI never
+# saw it -- CI has no GPU, so the detected budget is host RAM and stable.
+#
+# The `vramBytes` query override is not enough on its own. It replaces
+# the three VRAM figures and `ramBytes` the two RAM ones, but `gpuCount`
+# and `unifiedMemory` come from detection either way, and
+# `unifiedMemory` picks a different branch in `_verdict` -- so an
+# overridden test would still answer differently on an Apple Silicon
+# machine, which is a dev platform this project now supports. Pinning
+# the whole `HostHardware` closes that, and stops every request shelling out
+# to nvidia-smi as a side effect.
+HOST = HostHardware(
+    hostname="fixture",
+    os=Os.linux,
+    arch=Arch.x64,
+    cpuCount=16,
+    ramTotalBytes=96 * GIB,
+    ramAvailableBytes=64 * GIB,
+    unifiedMemory=False,
+    gpus=[
+        Gpu(
+            index=0,
+            name="Fixture GPU",
+            vendor=Vendor.nvidia,
+            vramTotalBytes=32 * GIB,
+            vramFreeBytes=32 * GIB,
+        )
+    ],
+)
+
+
 def upstream(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     if "/tree/" in path:
@@ -82,10 +122,14 @@ def upstream(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.fixture
-def catalogue_client(configured_client: TestClient) -> Iterator[TestClient]:
-    """A client whose hub is a mock transport rather than the internet."""
+def catalogue_client(
+    configured_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[TestClient]:
+    """A client whose hub is a mock transport rather than the internet,
+    and whose hardware is `HOST` rather than this machine."""
     inner = httpx.AsyncClient(transport=httpx.MockTransport(upstream), follow_redirects=False)
     configured_client.app.state.hub_client = hub.HubClient(client=inner)
+    monkeypatch.setattr(hardware, "detect", lambda: HOST)
     yield configured_client
 
 
@@ -114,7 +158,30 @@ def test_detail_groups_candidates_and_attaches_the_fit(catalogue_client: TestCli
     assert len(body["projectors"]) == 1
     assert all(c["fit"]["contextLength"] == 4096 for c in body["candidates"])
     assert body["resolvedCommit"] == "commit1"
-    assert body["recommended"]["label"] in labels
+    # Nameable now that the machine is fixed rather than detected: both
+    # fit in 32 GiB and `recommend` takes the largest that fits
+    # entirely, so "one of them" can become "this one".
+    assert body["recommended"]["label"] == "Q8_0"
+
+
+def test_detail_recommends_nothing_when_nothing_fits_and_says_why(
+    catalogue_client: TestClient,
+) -> None:
+    """`recommended` is null rather than a best-effort pick, because
+    partial offload is materially slower and is the operator's call to
+    make knowingly. Asserted here because that null is what broke the
+    test above whenever a real GPU was busy: the branch existed, ran on
+    developer machines, and was covered by nothing.
+
+    `vramBytes` is the documented operator override, so this also checks
+    that squeezing the budget by hand reaches the verdict."""
+    body = catalogue_client.get(
+        "/v1/catalogue/model",
+        params={"repo": "org/repo", "contextLength": 4096, "vramBytes": 509 * MIB},
+    ).json()
+    assert body["recommended"] is None
+    assert {c["label"] for c in body["candidates"]} == {"Q4_K_M", "Q8_0"}
+    assert any("509.00 MiB of free GPU memory" in w for w in body["warnings"])
 
 
 def test_detail_defaults_the_context_from_config(catalogue_client: TestClient) -> None:
