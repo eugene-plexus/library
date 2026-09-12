@@ -49,6 +49,7 @@ import hashlib
 import logging
 import os
 import shutil
+import socket
 import time
 import uuid
 from collections.abc import Callable
@@ -149,10 +150,15 @@ def resolve_destination(
     promised since M2.
     """
     if not roots:
+        # Where, precisely, and on which machine. The first operator to hit
+        # this was browsing from a GPU worker while the library ran in a
+        # container on a NAS, and could not tell which host's directory the
+        # setting wanted. It wants this host's.
         raise DownloadError(
             "No model directories are configured, so there is nowhere to put a download. "
-            "Add one to `modelRoots` in this component's config first — downloads go "
-            "into directories you choose, and this component will not invent one.",
+            f"Add one under Config → Library → Model directories (`modelRoots`). Those are paths on the "
+            f"machine the library runs on ({socket.gethostname()}) — inside its container, "
+            "if it runs in one — and downloads land in the first of them.",
             status=409,
             code="NoRootsConfigured",
         )
