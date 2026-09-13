@@ -17,7 +17,7 @@ from .._generated.models import (
     ConfigUpdateRequest,
     ConfigUpdateResult,
 )
-from ..config import ConfigStore, as_schema
+from ..config import ConfigStore
 
 router = APIRouter(tags=["config"])
 
@@ -29,8 +29,11 @@ async def get_config(request: Request) -> ConfigDocument:
 
 
 @router.get("/v1/config/schema", response_model=ConfigSchema)
-async def get_config_schema() -> ConfigSchema:
-    return as_schema()
+async def get_config_schema(request: Request) -> ConfigSchema:
+    """Per store rather than module-level: the roots' default is this
+    install's, when its environment named one."""
+    store: ConfigStore = request.app.state.config_store
+    return store.schema()
 
 
 @router.patch("/v1/config", response_model=ConfigUpdateResult)

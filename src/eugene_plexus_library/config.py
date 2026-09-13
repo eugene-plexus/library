@@ -18,6 +18,17 @@ bug report.
 `PATCH`, and sealed at rest with the master key. That machinery was
 wired in at M2 with nothing using it, precisely so adding this field
 needed no plumbing work.
+
+`modelRoots` can take its **default** from the process environment
+(`Settings.default_model_roots`), for a host whose layout is fixed
+before any config exists — the container image knows its models volume
+is at `/models`. It is a default in exactly the sense this protocol
+already has: the schema reports it, `null` clears to it, and here an
+empty list does too, because "no directories at all" is not something
+an operator wants from a library whose image has said where they are.
+The default is never persisted: the file holds `[]` while the default
+is in effect, so the file records what the operator set and the
+environment keeps supplying the rest.
 """
 
 from __future__ import annotations
@@ -25,6 +36,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -219,13 +231,39 @@ FIELDS: list[ConfigField] = [
 
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
+ROOTS_KEY = "modelRoots"
+DEFAULT_ROOTS_VARIABLE = "EUGENE_PLEXUS_LIBRARY_DEFAULT_MODEL_ROOTS"
 
-def as_schema() -> ConfigSchema:
-    return ConfigSchema(component="library", fields=list(FIELDS), categories=CATEGORY_LABELS)
+
+def as_schema(*, default_roots: Sequence[str] = ()) -> ConfigSchema:
+    """The field metadata, with the roots' default as this install has it.
+
+    A picker rendering the schema shows the default beside the field,
+    so an operator in a container sees `/models` and where it came from
+    rather than an empty list that the effective config contradicts.
+    """
+    fields = list(FIELDS)
+    if default_roots:
+        index = next(i for i, f in enumerate(fields) if f.key == ROOTS_KEY)
+        field = fields[index]
+        fields[index] = field.model_copy(
+            update={
+                "default": list(default_roots),
+                "description": (
+                    f"{field.description} On this install the default is "
+                    f"{', '.join(default_roots)}, set by its environment "
+                    f"({DEFAULT_ROOTS_VARIABLE}); clearing the list returns to it."
+                ),
+            }
+        )
+    return ConfigSchema(component="library", fields=fields, categories=CATEGORY_LABELS)
 
 
-def _defaults() -> dict[str, Any]:
-    return {f.key: f.default for f in FIELDS if f.default is not None}
+def _defaults(*, default_roots: Sequence[str] = ()) -> dict[str, Any]:
+    values = {f.key: f.default for f in FIELDS if f.default is not None}
+    if default_roots:
+        values[ROOTS_KEY] = list(default_roots)
+    return values
 
 
 def _validate_value(field: ConfigField, value: Any) -> str | None:
@@ -309,12 +347,27 @@ class ConfigStore:
     """File-backed config state. Thread-safe for the read/write pattern
     the routes use."""
 
-    def __init__(self, path: Path, *, master_key: bytes | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        master_key: bytes | None = None,
+        default_roots: Sequence[str] = (),
+    ) -> None:
         self._path = path
         self._lock = threading.Lock()
-        self._values: dict[str, Any] = _defaults()
+        self._default_roots: list[str] = [r for r in default_roots if r.strip()]
+        self._values: dict[str, Any] = self._field_defaults()
+        # Whether `modelRoots` is currently the environment's default
+        # rather than something the operator set. Decides what the file
+        # gets: the default is never written, so the file keeps meaning
+        # "what the operator chose" and the variable keeps applying.
+        self._roots_defaulted = bool(self._default_roots)
         self._pending_restart: set[str] = set()
         self._master_key = master_key
+
+    def _field_defaults(self) -> dict[str, Any]:
+        return _defaults(default_roots=self._default_roots)
 
     def load(self) -> None:
         with self._lock:
@@ -322,14 +375,22 @@ class ConfigStore:
                 raw = yaml.safe_load(self._path.read_text(encoding="utf-8")) or {}
                 if not isinstance(raw, dict):
                     raise ValueError(f"config file {self._path} must be a YAML mapping at the root")
-                merged = _defaults()
+                merged = self._field_defaults()
                 for key, value in raw.items():
                     if key not in _FIELDS_BY_KEY:
                         continue
                     merged[key] = self._decrypt_loaded(key, value)
+                # An empty list on disk is "nothing configured", and the
+                # environment's default fills it -- including a file
+                # written before the variable existed, which is every
+                # container that came up before this default did.
+                self._roots_defaulted = bool(self._default_roots) and not merged.get(ROOTS_KEY)
+                if self._roots_defaulted:
+                    merged[ROOTS_KEY] = list(self._default_roots)
                 self._values = merged
             else:
-                self._values = _defaults()
+                self._values = self._field_defaults()
+                self._roots_defaulted = bool(self._default_roots)
                 self._write_locked()
 
     def _decrypt_loaded(self, key: str, value: Any) -> Any:
@@ -356,6 +417,20 @@ class ConfigStore:
                 out[key] = REDACTED if (field and field.sensitive and value is not None) else value
             return ConfigDocument.model_validate(out)
 
+    def schema(self) -> ConfigSchema:
+        return as_schema(default_roots=self._default_roots)
+
+    @property
+    def default_roots(self) -> list[str]:
+        """What the environment said, whether or not it is in effect."""
+        return list(self._default_roots)
+
+    def roots_are_defaulted(self) -> bool:
+        """True while `modelRoots` is the environment's default rather
+        than something the operator set."""
+        with self._lock:
+            return self._roots_defaulted
+
     def apply_patch(self, request: ConfigUpdateRequest) -> ConfigUpdateResult:
         applied: list[str] = []
         rejected: list[ConfigFieldError] = []
@@ -372,8 +447,17 @@ class ConfigStore:
                     rejected.append(ConfigFieldError(key=key, message=error))
                     continue
 
-                if new_value is None and field.default is not None:
-                    self._values[key] = field.default
+                defaults = self._field_defaults()
+                if key == ROOTS_KEY and self._default_roots:
+                    # `[]` clears to the default as `null` does: with the
+                    # environment naming the directories, "none" is not a
+                    # state this install can be in, only "these others".
+                    self._roots_defaulted = not new_value
+                    if self._roots_defaulted:
+                        new_value = None
+
+                if new_value is None and defaults.get(key) is not None:
+                    self._values[key] = defaults[key]
                 else:
                     self._values[key] = new_value
 
@@ -445,7 +529,13 @@ class ConfigStore:
         on_disk: dict[str, Any] = {}
         for key, value in self._values.items():
             field = _FIELDS_BY_KEY.get(key)
-            if (
+            if key == ROOTS_KEY and self._roots_defaulted:
+                # The environment's default is not the operator's choice,
+                # so it is not written down as one. `[]` here reads back
+                # as "use the default" (see `load`), which keeps a later
+                # change to the variable in force.
+                on_disk[key] = []
+            elif (
                 field is not None
                 and field.sensitive
                 and isinstance(value, str)

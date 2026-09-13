@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI
 
 from . import __version__
 from .auth_state import load_auth_state
-from .config import ConfigStore
+from .config import DEFAULT_ROOTS_VARIABLE, ConfigStore
 from .dependencies import require_authorized, require_operator
 from .downloads import DownloadManager
 from .hub import HubClient
@@ -45,7 +46,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             master_key_b64=settings.master_key,
         )
 
-    config_store = ConfigStore(settings.config_file, master_key=app.state.auth_state.master_key)
+    config_store = ConfigStore(
+        settings.config_file,
+        master_key=app.state.auth_state.master_key,
+        default_roots=settings.default_roots(),
+    )
     if settings.safe_mode:
         log.warning(
             "starting in SAFE MODE (EUGENE_PLEXUS_LIBRARY_SAFE_MODE=1); ignoring %s and "
@@ -70,6 +75,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
     app.state.config_store = config_store
     app.state.safe_mode = settings.safe_mode
+    _announce_default_roots(config_store)
 
     state_store = StateStore(settings.state_file)
     state_store.load()
@@ -118,6 +124,40 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.download_manager.shutdown()
         await manager.shutdown()
         await hub_client.aclose()
+
+
+def _announce_default_roots(config_store: ConfigStore) -> None:
+    """Say where the model directories came from when it was not the
+    operator, and say it plainly when one of them is not there.
+
+    In a container the missing case has exactly one meaning -- nothing
+    is mounted at that path -- and the scan will go on to report the
+    root as missing and health as degraded. This line is the sentence
+    that explains those, in the log an operator reads when the library
+    is empty.
+    """
+    if not config_store.default_roots:
+        return
+    roots = config_store.default_roots
+    if not config_store.roots_are_defaulted():
+        log.info(
+            "model directories are configured (%s); the environment's default (%s) is not in use",
+            ", ".join(str(r) for r in config_store.model_roots()),
+            ", ".join(roots),
+        )
+        return
+    log.info(
+        "model directories default to %s (%s); set them under Config to use others",
+        ", ".join(roots),
+        DEFAULT_ROOTS_VARIABLE,
+    )
+    for root in roots:
+        if not Path(root).expanduser().is_dir():
+            log.warning(
+                "%s does not exist -- in a container that means nothing is mounted there. "
+                "The scan will report it missing until the directory is mounted.",
+                root,
+            )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
