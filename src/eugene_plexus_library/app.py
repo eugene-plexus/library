@@ -17,6 +17,7 @@ from .hub import HubClient
 from .routes import admin as admin_routes
 from .routes import catalogue as catalogue_routes
 from .routes import config as config_routes
+from .routes import directories as directory_routes
 from .routes import downloads as download_routes
 from .routes import guidance as guidance_routes
 from .routes import health as health_routes
@@ -166,9 +167,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(download_routes.router, dependencies=authorized)
 
     # Wholly operator-only: config carries the roots, and restart is a
-    # process-lifecycle action.
+    # process-lifecycle action. The directory listing (M11) sits with
+    # them: it is the picker behind the roots field, and it walks the
+    # operator's disk on request, which no component's job involves.
     operator_only = [Depends(require_operator)]
     app.include_router(config_routes.router, dependencies=operator_only)
+    app.include_router(directory_routes.router, dependencies=operator_only)
     app.include_router(admin_routes.router, dependencies=operator_only)
 
     return app
