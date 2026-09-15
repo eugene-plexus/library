@@ -18,6 +18,7 @@ from .._generated.models import (
     ConfigUpdateResult,
 )
 from ..config import ConfigStore
+from ..folders import folder_paths
 
 router = APIRouter(tags=["config"])
 
@@ -77,10 +78,12 @@ def test_config(request: Request, body: ConfigTestRequest | None = None) -> Conf
             ok=False,
             component="library",
             latencyMs=int((time.perf_counter() - start) * 1000),
-            error=f"modelRoots must be a list of paths, got {type(raw).__name__}",
+            error=f"modelRoots must be a list of folders, got {type(raw).__name__}",
         )
 
-    roots = [Path(str(item)).expanduser() for item in raw if str(item).strip()]
+    # Folders' own paths only. A mount is a path on another machine and
+    # only that machine can stat it (`POST agent/v1/library/folders/check`).
+    roots = [Path(item).expanduser() for item in folder_paths(raw)]
     problems: list[str] = []
     readable: list[str] = []
 

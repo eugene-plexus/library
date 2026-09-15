@@ -6,13 +6,16 @@ Implements the shared Eugene Plexus config protocol:
 * `GET /v1/config` -> current effective values, secrets redacted
 * `PATCH /v1/config` -> partial update, per-key validation
 
-The field that matters is `modelRoots`, a `path_list`. Roots are config
-rather than a resource of their own precisely so the generic config
-editor renders them with no library-specific UI code — `path_list` was
-added to `ConfigValueType` in specs M2 for this, and the UI turns it
-into an add/remove list of directory pickers rather than a text field,
-because asking someone to comma-separate Windows paths is asking for a
-bug report.
+The field that matters is `modelRoots`, a `library_folders` list
+(2026-09-14; a `path_list` from M2 until then). Roots are config rather
+than a resource of their own precisely so the generic config editor
+renders them with no library-specific UI code. Each entry is a
+`LibraryFolder`: the directory as this host spells it, plus `mounts` --
+where other machines find the same directory, one per OS shape -- so
+the reach of a folder is stated once here and every node inherits it,
+instead of each node's agent carrying a row per folder. A bare string
+is still accepted and means a folder with no mounts; `folders.py` holds
+the coercion and the validation.
 
 `hfToken` is the one `sensitive` field: redacted in `GET`, accepted in
 `PATCH`, and sealed at rest with the master key. That machinery was
@@ -51,14 +54,16 @@ from ._generated.models import (
     ConfigUpdateRequest,
     ConfigUpdateResult,
     ConfigValueType,
+    LibraryFolder,
 )
+from .folders import as_models, coerce_folders, folder_paths, validate_folders
 
 log = logging.getLogger(__name__)
 
 REDACTED = "<redacted>"
 
 CATEGORY_LABELS: dict[str, str] = {
-    "library": "Model library",
+    "library": "Library",
     "scanning": "Scanning",
     "catalogue": "Model catalogue",
     "downloads": "Downloads",
@@ -69,18 +74,28 @@ CATEGORY_LABELS: dict[str, str] = {
 FIELDS: list[ConfigField] = [
     ConfigField(
         key="modelRoots",
-        label="Model directories",
+        label="Folders",
         description=(
-            "Directories to scan for models. Point these at wherever you "
+            "The directories this Library catalogues, as the machine the "
+            "Library runs on spells them. Point them at wherever you "
             "already keep models — an LM Studio folder, a drive full of "
             "GGUFs, a HuggingFace cache. Subdirectories are searched, so "
             "one entry covers a whole publisher/repo tree. Nothing is "
-            "moved, renamed or copied; these are read only. Order "
-            "matters only in that it is the order you see them in, and "
-            "downloads will default to the first."
+            "moved, renamed or copied; these are read only. Order matters "
+            "only in that it is the order you see them in, and downloads "
+            "will default to the first. A node runs a model only from one "
+            "of these folders. Each folder also carries its MOUNTS: where "
+            "other machines find the same directory — one path for Linux "
+            "and macOS nodes (`/mnt/models`), one for Windows nodes "
+            "(`\\\\NAS\\models`); a node takes the entry of its own "
+            "shape and inherits it, so the reach of a folder is stated "
+            "once, here. A node that mounts the share somewhere else "
+            "carries one override under Library → that node → Folders. "
+            "No mounts means the folder is reached at its own path, or "
+            "not at all — every single-machine install."
         ),
         category="library",
-        valueType=ConfigValueType.path_list,
+        valueType=ConfigValueType.library_folders,
         default=[],
     ),
     ConfigField(
@@ -248,11 +263,13 @@ def as_schema(*, default_roots: Sequence[str] = ()) -> ConfigSchema:
         field = fields[index]
         fields[index] = field.model_copy(
             update={
-                "default": list(default_roots),
+                "default": coerce_folders(list(default_roots)),
                 "description": (
                     f"{field.description} On this install the default is "
                     f"{', '.join(default_roots)}, set by its environment "
-                    f"({DEFAULT_ROOTS_VARIABLE}); clearing the list returns to it."
+                    f"({DEFAULT_ROOTS_VARIABLE}) with no mounts declared; clearing the "
+                    f"list returns to it, and adding mounts to it replaces it with an "
+                    f"explicit list that says the same path."
                 ),
             }
         )
@@ -262,7 +279,7 @@ def as_schema(*, default_roots: Sequence[str] = ()) -> ConfigSchema:
 def _defaults(*, default_roots: Sequence[str] = ()) -> dict[str, Any]:
     values = {f.key: f.default for f in FIELDS if f.default is not None}
     if default_roots:
-        values[ROOTS_KEY] = list(default_roots)
+        values[ROOTS_KEY] = coerce_folders(list(default_roots))
     return values
 
 
@@ -279,6 +296,9 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
         if field.pattern is not None and re.search(field.pattern, value) is None:
             return f"value does not match pattern {field.pattern!r}"
         return None
+
+    if vt == ConfigValueType.library_folders:
+        return validate_folders(value)
 
     if vt == ConfigValueType.path_list:
         if not isinstance(value, list):
@@ -386,7 +406,12 @@ class ConfigStore:
                 # container that came up before this default did.
                 self._roots_defaulted = bool(self._default_roots) and not merged.get(ROOTS_KEY)
                 if self._roots_defaulted:
-                    merged[ROOTS_KEY] = list(self._default_roots)
+                    merged[ROOTS_KEY] = coerce_folders(list(self._default_roots))
+                else:
+                    # A file written for `path_list` holds bare strings;
+                    # read as folders with no mounts, so one shape is
+                    # held in memory and one shape is written back.
+                    merged[ROOTS_KEY] = coerce_folders(merged.get(ROOTS_KEY))
                 self._values = merged
             else:
                 self._values = self._field_defaults()
@@ -448,6 +473,10 @@ class ConfigStore:
                     continue
 
                 defaults = self._field_defaults()
+                if key == ROOTS_KEY and new_value is not None:
+                    # Bare strings are accepted (the wizard, a script, the
+                    # M2 shape) and stored in the object form.
+                    new_value = coerce_folders(new_value)
                 if key == ROOTS_KEY and self._default_roots:
                     # `[]` clears to the default as `null` does: with the
                     # environment naming the directories, "none" is not a
@@ -480,18 +509,18 @@ class ConfigStore:
             return self._values.get(key)
 
     def model_roots(self) -> list[Path]:
-        """Configured roots as paths.
+        """Configured folders as paths on this host.
 
-        Non-string junk is filtered rather than raised on: validation
-        rejects it at PATCH time, and a hand-edited config file must not
-        stop the component from starting — the config endpoints are how
-        an operator repairs it.
+        Junk is filtered rather than raised on: validation rejects it at
+        PATCH time, and a hand-edited config file must not stop the
+        component from starting — the config endpoints are how an
+        operator repairs it.
         """
-        raw = self.get("modelRoots") or []
-        if not isinstance(raw, list):
-            log.warning("modelRoots is %s, expected a list; treating as empty", type(raw).__name__)
-            return []
-        return [Path(item).expanduser() for item in raw if isinstance(item, str) and item.strip()]
+        return [Path(item).expanduser() for item in folder_paths(self.get(ROOTS_KEY))]
+
+    def library_folders(self) -> list[LibraryFolder]:
+        """The folders with their mounts, as the wire carries them."""
+        return as_models(self.get(ROOTS_KEY))
 
     def catalogue_enabled(self) -> bool:
         return bool(self.get("catalogueEnabled"))

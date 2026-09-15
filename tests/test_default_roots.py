@@ -61,7 +61,8 @@ def test_a_fresh_install_uses_the_default_and_does_not_write_it_down(tmp_path: P
     store.load()
 
     assert store.model_roots() == [Path("/models")]
-    assert store.as_document().model_dump()["modelRoots"] == ["/models"]
+    # The wire carries the object form, whatever shape the default was given in.
+    assert store.as_document().model_dump()["modelRoots"] == [{"path": "/models", "mounts": []}]
     assert store.roots_are_defaulted()
     # The file records what the operator chose, which is nothing yet.
     assert _on_disk(tmp_path / "config.yaml")["modelRoots"] == []
@@ -96,7 +97,9 @@ def test_an_explicit_list_replaces_the_default_and_is_persisted(tmp_path: Path) 
 
     assert store.model_roots() == [Path("/data/mine")]
     assert not store.roots_are_defaulted()
-    assert _on_disk(tmp_path / "config.yaml")["modelRoots"] == ["/data/mine"]
+    assert _on_disk(tmp_path / "config.yaml")["modelRoots"] == [
+        {"path": "/data/mine", "mounts": []}
+    ]
 
 
 @pytest.mark.parametrize("cleared", [None, []], ids=["null", "empty-list"])
@@ -147,9 +150,9 @@ def test_the_schema_reports_this_installs_default(tmp_path: Path) -> None:
     store = ConfigStore(tmp_path / "config.yaml", default_roots=["/models"])
     field = next(f for f in store.schema().fields if f.key == "modelRoots")
 
-    assert field.default == ["/models"]
+    assert field.default == [{"path": "/models", "mounts": []}]
     assert DEFAULT_ROOTS_VARIABLE in (field.description or "")
-    assert field.valueType.value == "path_list"
+    assert field.valueType.value == "library_folders"
 
 
 def test_the_schema_without_a_default_is_unchanged() -> None:
@@ -193,14 +196,16 @@ def test_a_default_directory_is_scanned_with_nobody_having_opened_config(
 
     for client in _client(_settings(tmp_path)):
         _wait_for_scan(client)
-        assert client.get("/v1/config").json()["modelRoots"] == [str(models_dir)]
+        assert client.get("/v1/config").json()["modelRoots"] == [
+            {"path": str(models_dir), "mounts": []}
+        ]
         health = client.get("/healthz").json()
         assert health["status"] == "ok"
         assert health["details"]["rootsConfigured"] == 1
         assert [m["name"] for m in client.get("/v1/models").json()["models"]] == ["a-Q4_K_M"]
         schema = client.get("/v1/config/schema").json()
         assert next(f for f in schema["fields"] if f["key"] == "modelRoots")["default"] == [
-            str(models_dir)
+            {"path": str(models_dir), "mounts": []}
         ]
 
 
@@ -233,6 +238,8 @@ def test_the_operators_own_directories_silence_the_default(
     caplog.set_level(logging.INFO, logger="eugene_plexus_library.app")
 
     for client in _client(_settings(tmp_path, default_model_roots="/models")):
-        assert client.get("/v1/config").json()["modelRoots"] == [models_dir.as_posix()]
+        assert client.get("/v1/config").json()["modelRoots"] == [
+            {"path": models_dir.as_posix(), "mounts": []}
+        ]
 
     assert "is not in use" in caplog.text

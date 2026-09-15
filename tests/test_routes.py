@@ -295,13 +295,15 @@ def test_a_mixed_tree_end_to_end(configured_client: TestClient, models_dir: Path
 # --- config -------------------------------------------------------------------
 
 
-def test_config_schema_declares_the_roots_as_a_path_list(client: TestClient) -> None:
+def test_config_schema_declares_the_roots_as_library_folders(client: TestClient) -> None:
     """Roots are config rather than a resource of their own precisely so
-    the generic editor renders them with no library-specific code."""
+    the generic editor renders them with no library-specific code. A
+    `path_list` from M2; `library_folders` since the reach of a folder
+    moved onto the folder (2026-09-14)."""
     schema = client.get("/v1/config/schema").json()
     field = next(f for f in schema["fields"] if f["key"] == "modelRoots")
 
-    assert field["valueType"] == "path_list"
+    assert field["valueType"] == "library_folders"
     assert schema["component"] == "library"
 
 
@@ -309,7 +311,10 @@ def test_patching_roots(client: TestClient, models_dir: Path) -> None:
     response = client.patch("/v1/config", json={"modelRoots": [str(models_dir)]})
 
     assert response.json()["applied"] == ["modelRoots"]
-    assert client.get("/v1/config").json()["modelRoots"] == [str(models_dir)]
+    # A bare string in, the object form out: one shape on the wire.
+    assert client.get("/v1/config").json()["modelRoots"] == [
+        {"path": str(models_dir), "mounts": []}
+    ]
 
 
 def test_patching_roots_does_not_start_a_scan(client: TestClient, models_dir: Path) -> None:
