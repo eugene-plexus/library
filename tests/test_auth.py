@@ -90,7 +90,8 @@ def test_a_token_signed_with_the_wrong_key_is_rejected(authed_client: TestClient
 
 
 def test_an_expired_token_is_rejected(authed_client: TestClient, signing_key: bytes) -> None:
-    stale = _issue(signing_key=signing_key, sub="operator", aud="operator", ttl_seconds=-10)
+    # Expired past the 300 s clock-skew leeway, not merely past `exp`.
+    stale = _issue(signing_key=signing_key, sub="operator", aud="operator", ttl_seconds=-600)
     assert authed_client.get("/v1/models", headers=_auth(stale)).status_code == 401
 
 
