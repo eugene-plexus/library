@@ -147,6 +147,29 @@ def test_a_root_that_was_not_configured_is_refused(tmp_path: Path) -> None:
     assert raised.value.code == "UnknownRoot"
 
 
+def test_a_configured_root_that_does_not_exist_yet_is_accepted(tmp_path: Path) -> None:
+    """The first-run wizard proposes `<home>/Eugene Models` and promises
+    "nothing is created until the first download lands there" (hobbyist
+    UX plan, S2). That promise rests on two facts about this module: a
+    configured root is never checked for existence here, and the
+    transfer creates the destination tree (`_transfer_one`'s
+    `mkdir(parents=True)`). This pins the first; a root-must-exist check
+    added later would turn the proposal into a 409 on first use."""
+    proposed = tmp_path / "Eugene Models"
+    assert not proposed.exists()
+    _, directory = downloads.resolve_destination(
+        repo="unsloth/Qwen3-8B-GGUF",
+        roots=[proposed],
+        root=None,
+        subdirectory=None,
+        layout="publisher_repo",
+    )
+    assert directory == proposed / "unsloth" / "Qwen3-8B-GGUF"
+    # Resolving plans; it does not create. The folder appears with the
+    # first file, not with the first look.
+    assert not proposed.exists()
+
+
 def test_no_roots_configured_is_a_conflict_not_a_guess(tmp_path: Path) -> None:
     """A fresh install has nowhere to put a model, and inventing a
     directory is exactly what this component refuses to do."""
