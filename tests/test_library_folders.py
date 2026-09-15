@@ -183,3 +183,18 @@ def test_the_test_button_stats_the_folders_own_path_and_never_a_mount(
 
     assert result["ok"] is True
     assert "1 model directory is readable" in result["summary"]
+
+
+def test_the_folders_are_a_resource_a_service_token_can_read(
+    client: TestClient, models_dir: Path
+) -> None:
+    """A node's agent inherits its path rules from here, with a service
+    token; the config trio it mirrors is operator-only."""
+    client.patch(
+        "/v1/config",
+        json={"modelRoots": [{"path": str(models_dir), "mounts": ["\\\\NAS\\models"]}]},
+    )
+
+    body = client.get("/v1/folders").json()
+
+    assert body == {"folders": [{"path": str(models_dir), "mounts": ["\\\\NAS\\models"]}]}

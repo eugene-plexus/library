@@ -9,35 +9,39 @@ from typing import Any
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
-class ModelFormat(StrEnum):
+class LibraryFolder(BaseModel):
     """
-    On-disk format of a model. A dimension of the data model rather
-    than an assumption (locked 2026-09-08): both are implemented at
-    v0.1, and the differences are load-bearing rather than
-    cosmetic.
+    One directory the library catalogues, and where other machines
+    find it (2026-09-14).
 
-    * `gguf` — a single file, quantized, carrying its own metadata
-      and tokenizer. Large models may be **split** into
-      `…-00001-of-0000N.gguf` shards, of which only the first is
-      named on a launch line. A multimodal GGUF ships its vision
-      projector as a separate file in the same directory, which is
-      not itself a model.
-    * `safetensors` — a directory: `config.json` plus one or more
-      weight files plus tokenizer files. Unquantized in practice,
-      so **no quant tier** — a safetensors model is sized, not
-      tiered, and the quant fields exist only on the GGUF side.
+    `path` is the directory as the library's own host spells it —
+    what the scanner walks, what a `ModelSummary.path` starts with,
+    the left-hand side of every rule that reaches it. `mounts` is
+    the same directory as **other** machines see it: a POSIX-shaped
+    entry is for Linux and macOS nodes, a Windows-shaped one (drive
+    letter or UNC) for Windows nodes, and a node takes the first
+    entry of its own shape. That is the whole of "how does node X
+    reach folder Y" for every node that mounts the share where the
+    folder says; a node that mounts it elsewhere carries one
+    override in its agent's `pathMappings`, and a node with no
+    mount of its shape opens `path` as written — the identical-mount
+    convention, and every single-host install.
 
-    Shared because it appears on both sides of a join: a library
-    entry declares what a model *is*, and
-    `EngineDescriptor.modelFormats` declares what an engine can
-    *load*. Nothing can serve a safetensors model until the vLLM
-    adapter lands, and that answer comes from the engine's
-    descriptor rather than from anything the library knows.
+    The rule this replaces was per node per folder, on each node's
+    agent, and grew as nodes × folders with every row typed by hand.
+    This is per folder, stated once. Nothing is copied or cached:
+    the operator mounts the share, this says where.
 
     """
 
-    gguf = 'gguf'
-    safetensors = 'safetensors'
+    path: str = Field(
+        ...,
+        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
+    )
+    mounts: list[str] | None = Field(
+        [],
+        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
+    )
 
 
 class Role(StrEnum):
@@ -199,6 +203,37 @@ class EngineKind(StrEnum):
 
     llama_cpp = 'llama_cpp'
     vllm = 'vllm'
+
+
+class ModelFormat(StrEnum):
+    """
+    On-disk format of a model. A dimension of the data model rather
+    than an assumption (locked 2026-09-08): both are implemented at
+    v0.1, and the differences are load-bearing rather than
+    cosmetic.
+
+    * `gguf` — a single file, quantized, carrying its own metadata
+      and tokenizer. Large models may be **split** into
+      `…-00001-of-0000N.gguf` shards, of which only the first is
+      named on a launch line. A multimodal GGUF ships its vision
+      projector as a separate file in the same directory, which is
+      not itself a model.
+    * `safetensors` — a directory: `config.json` plus one or more
+      weight files plus tokenizer files. Unquantized in practice,
+      so **no quant tier** — a safetensors model is sized, not
+      tiered, and the quant fields exist only on the GGUF side.
+
+    Shared because it appears on both sides of a join: a library
+    entry declares what a model *is*, and
+    `EngineDescriptor.modelFormats` declares what an engine can
+    *load*. Nothing can serve a safetensors model until the vLLM
+    adapter lands, and that answer comes from the engine's
+    descriptor rather than from anything the library knows.
+
+    """
+
+    gguf = 'gguf'
+    safetensors = 'safetensors'
 
 
 class Problem(BaseModel):
@@ -640,41 +675,6 @@ class PathMapping(BaseModel):
     to: str = Field(
         ...,
         description="The same directory on the host holding this config. Used\nverbatim, `~` expanded; the remainder of a matched path is\nre-joined onto it with this host's own separator.\n",
-    )
-
-
-class LibraryFolder(BaseModel):
-    """
-    One directory the library catalogues, and where other machines
-    find it (2026-09-14).
-
-    `path` is the directory as the library's own host spells it —
-    what the scanner walks, what a `ModelSummary.path` starts with,
-    the left-hand side of every rule that reaches it. `mounts` is
-    the same directory as **other** machines see it: a POSIX-shaped
-    entry is for Linux and macOS nodes, a Windows-shaped one (drive
-    letter or UNC) for Windows nodes, and a node takes the first
-    entry of its own shape. That is the whole of "how does node X
-    reach folder Y" for every node that mounts the share where the
-    folder says; a node that mounts it elsewhere carries one
-    override in its agent's `pathMappings`, and a node with no
-    mount of its shape opens `path` as written — the identical-mount
-    convention, and every single-host install.
-
-    The rule this replaces was per node per folder, on each node's
-    agent, and grew as nodes × folders with every row typed by hand.
-    This is per folder, stated once. Nothing is copied or cached:
-    the operator mounts the share, this says where.
-
-    """
-
-    path: str = Field(
-        ...,
-        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
-    )
-    mounts: list[str] | None = Field(
-        [],
-        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
     )
 
 
@@ -1365,6 +1365,17 @@ class QuantTier(BaseModel):
     )
 
 
+class LibraryFolderList(BaseModel):
+    """
+    The folders the library catalogues, as `GET /v1/folders` answers
+    them — the same objects `modelRoots` holds, one shape on the
+    wire whatever shape the config was given in.
+
+    """
+
+    folders: list[LibraryFolder]
+
+
 class ComputeDevice(BaseModel):
     """
     One compute device on one host, as that host's agent detected it.
@@ -1753,6 +1764,43 @@ class QuantTable(BaseModel):
     )
 
 
+class DirectoryListing(BaseModel):
+    """
+    One directory on the component's own host, listed for a picker.
+
+    Returned by `GET /v1/directories` on the library (whose host
+    holds the model roots) and on the agent (whose host holds a
+    path mapping's `to`, and any engine binary an operator points
+    at). The same shape on both, because the UI has one picker and
+    the only thing that differs is which machine's disk it is
+    looking at — which is why `host` is on the response.
+
+    This is the endpoint behind the promise `path_list` has carried
+    since M2: *"an add/remove list of directory pickers"*. It lists
+    what an operator could already type into a path field, on
+    request, to the strongest credential there is; it is not a new
+    capability and it is not a file browser.
+
+    """
+
+    host: str = Field(
+        ...,
+        description='The machine whose disk this is. On a multi-host install the\nanswer to "browse" is frequently a machine other than the\none the browser is on.\n',
+    )
+    path: str | None = Field(
+        None,
+        description='The directory listed, absolute and as this host spells it.\nAbsent when no `path` was asked for, in which case `entries`\nare the places to start from — every drive on Windows, `/`\non POSIX, and the home directory.\n',
+    )
+    parent: str | None = Field(
+        None,
+        description='The directory above `path`, so a picker can go up without\ndoing path arithmetic in a browser. Absent at a filesystem\nroot and when `path` is absent.\n',
+    )
+    entries: list[DirectoryEntry] = Field(
+        ...,
+        description='Sorted by name, directories first. Entries this component\nmay not read are omitted rather than failing the listing.\n',
+    )
+
+
 class LibraryModel(BaseModel):
     """
     One launchable model on this host.
@@ -1842,43 +1890,6 @@ class LibraryModel(BaseModel):
     error: str | None = Field(
         None,
         description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
-    )
-
-
-class DirectoryListing(BaseModel):
-    """
-    One directory on the component's own host, listed for a picker.
-
-    Returned by `GET /v1/directories` on the library (whose host
-    holds the model roots) and on the agent (whose host holds a
-    path mapping's `to`, and any engine binary an operator points
-    at). The same shape on both, because the UI has one picker and
-    the only thing that differs is which machine's disk it is
-    looking at — which is why `host` is on the response.
-
-    This is the endpoint behind the promise `path_list` has carried
-    since M2: *"an add/remove list of directory pickers"*. It lists
-    what an operator could already type into a path field, on
-    request, to the strongest credential there is; it is not a new
-    capability and it is not a file browser.
-
-    """
-
-    host: str = Field(
-        ...,
-        description='The machine whose disk this is. On a multi-host install the\nanswer to "browse" is frequently a machine other than the\none the browser is on.\n',
-    )
-    path: str | None = Field(
-        None,
-        description='The directory listed, absolute and as this host spells it.\nAbsent when no `path` was asked for, in which case `entries`\nare the places to start from — every drive on Windows, `/`\non POSIX, and the home directory.\n',
-    )
-    parent: str | None = Field(
-        None,
-        description='The directory above `path`, so a picker can go up without\ndoing path arithmetic in a browser. Absent at a filesystem\nroot and when `path` is absent.\n',
-    )
-    entries: list[DirectoryEntry] = Field(
-        ...,
-        description='Sorted by name, directories first. Entries this component\nmay not read are omitted rather than failing the listing.\n',
     )
 
 

@@ -4,11 +4,33 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from .._generated.models import LibraryModel, LibraryModelList, ModelStatus, Problem
+from .._generated.models import (
+    LibraryFolderList,
+    LibraryModel,
+    LibraryModelList,
+    ModelStatus,
+    Problem,
+)
+from ..config import ConfigStore
 from ..dependencies import require_operator
 from ..store import StateStore
 
 router = APIRouter(tags=["models"])
+
+
+@router.get("/v1/folders", response_model=LibraryFolderList)
+async def list_folders(request: Request) -> LibraryFolderList:
+    """`modelRoots` as a resource, readable with a service token.
+
+    The reader that matters is a node's agent inheriting its path rules
+    (2026-09-14): a worker reaches this through the install with a
+    `service:agent` token at every launch and keeps a copy for the
+    spawns the library is not around for. The config trio it mirrors is
+    operator-only, which is why this exists; nothing here is secret --
+    the same paths are on every model below.
+    """
+    config: ConfigStore = request.app.state.config_store
+    return LibraryFolderList(folders=config.library_folders())
 
 
 def _problem(status_code: int, title: str, detail: str) -> HTTPException:
