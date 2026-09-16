@@ -652,6 +652,31 @@ class DownloadManager:
     def _persist(self, record: Download) -> None:
         self._store.put_download(record)
 
+    async def claim(self, download_id: str) -> tuple[bool, Download] | None:
+        """Take the intent off a record, once. `None` when there is none.
+
+        **Under the manager's own lock**, because the point of this is
+        that exactly one caller gets it: two consoles polling the same
+        install will both see a finished download with `runWhenReady`
+        set, and without an atomic clear both would create a profile and
+        launch a runtime for the same model.
+
+        Idempotent by construction — a second claim finds the flag
+        already down and answers `False` — so a client that retries
+        after a timeout does not get told something is wrong when
+        nothing is.
+        """
+        async with self._lock:
+            job = self._jobs.get(download_id)
+            if job is None:
+                return None
+            record = job.record
+            if not record.runWhenReady:
+                return False, record
+            record.runWhenReady = False
+            self._persist(record)
+            return True, record
+
     # -- starting -----------------------------------------------------------
 
     async def start(self, spec: DownloadSpec) -> Download:
@@ -716,6 +741,7 @@ class DownloadManager:
             bytesDownloaded=0,
             attempts=0,
             startedAt=_now(),
+            runWhenReady=bool(spec.runWhenReady),
             message=f"queued; {len(entries)} file(s) into {directory}",
         )
 

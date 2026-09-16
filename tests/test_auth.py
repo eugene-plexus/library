@@ -133,6 +133,18 @@ def test_a_service_token_cannot_forget_a_model(
     )
 
 
+def test_a_service_token_cannot_claim_a_download(
+    authed_client: TestClient, service_token: str
+) -> None:
+    """Taking responsibility for launching something is not a read, and
+    a claim is the one write on a download record that is not about the
+    transfer."""
+    assert (
+        authed_client.post("/v1/downloads/whatever/claim", headers=_auth(service_token)).status_code
+        == 401
+    )
+
+
 def test_a_service_token_cannot_write_a_profile(
     authed_client: TestClient, service_token: str
 ) -> None:

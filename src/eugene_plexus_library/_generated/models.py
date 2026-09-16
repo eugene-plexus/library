@@ -1217,9 +1217,27 @@ class DownloadSpec(BaseModel):
         None,
         description='Relative destination under `root`, overriding the configured\nlayout. Path traversal is rejected; the result must stay\ninside the root.\n',
     )
+    runWhenReady: bool | None = Field(
+        False,
+        description="The operator asked for this model to be **run** when it\nlands, not merely fetched.\n\n**This component records it and never acts on it.** The\nlibrary does not launch anything — a launch is a profile, an\nengine and a runtime on some node's agent, and which node is\na question the library has no business answering. What this\nfield buys is that the *intent* outlives the browser tab\nthat expressed it: a 16 GB download takes long enough that\nthe person will close the laptop lid, and a console opening\nlater can see that a download was started in order to run\nsomething and carry on from there.\n\nExactly one console should carry on, which is what\n`POST /v1/downloads/{id}/claim` is for.\n",
+    )
     filename: str | None = Field(
         None,
         description='Override the written name of the **single-file** case. Rarely\nwanted: the upstream name is what the operator recognises,\nwhat the library will call it, and what\n`Runtime.modelAlias` defaults to — plainly-named files are\nthe point. Rejected when `files` holds more than one entry,\nbecause renaming one shard of a set breaks the set.\n',
+    )
+
+
+class DownloadClaim(BaseModel):
+    """
+    The answer to "am I the one who continues this?". `claimed` is
+    true for exactly one caller per download.
+
+    """
+
+    claimed: bool
+    modelId: str | None = Field(
+        None,
+        description='The local model the download produced, when the scan that\nfollows a completed transfer has named it. Absent while the\nscan is still running, which is a reason to wait rather than\na reason to give up — the claim is already yours.\n',
     )
 
 
@@ -2193,6 +2211,10 @@ class Download(BaseModel):
         None, description='Recent rate, not an average over the whole job.', ge=0.0
     )
     etaSeconds: int | None = Field(None, ge=0)
+    runWhenReady: bool | None = Field(
+        None,
+        description='The operator asked for this model to be run when it lands.\nRecorded, never acted on here — see `DownloadSpec`. Cleared\nby `POST /v1/downloads/{id}/claim`, so a finished download\nwhose flag is still set is one nobody has picked up yet.\n',
+    )
     attempts: int | None = Field(
         None,
         description='How many times the transfer has been (re)started, including\nautomatic retries. Visible because a 40 GB fetch over a\ndomestic link will meet transient failures, and the\ndifference between a flaky connection and a dead one is\nthis number moving.\n',
