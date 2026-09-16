@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 from ._generated.models import (
     Basis,
@@ -78,11 +79,52 @@ f16 scale is 18 bytes for 32 elements, not 16."""
 
 
 @dataclass(frozen=True)
+class LayerKV:
+    """One layer's KV cost, because layers stopped being alike.
+
+    `window` is the sliding-attention window in tokens, or `None` for a
+    full-attention layer. A sliding layer never caches more than its
+    window however long the prompt is, which is the whole point of the
+    design and the term the scalar arithmetic below cannot express.
+    """
+
+    head_count_kv: int
+    key_length: int
+    value_length: int
+    window: int | None = None
+
+    def elements(self, context_length: int) -> int:
+        effective = min(context_length, self.window) if self.window else context_length
+        return effective * self.head_count_kv * (self.key_length + self.value_length)
+
+
+@dataclass(frozen=True)
 class ModelShape:
     """What the KV-cache term needs from a model's metadata.
 
     A typed carrier rather than a dict so a renamed field fails at the
     call site instead of silently producing a zero-sized cache.
+
+    ## Why there is a per-layer form as well as the scalars
+
+    The scalars assume every layer caches the same thing, which stopped
+    being true twice. First hybrids: some layers hold no KV at all, and
+    `attention_layers` exists for that. Then per-layer attention:
+    `attention.head_count_kv` is **an array** on a current mainstream
+    12B -- eight heads on five layers of every six and one on the sixth
+    -- and five of every six layers are sliding-window with their own
+    shorter key and value lengths and a 1024-token window.
+
+    Measured on that file at 16k context: the scalar arithmetic, falling
+    back to `head_count` because the array is not an integer, says
+    **24.0 GiB**. The per-layer truth is **0.56 GiB**. A factor of 43,
+    and 83 at the model's own trained context -- which is the difference
+    between "the starter card recommends this" and "the starter card
+    says a 7 GB model will not fit a 32 GB card".
+
+    So `layers` wins when the reader could build it, and the scalars
+    remain for every file that declares the simple form -- which is most
+    of them, and all of the older ones.
     """
 
     block_count: int | None = None
@@ -98,9 +140,15 @@ class ModelShape:
     context_length: int | None = None
     parameters: int | None = None
 
+    layers: tuple[LayerKV, ...] | None = None
+    """Per-layer KV, when the file declared enough to build it. Wins over
+    every scalar below -- see the class docstring for the 43x."""
+
     @property
     def complete(self) -> bool:
         """Is there enough here to compute a real KV cache size?"""
+        if self.layers:
+            return True
         return (
             self.effective_attention_layers is not None and self._per_token_elements() is not None
         )
@@ -137,12 +185,77 @@ class ModelShape:
         return heads_kv * (key_len + value_len)
 
     def kv_bytes(self, context_length: int, kv_cache_type: KvCacheType) -> int | None:
+        element = KV_ELEMENT_BYTES[kv_cache_type]
+        if self.layers:
+            return int(sum(layer.elements(context_length) for layer in self.layers) * element)
         layers = self.effective_attention_layers
         per_token = self._per_token_elements()
         if not layers or not per_token:
             return None
-        element = KV_ELEMENT_BYTES[kv_cache_type]
         return int(context_length * layers * per_token * element)
+
+    def kv_terms(self, kv_cache_type: KvCacheType) -> tuple[float, int] | None:
+        """`(bytes per token, fixed bytes)` -- the cache as a line in ctx.
+
+        Sliding layers stop growing at their window, so the cache is
+        affine in context rather than linear through the origin, and
+        `max_context_that_fits` cannot divide by a single per-token
+        figure any more. Above every window the slope is the
+        full-attention layers alone and the sliding ones are the
+        constant; at a context shorter than a window that over-charges
+        the fixed term, which errs pessimistic and is the direction this
+        module errs on purpose.
+        """
+        element = KV_ELEMENT_BYTES[kv_cache_type]
+        if self.layers:
+            slope = sum(
+                layer.head_count_kv * (layer.key_length + layer.value_length)
+                for layer in self.layers
+                if layer.window is None
+            )
+            fixed = sum(layer.elements(layer.window or 0) for layer in self.layers if layer.window)
+            return slope * element, int(fixed * element)
+        per_token = self.kv_bytes(1, kv_cache_type)
+        return (float(per_token), 0) if per_token else None
+
+
+def encode_layers(layers: tuple[LayerKV, ...] | None) -> list[list[int | None]] | None:
+    """Run-length: `[[count, heads, key, value, window|null], ...]`.
+
+    For a file to be read by a person before they accept it. A 48-layer
+    model with a five-in-six sliding pattern is sixteen runs rather than
+    forty-eight rows, and the runs make the pattern visible, which is
+    the point of a data file a human signs off on.
+    """
+    if not layers:
+        return None
+    runs: list[list[int | None]] = []
+    for layer in layers:
+        row = [1, layer.head_count_kv, layer.key_length, layer.value_length, layer.window]
+        if runs and runs[-1][1:] == row[1:]:
+            runs[-1][0] = (runs[-1][0] or 0) + 1
+        else:
+            runs.append(row)
+    return runs
+
+
+def decode_layers(runs: Any) -> tuple[LayerKV, ...] | None:
+    """The inverse. Any malformed run means "use the scalars"."""
+    if not isinstance(runs, list) or not runs:
+        return None
+    layers: list[LayerKV] = []
+    for run in runs:
+        if not isinstance(run, list | tuple) or len(run) != 5:
+            return None
+        count, heads, key, value, window = run
+        if not all(isinstance(v, int) for v in (count, heads, key, value)):
+            return None
+        if window is not None and not isinstance(window, int):
+            return None
+        if count <= 0 or count > 1024:
+            return None
+        layers += [LayerKV(heads, key, value, window)] * count
+    return tuple(layers)
 
 
 def budget_from_hardware(
@@ -316,13 +429,14 @@ def max_context_that_fits(
     to a multiple of 256, because a context of 31,847 is not a number
     anyone should be handed.
     """
-    per_token = shape.kv_bytes(1, kv_cache_type)
-    if not per_token:
+    terms = shape.kv_terms(kv_cache_type)
+    if terms is None or terms[0] <= 0:
         return None
+    per_token, fixed = terms
 
     vram_free = budget.vramFreeBytes or 0
     available = (vram_free if vram_free else (budget.ramAvailableBytes or 0)) - overhead_bytes
-    available -= weights_bytes
+    available -= weights_bytes + fixed
     if available <= 0:
         return None
 

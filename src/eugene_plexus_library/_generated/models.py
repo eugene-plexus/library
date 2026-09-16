@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from enum import StrEnum
 from typing import Any
 
@@ -999,6 +1000,21 @@ class CatalogueSort(StrEnum):
     created = 'created'
 
 
+class InterpretedAs(StrEnum):
+    """
+    How `q` was read. `repo` means it parsed as a repo
+    reference -- a hub URL, or a bare `owner/name` that
+    resolved -- and `results` holds that one repo; a client
+    should select it rather than make the person click the only
+    row. `search` is an ordinary query, including a bare
+    `owner/name` that upstream had no repo for.
+
+    """
+
+    search = 'search'
+    repo = 'repo'
+
+
 class GateKind(StrEnum):
     """
     Whether upstream restricts the *bytes*. `open` is unrestricted;
@@ -1115,6 +1131,43 @@ class AlreadyOwned(BaseModel):
     matchedOn: MatchedOn | None = Field(
         None,
         description="`digest` is certain — the local file's hash was known and\nmatched. `name_and_size` is a strong guess and labelled as\none, because the library deliberately never hashes model\ncontent (a 40 GB read per scan is not on the table), so for\nmost entries name and size is all there is to compare.\n",
+    )
+
+
+class StarterSetSource(StrEnum):
+    """
+    `shipped` is the list inside the wheel; `configured` is a file
+    `starterModelsFile` points at. An operator who replaced the list
+    should see that they did.
+
+    A named schema rather than an inline enum, and the reason is a
+    codegen hazard rather than taste: `datamodel-code-generator`
+    names an inline enum after its property, so a second inline
+    `source:` anywhere in this document renames the FIRST one --
+    `MemoryBudget.source` became `Source1` and every existing
+    `Source.override` call site broke. Inline enums in a document
+    this size are a collision waiting for the next schema.
+
+    """
+
+    shipped = 'shipped'
+    configured = 'configured'
+
+
+class StarterRecommendation(BaseModel):
+    """
+    Which entry this machine should take, and why -- or, when
+    `sizeClass` is absent, why none of them.
+
+    """
+
+    sizeClass: str | None = Field(
+        None,
+        description="The recommended entry's `sizeClass`. Absent when nothing in\nthe list fits, in which case `reason` says what would.\n",
+    )
+    reason: str = Field(
+        ...,
+        description='Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n',
     )
 
 
@@ -1943,6 +1996,14 @@ class Scan(BaseModel):
 
 class CatalogueSearchPage(BaseModel):
     results: list[CatalogueSearchResult]
+    interpretedAs: InterpretedAs | None = Field(
+        None,
+        description='How `q` was read. `repo` means it parsed as a repo\nreference -- a hub URL, or a bare `owner/name` that\nresolved -- and `results` holds that one repo; a client\nshould select it rather than make the person click the only\nrow. `search` is an ordinary query, including a bare\n`owner/name` that upstream had no repo for.\n',
+    )
+    interpretedFrom: str | None = Field(
+        None,
+        description='The repo id a `repo` interpretation resolved to, which is\nnot always what was typed: a URL carries a `/tree/` or\n`/blob/` tail and a person pastes the whole thing.\n',
+    )
     nextCursor: str | None = Field(
         None,
         description="Pass back as `cursor` for the next page. Absent on the last\npage. Opaque — it is upstream's own continuation token and\ncarries no page arithmetic.\n",
@@ -1997,6 +2058,56 @@ class CatalogueCandidate(BaseModel):
         None,
         description="Convenience copy of the repo's gate, on the row the operator\nis about to click.\n",
     )
+
+
+class StarterModel(BaseModel):
+    """
+    One entry: a base model, the repo a quant of it comes from, the
+    one file to fetch, and everything a fit needs -- measured once by
+    the review, carried here so no upstream call is required.
+
+    """
+
+    sizeClass: str = Field(
+        ...,
+        description='The bucket this entry fills, by total parameter count:\n`4B`, `8B`, `14B`, `30B`, `70B`. Total, not active -- a\nmixture-of-experts model holds every expert in memory, so\n30B-A3B is a 30B for the only purpose this number serves.\n',
+    )
+    baseModel: str = Field(
+        ...,
+        description='The model itself, e.g. `Qwen/Qwen3.5-9B`. What the ranking\nis about: a dozen publishers mirror one model and they are\none candidate, not a dozen.\n',
+    )
+    repo: str = Field(
+        ...,
+        description='The repo the file comes from -- one mirror of many, chosen\nfrom a short list of publishers a human maintains. Never the\nhighest-download repo automatically; that is how a\nkeyword-stuffed finetune becomes a default.\n',
+    )
+    file: str = Field(
+        ..., description='The repo-relative path of the recommended quant.'
+    )
+    label: str = Field(..., description='The quant, e.g. `Q4_K_M`.')
+    sizeBytes: int
+    parameters: int | None = None
+    architecture: str | None = Field(
+        None,
+        description="The GGUF architecture id, e.g. `qwen35`. Recorded because\nthe review checks it against the pinned engine's own\narchitecture list -- a model no engine here can load must\nnever be recommended.\n",
+    )
+    contextLength: int | None = Field(
+        None, description='What the model was trained for, not what fits.'
+    )
+    license: str | None = None
+    why: str = Field(
+        ...,
+        description="One sentence, in the review's words: why this entry is in\nthe list. Downloads, and the window they were counted over.\n",
+    )
+    downloads30d: int | None = Field(
+        None,
+        description='The 30-day download count the ranking used, as of\n`reviewed`. A number with a date on it rather than a live\none, because this endpoint makes no upstream call.\n',
+    )
+    fit: Fit | None = None
+    maxContextLength: int | None = Field(
+        None,
+        description='The largest context this entry fits entirely in GPU memory\nat, on the scored machine. The number a profile takes, and\nthe reason a client can say *fits at 75,520* rather than\njust *fits*.\n',
+    )
+    alreadyOwned: AlreadyOwned | None = None
 
 
 class CataloguePreflight(BaseModel):
@@ -2181,6 +2292,38 @@ class CatalogueModel(BaseModel):
     warnings: list[str] | None = Field(
         None,
         description='Things to say before a download starts: the repo is gated,\nnothing here fits, the only thing that fits is a very low\nquant, upstream metadata was unreadable so the fit is a\nsize estimate.\n',
+    )
+
+
+class StarterSet(BaseModel):
+    """
+    The starter set as this install has it, scored against one
+    machine. Every field that could go stale carries the evidence
+    for how stale it is.
+
+    """
+
+    reviewed: date = Field(
+        ...,
+        description='When a human last accepted a review of this list. Shown to\nthe person, not just logged: "Reviewed 15 Sep 2026" is the\none thing that lets them judge a recommendation about a\nfield that moves monthly.\n',
+    )
+    reviewedDaysAgo: int | None = Field(
+        None,
+        description='Computed here so a client does not have to do date\narithmetic to decide whether to say "this is old".\n',
+    )
+    engine: str | None = Field(
+        None,
+        description='The engine build every entry was verified to load, e.g.\n`llama_cpp b10948`. A starter model the installed engine\ncannot load is the one recommendation worse than none, so\nthe build that proved it is recorded rather than assumed.\n',
+    )
+    source: StarterSetSource
+    models: list[StarterModel] = Field(
+        ...,
+        description='One entry per size class. Empty is valid and means there is\nno recommendation to make; a client offers search instead.\n',
+    )
+    recommended: StarterRecommendation | None = None
+    notes: list[str] | None = Field(
+        None,
+        description='What the caller should know about this answer: an empty\nlist and why, a list older than the release gate allows, a\nbudget that came from an override.\n',
     )
 
 

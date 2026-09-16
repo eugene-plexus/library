@@ -17,18 +17,21 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from .. import catalogue as catalogue_mod
 from .. import fit as fit_mod
-from .. import hardware
+from .. import hardware, repo_ref
 from .. import preflight as preflight_mod
+from .. import starter as starter_mod
 from .._generated.models import (
     CatalogueCard,
     CatalogueModel,
     CataloguePreflight,
     CatalogueSearchPage,
     CatalogueSort,
+    InterpretedAs,
     KvCacheType,
     MemoryBudget,
     ModelFormat,
     Problem,
+    StarterSet,
 )
 from ..config import ConfigStore
 from ..hub import HubClient, HubError
@@ -167,6 +170,17 @@ async def search_catalogue(
     window, which is not a substitute.
     """
     client = _client(request)
+
+    # A pasted repo reference is a lookup, not a query. Upstream's
+    # full-text index has never matched a URL, so before this the
+    # commonest way a person arrives with a model in mind -- someone
+    # linked them one -- produced an empty list and no clue.
+    reference = repo_ref.parse(q)
+    if reference is not None:
+        resolved = await _resolve_reference(client, reference)
+        if resolved is not None:
+            return resolved
+
     try:
         results, next_cursor, _cached_at = await client.search(
             query=q,
@@ -190,7 +204,47 @@ async def search_catalogue(
         # than presented as authoritative.
         rows = [r for r in rows if ModelFormat.safetensors in (r.formats or [])]
 
-    return CatalogueSearchPage(results=rows, nextCursor=next_cursor, cachedAt=None)
+    return CatalogueSearchPage(
+        results=rows,
+        nextCursor=next_cursor,
+        cachedAt=None,
+        interpretedAs=InterpretedAs.search,
+    )
+
+
+async def _resolve_reference(
+    client: HubClient, reference: repo_ref.RepoReference
+) -> CatalogueSearchPage | None:
+    """One repo lookup for a pasted reference.
+
+    `None` means "fall through to an ordinary search", which is what a
+    bare `owner/name` that upstream does not have deserves -- it may be
+    what the person meant to type. A URL is different: it names one repo
+    and nothing else, so a miss raises rather than quietly searching for
+    the URL's own text.
+    """
+    try:
+        info = await client.repo_info(reference.repo, revision=reference.revision or "main")
+    except HubError as exc:
+        if exc.status == 404 and not reference.certain:
+            return None
+        if exc.status == 404:
+            raise _problem(
+                404,
+                "No such model",
+                f"{client.base_url} has no repository {reference.repo!r}. The link may be "
+                "for a dataset or a space, or the repo may have been renamed or made "
+                "private.",
+                code="repo-not-found",
+            ) from exc
+        raise _from_hub_error(exc) from exc
+
+    return CatalogueSearchPage(
+        results=[catalogue_mod.build_search_result({"id": reference.repo, **info.raw})],
+        cachedAt=None,
+        interpretedAs=InterpretedAs.repo,
+        interpretedFrom=reference.repo,
+    )
 
 
 @router.get("/v1/catalogue/model", response_model=CatalogueModel)
@@ -259,6 +313,47 @@ async def get_catalogue_model(
         budget=budget,
         context_length=contextLength or config.guidance_context_length(),
         kv_cache_type=kvCacheType,
+    )
+
+
+@router.get("/v1/catalogue/starter", response_model=StarterSet)
+async def get_starter_models(
+    request: Request,
+    contextLength: int | None = Query(
+        default=None,
+        ge=1,
+        description=CONTEXT_DESCRIPTION,
+    ),
+    kvCacheType: KvCacheType = Query(
+        default=KvCacheType.f16,
+        description=KV_CACHE_DESCRIPTION,
+    ),
+    vramBytes: int | None = Query(default=None, ge=0, description=VRAM_DESCRIPTION),
+    ramBytes: int | None = Query(default=None, ge=0, description=RAM_DESCRIPTION),
+) -> StarterSet:
+    """The shipped starter set, scored against this machine.
+
+    **No upstream call**, which is the property worth protecting: every
+    number a fit needs was measured once by the review that produced the
+    list, so the screen where a person picks their first model still
+    works with the catalogue disabled or the hub down. It is also the
+    only catalogue endpoint that answers in a lab with no internet.
+
+    Not cached, because there is nothing to cache: this is a YAML read
+    and some arithmetic. The list is re-read per request so an operator
+    editing `starterModelsFile` sees the change without a restart, the
+    same rule the config trio follows everywhere else.
+    """
+    config: ConfigStore = request.app.state.config_store
+    store: StateStore = request.app.state.state_store
+    starter = starter_mod.load(config.starter_models_file())
+    budget = await _budget(request, vram=vramBytes, ram=ramBytes)
+    return starter_mod.build(
+        starter,
+        budget=budget,
+        context_length=contextLength or config.guidance_context_length(),
+        kv_cache_type=kvCacheType,
+        store=store,
     )
 
 
