@@ -68,6 +68,7 @@ Defined in [`specs/openapi/library.yaml`](https://github.com/eugene-plexus/specs
 | `GET /v1/quants`                                                          | What the quant tiers mean                                         |
 | `GET`/`POST /v1/downloads`                                                | List / start downloads                                            |
 | `GET`/`DELETE /v1/downloads/{id}`                                         | Progress / cancel (removes the `.part`, never a finished file)    |
+| `POST /v1/downloads/{id}/claim`                                           | Take the run-when-ready intent off a finished download, once      |
 | `POST /v1/downloads/{id}/pause`, `.../resume`                             | Stop keeping the partial / continue from it                       |
 | `POST /v1/admin/restart`, `GET /healthz`                                  | Meta                                                              |
 
@@ -123,6 +124,22 @@ plus a proposed file. **It never applies anything**, and the monthly
 workflow opens an issue rather than a commit: the two-review hysteresis
 needs last month's file to compare against. Exits non-zero when any class
 is `REPLACE` or `REVIEW`, which is what the release gate reads.
+
+## A download can carry the intent that started it
+
+`runWhenReady` on `DownloadSpec` says the operator asked for this model
+to be **run** when it lands, not merely fetched. **This component records
+it and never acts on it**: a launch is a profile, an engine and a runtime
+on some node's agent, and which node is a question the library has no
+business answering.
+
+What it buys is that the intent outlives the browser tab that expressed
+it. A 16 GB download takes long enough that the person will close the
+laptop, and a console opening later can see that a download was started
+in order to run something. `POST /v1/downloads/{id}/claim` clears the
+flag atomically and says whether this caller got it — two browsers are
+two browsers, and without it every console would create a profile and
+launch a runtime for the same model.
 
 ## Reading a model is not free
 
