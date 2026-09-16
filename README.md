@@ -36,10 +36,10 @@ Discovery and guidance are one response on purpose: the moment you are choosing 
 
 ## Status
 
-**M3 features live-verified; current M7 contracts (2026-09-10).** Local scan, both
+**M3 features live-verified; current contracts 2026-09-16.** Local scan, both
 formats, metadata, profiles, config, catalogue search, fit scoring, ranged metadata
-preflight, quant guidance and resumable verified downloads are exercised against
-real files and the live hub. AMD, Intel and Apple unified-memory detection remain
+preflight, quant guidance, the starter set and its review, and resumable verified
+downloads are exercised against real files and the live hub. AMD, Intel and Apple unified-memory detection remain
 unverified on hardware. Guidance is an estimate, not a guarantee of runtime fit;
 the owning agent performs launch admission.
 
@@ -58,7 +58,8 @@ Defined in [`specs/openapi/library.yaml`](https://github.com/eugene-plexus/specs
 | `GET`/`PUT`/`DELETE /v1/models/{id}/profiles/{pid}`                       | Read / replace / delete one                                       |
 | `GET`/`POST`/`DELETE /v1/scan`                                            | State of / start / cancel the walk                                |
 | `GET`/`PATCH /v1/config`, `GET /v1/config/schema`, `POST /v1/config/test` | The standard config trio                                          |
-| `GET /v1/catalogue/search`                                                | Search upstream. Repos, cursor-paginated — no sizes, see below    |
+| `GET /v1/catalogue/starter`                                               | The starter set, scored against one machine. **No upstream call**  |
+| `GET /v1/catalogue/search`                                                | Search upstream, or resolve a pasted repo link. Repos, cursor-paginated — no sizes, see below |
 | `GET /v1/catalogue/model`                                                 | One repo: its download candidates, each with a fit verdict        |
 | `GET /v1/catalogue/model/card`                                            | The model card prose, as Markdown                                 |
 | `GET /v1/catalogue/model/preflight`                                       | Read one remote file's real metadata over HTTP Range              |
@@ -71,6 +72,57 @@ Defined in [`specs/openapi/library.yaml`](https://github.com/eugene-plexus/specs
 | `POST /v1/admin/restart`, `GET /healthz`                                  | Meta                                                              |
 
 Search lists repos and detail scores candidates, because upstream's search response carries filenames without sizes: badging a fit verdict on a search row would cost one extra call per row, against a budget of 500 requests per five minutes.
+
+**`/v1/catalogue/starter` is the one catalogue endpoint that needs no
+internet.** It answers the question that comes *before* a search — "which
+of the four hundred thousand models on that site do I want" — from a list
+shipped inside this wheel, scored against the caller's machine. Every
+number a fit needs was measured once by `eugene-plexus-library
+starter-review` and is carried in `starter_models.yaml`, so it answers
+with `catalogueEnabled` off, the hub down, or no network at all.
+Downloading the model still needs the hub; choosing it does not.
+
+**`q` on the search endpoint reads a pasted repo reference as a lookup.**
+A hub URL (with or without a `/tree/` or `/blob/` tail) or a bare
+`owner/name` comes back as a single result with `interpretedAs: repo`. A
+URL that cannot be resolved is a `404` naming the repo — and note that
+**upstream answers `401` for a repo that does not exist**, not `404`,
+because "gone" and "private" are deliberately the same answer to an
+unauthenticated caller; the `404` here covers all three causes and the
+detail says so. A bare `owner/name` that misses falls through to an
+ordinary search, because it may be what the person meant to type.
+
+## The starter set, and the review that keeps it honest
+
+`starter_models.yaml` ships inside the wheel: one entry per size class
+(~4B, ~8B, ~14B, ~30B, ~70B), each naming a base model, the repo a quant
+of it comes from, the one file to fetch, and the shape a fit needs.
+**No model name appears anywhere in this package's source.**
+`starterModelsFile` points at a different file and an empty `classes:`
+list is a valid answer meaning "we have no recommendation" — which a
+client renders as *find a model*, never as a bug.
+
+`reviewed:` is the load-bearing field. A recommendation in a field that
+moves monthly fails by going quietly out of date rather than by
+erroring, so the date travels to the browser and a release is gated on a
+review under thirty days old.
+
+```
+eugene-plexus-library starter-review --report review.md --proposed proposed.yaml
+```
+
+Ranks the hub's GGUF repos by **30-day downloads and nothing else** —
+the community's judgement rather than ours, and the same rule
+`quants.py` follows in refusing to say which quant is *better*.
+Aggregates mirrors by a case-folded `base_model`, buckets by the mode of
+its contributors' parameter counts, drops anything without a chat
+template, flags anything whose publisher, licence, name or single-mirror
+status a human should look at, checks each leader's architecture against
+the pinned llama.cpp build's own `llama-arch.cpp`, and writes a report
+plus a proposed file. **It never applies anything**, and the monthly
+workflow opens an issue rather than a commit: the two-review hysteresis
+needs last month's file to compare against. Exits non-zero when any class
+is `REPLACE` or `REVIEW`, which is what the release gate reads.
 
 ## Reading a model is not free
 
