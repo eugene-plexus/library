@@ -220,24 +220,38 @@ async def _resolve_reference(
     `None` means "fall through to an ordinary search", which is what a
     bare `owner/name` that upstream does not have deserves -- it may be
     what the person meant to type. A URL is different: it names one repo
-    and nothing else, so a miss raises rather than quietly searching for
-    the URL's own text.
+    and nothing else, so a miss answers with a Problem about that repo
+    rather than quietly searching for the URL's own text.
+
+    **A repo that does not exist does not come back as 404.** Measured
+    against the live hub: `GET /api/models/nobody/nothing` answers **401
+    `Invalid username or password`**, because to an unauthenticated
+    caller "gone" and "private" are deliberately the same answer -- an
+    enumeration defence. So "could not resolve" is 401, 403 and 404
+    together, and the message has to name both possibilities instead of
+    asserting the one we cannot tell from the other. A genuinely gated
+    repo is the exception and keeps its own advice, because accepting a
+    licence is a thing the operator can go and do.
     """
     try:
         info = await client.repo_info(reference.repo, revision=reference.revision or "main")
     except HubError as exc:
-        if exc.status == 404 and not reference.certain:
+        if exc.code == "GatedRepo":
+            raise _from_hub_error(exc) from exc
+        if exc.status not in (401, 403, 404):
+            raise _from_hub_error(exc) from exc
+        if not reference.certain:
             return None
-        if exc.status == 404:
-            raise _problem(
-                404,
-                "No such model",
-                f"{client.base_url} has no repository {reference.repo!r}. The link may be "
-                "for a dataset or a space, or the repo may have been renamed or made "
-                "private.",
-                code="repo-not-found",
-            ) from exc
-        raise _from_hub_error(exc) from exc
+        raise _problem(
+            404,
+            "No such model",
+            f"{client.base_url} has no repository {reference.repo!r} that this install can "
+            "see. It may not exist, it may have been renamed, or it may be private -- "
+            "upstream answers the same way for all three. If it is private, set `hfToken` "
+            "in the library's config to a token with access. A link to a dataset or a "
+            "space will land here too; only model repos can be opened from this screen.",
+            code="repo-not-found",
+        ) from exc
 
     return CatalogueSearchPage(
         results=[catalogue_mod.build_search_result({"id": reference.repo, **info.raw})],

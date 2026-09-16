@@ -60,7 +60,13 @@ def upstream(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=SEARCH)
     if path == "/api/models/unsloth/Qwen3.8-27B-GGUF":
         return httpx.Response(200, json=REPO_INFO)
-    return httpx.Response(404, json={"error": "Repository not found"})
+    # **How the hub actually answers for a repo that does not exist.**
+    # Measured against the live hub: 401 `Invalid username or password`,
+    # not 404 -- to an unauthenticated caller "gone" and "private" are
+    # deliberately the same answer. A fixture returning 404 here would
+    # have passed against code that only handled 404, which is exactly
+    # what the first acceptance run caught.
+    return httpx.Response(401, json={"error": "Invalid username or password."})
 
 
 @pytest.fixture
@@ -175,12 +181,20 @@ def test_a_url_that_does_not_resolve_is_a_404_naming_the_repo(
 ) -> None:
     """A URL names one repo and nothing else, so an empty result list
     would be the silent failure -- the exact shape of the dead end this
-    replaces."""
+    replaces.
+
+    The upstream status is 401 and the answer here is 404, deliberately:
+    the person pasted a link, and "this install cannot see that repo" is
+    the true statement. The detail says all three reasons because
+    upstream refuses to distinguish them.
+    """
     response = catalogue_client.get(
         "/v1/catalogue/search", params={"q": "https://huggingface.co/nobody/nothing"}
     )
     assert response.status_code == 404
-    assert "nobody/nothing" in response.json()["detail"]["detail"]
+    detail = response.json()["detail"]["detail"]
+    assert "nobody/nothing" in detail
+    assert "private" in detail and "hfToken" in detail
 
 
 def test_a_bare_name_that_does_not_resolve_falls_through_to_a_search(
