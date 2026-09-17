@@ -150,6 +150,62 @@ def test_a_shapeless_model_says_it_is_estimating() -> None:
     )
     assert result.basis is Basis.estimate
     assert any("15%" in note for note in result.notes or [])
+    # The baseline is what it always was: an install that never touches
+    # the context control sees the figure this fallback produced before
+    # it learned to scale.
+    assert result.kvCacheBytes == int(8 * GIB * 0.15)
+
+
+def test_an_estimated_kv_cache_grows_with_the_context() -> None:
+    """The defect this exists to stop coming back.
+
+    An estimated fit used to be a *constant*, so the discovery screen's
+    context control moved its own label, the column header and the
+    number echoed back on every badge — and could not move one verdict.
+    A person stepping it down from 128k to find something their card
+    could hold was told nothing had changed.
+
+    Almost every catalogue verdict takes this branch: the hub reports a
+    repo's architecture, parameters and trained context and nothing
+    about layers or heads, so `basis: estimate` is the *normal* case on
+    Discover and the rare one on disk.
+    """
+    budget = fit.budget_from_hardware(DEV_BOX)
+
+    def kv(context_length: int) -> int:
+        return fit.compute(
+            weights_bytes=8 * GIB, budget=budget, context_length=context_length
+        ).kvCacheBytes
+
+    # Linear in context, because that is what a KV cache is. Within a
+    # byte: the result is truncated to an integer at each end.
+    assert abs(kv(16384) - 2 * kv(8192)) <= 1
+    assert abs(2 * kv(4096) - kv(8192)) <= 1
+    assert abs(kv(262144) - 32 * kv(8192)) <= 32
+
+    # And it reaches the verdict rather than stopping at the breakdown:
+    # 8 GiB of weights sit inside 28.9 GiB of free VRAM at 8k and do not
+    # at 262144, which is the whole point of asking.
+    assert (
+        fit.compute(weights_bytes=8 * GIB, budget=budget, context_length=8192).verdict
+        is FitVerdict.fits
+    )
+    assert (
+        fit.compute(weights_bytes=8 * GIB, budget=budget, context_length=262144).verdict
+        is not FitVerdict.fits
+    )
+
+
+def test_the_estimated_kv_note_carries_the_context_it_was_scaled_to() -> None:
+    """A breakdown reading "a rough 15% of the weights" beside a figure
+    that is 4.8x the weights is a note that contradicts its own number.
+    """
+    result = fit.compute(
+        weights_bytes=8 * GIB,
+        budget=fit.budget_from_hardware(DEV_BOX),
+        context_length=32768,
+    )
+    assert any("32,768" in note and "8,192 tokens" in note for note in result.notes or [])
 
 
 def test_a_shaped_model_says_it_is_not() -> None:

@@ -68,6 +68,32 @@ DEFAULT_CONTEXT_LENGTH = 8192
 trained context: current models declare 262144 and almost nobody can
 hold that, so defaulting to it would report `no` for everything."""
 
+ESTIMATED_KV_FRACTION = 0.15
+"""The fallback KV term, as a fraction of the weights **per
+`ESTIMATED_KV_BASELINE_CONTEXT` tokens** — not a flat fraction of the
+weights.
+
+Flat was a defect, and a quiet one. A KV cache is linear in context by
+construction: one entry per token, per attention layer. A constant made
+every estimated verdict identical at 4k and at 262144, so the discovery
+screen's context control changed its own label, changed the column
+header, changed the number echoed back on the badge — and could not
+change a single verdict. Someone stepping it down from 128k looking for
+something their card could hold was told nothing had moved, which is the
+one failure mode this module is written to avoid: guidance that is
+confidently wrong in the optimistic direction.
+
+It is still an estimate and still says so. It is now an estimate of the
+right *shape*: wrong by a factor, not by a factor that grows with the
+number the operator is turning."""
+
+ESTIMATED_KV_BASELINE_CONTEXT = 8192
+"""What `ESTIMATED_KV_FRACTION` is a fraction *at*.
+
+8192 because that is `DEFAULT_CONTEXT_LENGTH`, so an install that never
+touches the control sees exactly the figure this fallback produced
+before it learned to scale."""
+
 KV_ELEMENT_BYTES: dict[KvCacheType, float] = {
     KvCacheType.f16: 2.0,
     KvCacheType.q8_0: 1.0625,
@@ -362,15 +388,20 @@ def compute(
 
     kv_bytes = shape.kv_bytes(context_length, kv_cache_type)
     if kv_bytes is None:
-        # No usable shape. A flat fraction of the weights is a poor
-        # estimate and an honest one; `basis: estimate` is what says not
-        # to trust the breakdown.
-        kv_bytes = int(weights_bytes * 0.15)
+        # No usable shape. A fraction of the weights is a poor estimate
+        # and an honest one; `basis: estimate` is what says not to trust
+        # the breakdown. It scales with context because a KV cache does:
+        # a constant here is what made the context control inert.
+        kv_bytes = int(
+            weights_bytes * ESTIMATED_KV_FRACTION * (context_length / ESTIMATED_KV_BASELINE_CONTEXT)
+        )
         basis = Basis.estimate
         notes.append(
-            "KV cache is a rough 15% of the weights: this model's layer and attention "
-            "metadata was not available. Preflight the file (or scan it, once it is on "
-            "disk) for a real figure."
+            f"KV cache is a rough {ESTIMATED_KV_FRACTION:.0%} of the weights per "
+            f"{ESTIMATED_KV_BASELINE_CONTEXT:,} tokens of context, so "
+            f"{format_bytes(kv_bytes)} at {context_length:,}: this model's layer and "
+            "attention metadata was not available. Preflight the file (or scan it, once "
+            "it is on disk) for a real figure."
         )
     else:
         basis = Basis.metadata
