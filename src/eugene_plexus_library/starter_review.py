@@ -85,6 +85,7 @@ from . import catalogue as catalogue_mod
 from . import fit as fit_mod
 from . import preflight as preflight_mod
 from . import starter as starter_mod
+from ._http import egress_client
 from .hub import HubClient, HubError
 
 log = logging.getLogger(__name__)
@@ -390,7 +391,9 @@ async def engine_architectures(tag: str) -> set[str] | None:
     """
     url = LLAMA_ARCH_URL.format(tag=tag)
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        # Egress: this reads llama.cpp's own source from GitHub, so it
+        # keeps `trust_env` and gains the shared SSL context.
+        async with egress_client(timeout=30, follow_redirects=True) as client:
             response = await client.get(url)
         if response.status_code >= 400:
             log.warning("could not read %s (HTTP %s)", url, response.status_code)

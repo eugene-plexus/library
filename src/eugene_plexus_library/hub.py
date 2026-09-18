@@ -71,6 +71,7 @@ from typing import Any
 import httpx
 
 from ._generated.models import CatalogueSort, GateKind
+from ._http import egress_client
 
 log = logging.getLogger(__name__)
 
@@ -299,7 +300,7 @@ class _TtlCache:
         if entry is None:
             return None
         stamped, value = entry
-        if time.monotonic() - stamped > self._ttl:
+        if time.perf_counter() - stamped > self._ttl:
             self._entries.pop(key, None)
             return None
         return value, stamped
@@ -307,7 +308,7 @@ class _TtlCache:
     def put(self, key: str, value: Any) -> None:
         if len(self._entries) >= CACHE_MAX_ENTRIES:
             self._entries.clear()
-        self._entries[key] = (time.monotonic(), value)
+        self._entries[key] = (time.perf_counter(), value)
 
     def clear(self) -> None:
         self._entries.clear()
@@ -336,7 +337,13 @@ class HubClient:
         client: httpx.AsyncClient | None = None,
         cache: _TtlCache | None = None,
     ) -> None:
-        self._client = client or httpx.AsyncClient(
+        # `egress_client`, deliberately: the hub is one of exactly two
+        # places this product talks to the public internet, so it KEEPS
+        # `trust_env` -- a user behind a corporate proxy reaches
+        # huggingface.co through it or not at all. What it gains is the
+        # process-wide SSL context, so constructing it does not parse
+        # certifi's PEM bundle again (~104 ms of synchronous CPU).
+        self._client = client or egress_client(
             follow_redirects=False,  # Trap 2. Never turn this on.
             timeout=REQUEST_TIMEOUT,
             headers={"User-Agent": USER_AGENT},

@@ -246,7 +246,7 @@ class DownloadJob:
 
     def _observe(self, total: int) -> None:
         """Record a progress sample and refresh rate and ETA."""
-        now = time.monotonic()
+        now = time.perf_counter()
         self._samples.append((now, total))
         while len(self._samples) > 2 and now - self._samples[0][0] > RATE_WINDOW_SECONDS:
             self._samples.pop(0)
