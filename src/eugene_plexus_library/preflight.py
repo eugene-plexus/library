@@ -199,14 +199,48 @@ def per_layer_kv(meta: gguf.GgufMetadata) -> tuple[fit_mod.LayerKV, ...] | None:
     return tuple(layers)
 
 
+# The keys whose absence-as-a-length means "this file has per-layer
+# attention and we did not keep it". Read as names rather than inferred,
+# because the point is to notice a term we know we needed.
+_PER_LAYER_KEYS = ("attention.head_count_kv", "attention.sliding_window_pattern")
+
+
+def per_layer_dropped(meta: gguf.GgufMetadata) -> bool:
+    """Did this file declare a per-layer term that was stepped over?
+
+    `array_lengths` records the length of every array the reader walked
+    past instead of keeping, so a key present there and absent from `kv`
+    is one we know existed and cannot use. That is a different situation
+    from a file that declares the simple scalar form, and the difference
+    is exactly what `basis` is supposed to tell a person.
+    """
+    arch = meta.architecture
+    if arch is None:
+        return False
+    return any(
+        f"{arch}.{suffix}" in meta.array_lengths and meta.arch_key(suffix) is None
+        for suffix in _PER_LAYER_KEYS
+    )
+
+
 def shape_from_gguf(meta: gguf.GgufMetadata) -> fit_mod.ModelShape:
-    """The KV-cache terms, read off the file's own KV block."""
+    """The KV-cache terms, read off the file's own KV block.
+
+    **The one place a shape is built from a GGUF.** It was not, for a
+    while: `routes/guidance.py` grew its own reader at M3 and the 43x
+    per-layer fix landed here and not there, so `GET
+    /v1/models/{id}/fit` answered 4,864 where the starter set answered
+    262,144 for the same file -- both saying `basis: metadata` (review
+    §6.1 #4). That route delegates here now, and the rule is that a
+    second shape builder is the bug rather than the fix.
+    """
 
     def integer(suffix: str) -> int | None:
         value = meta.arch_key(suffix)
         return int(value) if isinstance(value, int) else None
 
     blocks = integer("block_count")
+    layers = per_layer_kv(meta)
     return fit_mod.ModelShape(
         block_count=blocks,
         attention_layers=attention_layers(meta),
@@ -216,7 +250,8 @@ def shape_from_gguf(meta: gguf.GgufMetadata) -> fit_mod.ModelShape:
         embedding_length=integer("embedding_length"),
         head_count=integer("attention.head_count"),
         context_length=meta.context_length,
-        layers=per_layer_kv(meta),
+        layers=layers,
+        per_layer_unavailable=layers is None and per_layer_dropped(meta),
     )
 
 

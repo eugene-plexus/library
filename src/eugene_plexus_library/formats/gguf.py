@@ -89,10 +89,24 @@ _SCALAR = {
 }
 
 # Arrays at or below this length are kept; longer ones are stepped over.
-# 64 covers the small structural arrays that carry meaning
+# It covers the small structural arrays that carry meaning
 # (`rope.dimension_sections`, `vision.image_mean`, per-layer flags) and
 # excludes every vocabulary.
-_INLINE_ARRAY_LIMIT = 64
+#
+# **It was 64, and a per-layer array is as long as the block count.**
+# The shipped starter classes declare 32, 42, 48 and **65** blocks, so
+# the limit missed by one on a model already in the product's own
+# starter file: `attention.head_count_kv` was stepped over, the fit fell
+# back to the same-every-layer scalars, and the answer came out up to
+# 43x too large while still reporting `basis: metadata` (roadmap R1.3,
+# from review §6.1 #4's neighbourhood).
+#
+# 512 rather than 66, because the number to clear is "how many layers
+# will a model have", which only goes up, and the thing being excluded
+# is a vocabulary -- three orders of magnitude away, so there is no
+# squeeze between the two. A per-layer array of int32 at this limit is
+# 2 KB.
+_INLINE_ARRAY_LIMIT = 512
 
 # Sanity ceilings. A corrupt or truncated file can present a u64 length
 # as something like 2^61; without a bound the reader tries to allocate

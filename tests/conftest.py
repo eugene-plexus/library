@@ -60,6 +60,16 @@ def _gguf_value(value: Any) -> bytes:
         if isinstance(value[0], str):
             body = b"".join(_gguf_string(v) for v in value)
             element = T_STRING
+        elif isinstance(value[0], bool):
+            # **Checked before `int`, because `bool` IS an `int` in
+            # Python and every one of these would otherwise be written
+            # as an int32 array.** A real file's
+            # `attention.sliding_window_pattern` is a BOOL array, and a
+            # fixture that writes 0/1 int32s exercises a type the reader
+            # never meets -- the recurring shape here being a fixture
+            # that cannot produce the case it is named for.
+            body = b"".join(struct.pack("<?", v) for v in value)
+            element = T_BOOL
         else:
             body = b"".join(struct.pack("<i", v) for v in value)
             element = T_INT32

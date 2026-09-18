@@ -170,6 +170,20 @@ class ModelShape:
     """Per-layer KV, when the file declared enough to build it. Wins over
     every scalar below -- see the class docstring for the 43x."""
 
+    per_layer_unavailable: bool = False
+    """The file HAS per-layer terms and this reader could not get them.
+
+    Different from "the file declares the simple form", which is most
+    files and is answered correctly by the scalars. This says the array
+    was there and was stepped over -- a scan keeps only arrays up to a
+    length limit -- so the scalars below are the 43x over-estimate, in
+    the direction that refuses a model which fits.
+
+    It exists because `basis: metadata` is the word that tells a person
+    the number is arithmetic rather than a guess, and saying it here
+    would be a lie. `compute` degrades the basis and says why.
+    """
+
     @property
     def complete(self) -> bool:
         """Is there enough here to compute a real KV cache size?"""
@@ -402,6 +416,18 @@ def compute(
             f"{format_bytes(kv_bytes)} at {context_length:,}: this model's layer and "
             "attention metadata was not available. Preflight the file (or scan it, once "
             "it is on disk) for a real figure."
+        )
+    elif shape.per_layer_unavailable:
+        # The scalars answered, and this file said they are not the
+        # whole story. Reporting that as `metadata` is the failure mode
+        # this field exists for: the number is a scalar guess on a model
+        # whose layers are not alike, and it over-estimates by up to 43x
+        # -- which reads as "will not fit" about a model that fits.
+        basis = Basis.estimate
+        notes.append(
+            "this model declares per-layer attention and those terms were not stored "
+            "with it, so the cache above is the same-every-layer arithmetic and "
+            "over-estimates, possibly by a lot. Re-scan this directory for a real figure."
         )
     else:
         basis = Basis.metadata
