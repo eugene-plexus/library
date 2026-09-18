@@ -42,6 +42,7 @@ has no GPU.
 from __future__ import annotations
 
 import ctypes
+import enum
 import logging
 import os
 import platform
@@ -86,16 +87,36 @@ class _MemoryStatusEx(ctypes.Structure):
     )
 
 
-def _run(argv: list[str]) -> str | None:
-    """Run a vendor CLI and return stdout, or None if it is not usable.
+class Probe(enum.Enum):
+    """Why a vendor CLI produced nothing — review §6.2 #29.
 
-    Absence is the common case and is not an error: most machines have
-    exactly one of these tools. A tool that exists and fails *is*
-    interesting, so it is logged.
+    `_run` used to answer `None` for both *not installed* and *ran and
+    failed*, so one layer up the two were indistinguishable and
+    `detect()` reported the second as the first: *"its vendor tool is
+    not on this process's PATH"*. That sends a person to fix an
+    environment that is fine while their driver is wedged — and a
+    driver/library version mismatch after an update is the commonest
+    Linux failure there is.
+
+    Three states, in one place, because `nvidia-smi`, `rocm-smi` and
+    `xpu-smi` all need the same distinction and three copies of it is
+    three chances to get one wrong.
     """
+
+    ABSENT = "absent"
+    """Not on PATH. The common case: most machines have exactly one of
+    these tools, and the absence of the other two says nothing."""
+
+    FAILED = "failed"
+    """It is installed and it did not work. Interesting, and the thing
+    a person has to be told."""
+
+
+def probe(argv: list[str]) -> Probe | str:
+    """Run a vendor CLI: its stdout, or which kind of nothing."""
     exe = shutil.which(argv[0])
     if exe is None:
-        return None
+        return Probe.ABSENT
     try:
         completed = subprocess.run(
             [exe, *argv[1:]],
@@ -105,7 +126,7 @@ def _run(argv: list[str]) -> str | None:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("%s could not be run (%s)", argv[0], exc)
-        return None
+        return Probe.FAILED
     if completed.returncode != 0:
         log.warning(
             "%s exited %d: %s",
@@ -113,8 +134,19 @@ def _run(argv: list[str]) -> str | None:
             completed.returncode,
             (completed.stderr or "").strip()[:200],
         )
-        return None
+        return Probe.FAILED
     return completed.stdout
+
+
+def _run(argv: list[str]) -> str | None:
+    """`probe` for callers that only need output-or-nothing.
+
+    The detectors below use it; `detect` uses `probe` directly, because
+    it is the one that has to tell a person which kind of nothing it
+    was.
+    """
+    result = probe(argv)
+    return None if isinstance(result, Probe) else result
 
 
 def detect_os() -> Os:
@@ -336,9 +368,9 @@ def _intel_gpus(warnings: list[str]) -> list[Gpu]:
         )
     if gpus:
         warnings.append(
-            "xpu-smi does not report VRAM size in a stable form, so Intel GPU memory is "
-            "unknown and fit verdicts fall back to host memory. Detection here is "
-            "untested against real hardware."
+            "xpu-smi does not report VRAM size in a stable form, so this card's memory is "
+            "unknown and every fit verdict on this host is `unknown` rather than a guess. "
+            "Detection here is untested against real hardware."
         )
     return gpus
 
@@ -397,13 +429,36 @@ def detect() -> HostHardware:
         if not gpus:
             gpus = _intel_gpus(warnings)
 
-    if not gpus:
+    # **Which kind of nothing** (review §6.2 #29). A tool that is not
+    # installed and a tool that is installed and broken are two different
+    # problems with two different fixes, and reporting the second as the
+    # first sends a person to audit their PATH while their driver is the
+    # thing that is wrong.
+    #
+    # **Reported whether or not another vendor's card was found**, which
+    # the first version of this fix got wrong and the live run caught:
+    # on a machine with a working Intel card and a wedged NVIDIA driver,
+    # the NVIDIA card is the one the person cares about and the whole
+    # warning disappeared behind `if not gpus`.
+    broken = [
+        name for name in ("nvidia-smi", "rocm-smi", "xpu-smi") if probe([name]) is Probe.FAILED
+    ]
+    for name in broken:
+        warnings.append(
+            f"{name} is installed here and exited non-zero, so any GPU it manages could "
+            "not be read. On Linux that is usually a driver/library version mismatch "
+            f"after an update -- `{name}` itself will say so. This is not a PATH problem."
+        )
+
+    if not gpus and not broken:
         warnings.append(
             "no accelerator was detected, so fit is scored against host memory alone. "
             "If you have a GPU, its vendor tool (nvidia-smi, rocm-smi, xpu-smi) is not on "
             "this process's PATH -- which is a common outcome when a supervisor spawns a "
             "child with a trimmed environment."
         )
+    elif not gpus:
+        warnings.append("fit is scored against host memory alone, because no GPU was read.")
 
     return HostHardware(
         hostname=socket.gethostname(),

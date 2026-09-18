@@ -347,10 +347,32 @@ def budget_from_hardware(
     )
 
 
+def card_of_unknown_size(budget: MemoryBudget) -> bool:
+    """Is there a GPU here whose memory we could not read?
+
+    **The distinction `_verdict` did not make** (review §6.2 #28). It
+    branched on `vram_total == 0`, which is true of a machine with no
+    GPU *and* of a machine with a GPU whose size no vendor tool would
+    state — and sent the second down the CPU branch, where 30 GB of
+    weights "fits" in 32 GB of host memory. The owner of a 16 GB Arc
+    meets that as an out-of-memory error at load.
+
+    `gpuCount` is the field that actually answers *is there a card*, and
+    it was sitting in the same object, printed beside the wrong verdict.
+    """
+    return (budget.gpuCount or 0) > 0 and (budget.vramTotalBytes or 0) == 0
+
+
 def _verdict(required: int, budget: MemoryBudget) -> FitVerdict:
     vram_free = budget.vramFreeBytes or 0
     vram_total = budget.vramTotalBytes or 0
     ram_available = budget.ramAvailableBytes or 0
+
+    if card_of_unknown_size(budget) and not budget.unifiedMemory:
+        # No comparison can be made, including a favourable one: a
+        # `fits` computed against a number we do not have is right by
+        # luck, and luck is not a verdict.
+        return FitVerdict.unknown
 
     if budget.unifiedMemory:
         # One pool. `tight` is what "would fit if you closed something"
@@ -438,6 +460,13 @@ def compute(
                 "under-estimates."
             )
 
+    if card_of_unknown_size(budget) and not budget.unifiedMemory:
+        notes.append(
+            f"this machine has {budget.gpuCount} graphics card(s) and no vendor tool here "
+            "would say how much memory they have, so there is nothing to compare against "
+            "-- the verdict is unknown rather than a guess. Install the card's own tool "
+            "(nvidia-smi, rocm-smi or xpu-smi), or score against a budget you supply."
+        )
     notes.append(f"assumes full GPU offload and a {kv_cache_type.value} KV cache")
     notes.append(f"includes a flat {overhead_bytes / GIB:.1f} GiB allowance for compute buffers")
     if (budget.gpuCount or 0) > 1:

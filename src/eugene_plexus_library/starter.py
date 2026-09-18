@@ -290,6 +290,22 @@ def _score(
     )
 
 
+def has_no_accelerator(budget: fit_mod.MemoryBudget) -> bool:
+    """Is there genuinely no GPU on this machine?
+
+    **Not `vramTotalBytes == 0`** (review §6.2 #28). That is also true of
+    a machine whose card exists and whose size no vendor tool would
+    state, and this function decides whether to *invert the whole
+    recommendation* — so an Intel Arc owner opening Discover for the
+    first time was handed the smallest model in the set, with a sentence
+    explaining that their machine has no graphics card, on a machine
+    built around one.
+
+    `gpuCount` is the field that answers the question asked.
+    """
+    return (budget.gpuCount or 0) == 0 and not budget.unifiedMemory
+
+
 def recommend(
     models: list[StarterModel], *, context_length: int, budget: MemoryBudget
 ) -> StarterRecommendation | None:
@@ -303,6 +319,23 @@ def recommend(
     """
     if not models:
         return None
+
+    # **A machine we could not measure gets a sentence, not silence**
+    # (review §6.2 #28, found by the live run). Every verdict here is
+    # `unknown`, so nothing "fits" and the branch below would have said
+    # *none of these fits entirely in 0 B* -- a number that is not a
+    # number, about a card we can see and cannot size.
+    if fit_mod.card_of_unknown_size(budget) and not budget.unifiedMemory:
+        cards = budget.gpuCount or 1
+        return StarterRecommendation(
+            reason=(
+                f"This machine has {cards} graphics card"
+                f"{'' if cards == 1 else 's'} and nothing here would say how much memory "
+                "it has, so none of these can be scored against it. Install the card's "
+                "own tool (nvidia-smi, rocm-smi or xpu-smi) and reload, or pick from "
+                "Discover using the size you know your card to be."
+            )
+        )
 
     fitting = [m for m in models if m.fit and m.fit.verdict.value == "fits"]
     if not fitting:
@@ -327,8 +360,7 @@ def recommend(
     # broken. The guidance record already has this mistake once, in the
     # other direction: a library measuring a NAS recommended a 57 GB
     # BF16 download for CPU inference to an operator holding a 5090.
-    no_accelerator = (budget.vramTotalBytes or 0) == 0 and not budget.unifiedMemory
-    if no_accelerator:
+    if has_no_accelerator(budget):
         best = min(fitting, key=lambda m: (m.sizeBytes, m.parameters or 0))
         assert best.fit is not None
         return StarterRecommendation(

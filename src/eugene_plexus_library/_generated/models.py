@@ -1299,10 +1299,25 @@ class FitVerdict(StrEnum):
       offload, materially slower, and a decision rather than a
       failure.
     * `no` — larger than VRAM and RAM together.
+    * `unknown` — there is a GPU here and we could not read how much
+      memory it has, so no comparison against it can be made. Added
+      2026-09-18 (roadmap R2.3, review §6.2 #28) because the
+      alternative was worse than silence: `_intel_gpus` reports
+      `vramTotalBytes: 0` for a card whose size `xpu-smi` will not
+      state, the verdict then took the *no accelerator* branch,
+      compared the weights against host memory, and told a 16 GB Arc
+      owner that a 30 GB model **fits** — with `gpuCount: 1` printed
+      beside it. Wrong in the direction that runs out of memory at
+      load.
 
-    Four values rather than a percentage because a percentage of
+      It is a property of the machine and not of the model, so every
+      candidate on such a host reports it, including small ones: a
+      favourable answer computed against a number we do not have is
+      right by luck.
+
+    Five values rather than a percentage because a percentage of
     *what* — VRAM, or VRAM plus RAM? — is precisely the ambiguity
-    the operator is trying to resolve, and because the four have
+    the operator is trying to resolve, and because they have
     different advice. `tight` and `split` are the two the field
     usually collapses into "won't fit", and they are the two worth
     naming.
@@ -1313,6 +1328,7 @@ class FitVerdict(StrEnum):
     tight = 'tight'
     split = 'split'
     no = 'no'
+    unknown = 'unknown'
 
 
 class Source(StrEnum):

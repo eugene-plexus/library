@@ -344,18 +344,26 @@ def test_largest_gpu_is_reported_separately_from_the_sum() -> None:
 
 
 def test_a_card_with_no_free_reading_falls_back_to_total() -> None:
-    """Intel's tool does not report free memory in any stable form. The
-    fallback is optimistic for that card alone, and the hardware
-    warnings name it."""
-    intel = HostHardware(
-        hostname="arc",
+    """A card whose total is known and whose free is not.
+
+    **The fixture was Intel's and could not be**, which is review §6.2
+    #28 and why this docstring changed: `_intel_gpus` reports
+    `vramTotalBytes=0`, never a real size, so a test asserting the
+    fallback against `16 * GIB` was green about a shape the detector
+    cannot emit while the shape it does emit went unasserted. The
+    unknown-size case is `tests/test_a_card_we_cannot_see.py` now; this
+    is the AMD shape, where `rocm-smi` gives a total and `used` may be
+    missing.
+    """
+    amd = HostHardware(
+        hostname="radeon",
         os=Os.linux,
         arch=Arch.x64,
         ramTotalBytes=32 * GIB,
         ramAvailableBytes=24 * GIB,
-        gpus=[Gpu(index=0, name="Arc A770", vendor=Vendor.intel, vramTotalBytes=16 * GIB)],
+        gpus=[Gpu(index=0, name="RX 7900 XTX", vendor=Vendor.amd, vramTotalBytes=16 * GIB)],
     )
-    budget = fit.budget_from_hardware(intel)
+    budget = fit.budget_from_hardware(amd)
     assert budget.vramFreeBytes == 16 * GIB
 
 
