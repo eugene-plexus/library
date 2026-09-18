@@ -245,6 +245,33 @@ def test_every_vendor_probe_goes_through_the_same_three_state_result(vendor_tool
     assert set(hardware.Probe) >= {hardware.Probe.ABSENT, hardware.Probe.FAILED}
 
 
+def test_detect_runs_each_vendor_tool_at_most_once(monkeypatch) -> None:
+    """**A regression the live run caught, in WSL2 where nvidia-smi is
+    real.**
+
+    The first version of this fix answered *which tool failed* by
+    scanning all three again at the end of `detect()` -- up to three
+    extra subprocesses on every hardware read, on a request path, for a
+    fact the detectors had already learned and thrown away. It showed up
+    as a library process still alive after its own shutdown, because
+    `nvidia-smi` in WSL2 takes about a second. Same family as review
+    §6.1 #5, and the reason the warning is now recorded where it
+    happens.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(hardware, "host_memory", lambda: (32 * GIB, 24 * GIB))
+    monkeypatch.setattr(hardware.shutil, "which", lambda name: "/usr/bin/" + name)
+
+    def _record(argv, **kwargs):
+        calls.append(argv[0])
+        return subprocess.CompletedProcess(args=argv, returncode=9, stdout="", stderr="boom")
+
+    monkeypatch.setattr(hardware.subprocess, "run", _record)
+    hardware.detect()
+    for tool in ("nvidia-smi", "rocm-smi", "xpu-smi"):
+        assert calls.count(tool) <= 1, f"{tool} was run {calls.count(tool)} times: {calls}"
+
+
 def test_an_unmeasurable_machine_is_told_why_nothing_is_recommended() -> None:
     """**Found by the live run, not by reading.**
 

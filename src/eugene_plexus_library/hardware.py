@@ -138,14 +138,26 @@ def probe(argv: list[str]) -> Probe | str:
     return completed.stdout
 
 
-def _run(argv: list[str]) -> str | None:
-    """`probe` for callers that only need output-or-nothing.
+def _run(argv: list[str], warnings: list[str] | None = None) -> str | None:
+    """`probe`, with the FAILED case turned into a warning in passing.
 
-    The detectors below use it; `detect` uses `probe` directly, because
-    it is the one that has to tell a person which kind of nothing it
-    was.
+    **Recorded where it happens, not re-established afterwards.** The
+    first version of this fix scanned all three vendor tools again at
+    the end of `detect()` to find out which had failed -- which meant up
+    to three extra subprocesses on every hardware read, on a request
+    path, for a fact the detectors had already learned and thrown away.
+    In WSL2 (where `nvidia-smi` is real and takes about a second) the
+    acceptance run caught it as a library process still alive after its
+    own shutdown. Same family as review §6.1 #5.
     """
     result = probe(argv)
+    if result is Probe.FAILED and warnings is not None:
+        name = argv[0]
+        warnings.append(
+            f"{name} is installed here and exited non-zero, so any GPU it manages could "
+            "not be read. On Linux that is usually a driver/library version mismatch "
+            f"after an update -- `{name}` itself will say so. This is not a PATH problem."
+        )
     return None if isinstance(result, Probe) else result
 
 
@@ -262,7 +274,8 @@ def _nvidia_gpus(warnings: list[str]) -> list[Gpu]:
             "nvidia-smi",
             "--query-gpu=index,name,memory.total,memory.free,compute_cap,driver_version",
             "--format=csv,noheader,nounits",
-        ]
+        ],
+        warnings,
     )
     if out is None:
         return []
@@ -300,7 +313,7 @@ def _amd_gpus(warnings: list[str]) -> list[Gpu]:
     names have changed between ROCm releases. A parse failure appends a
     warning and reports no GPU rather than guessing a size.
     """
-    out = _run(["rocm-smi", "--showmeminfo", "vram", "--csv"])
+    out = _run(["rocm-smi", "--showmeminfo", "vram", "--csv"], warnings)
     if out is None:
         return []
 
@@ -350,7 +363,7 @@ def _intel_gpus(warnings: list[str]) -> list[Gpu]:
     says why. Fit then falls back to total for that card, which the
     verdict labels `tight` rather than `fits`.
     """
-    out = _run(["xpu-smi", "discovery", "--dump", "1,2"])
+    out = _run(["xpu-smi", "discovery", "--dump", "1,2"], warnings)
     if out is None:
         return []
     gpus: list[Gpu] = []
@@ -433,24 +446,14 @@ def detect() -> HostHardware:
     # installed and a tool that is installed and broken are two different
     # problems with two different fixes, and reporting the second as the
     # first sends a person to audit their PATH while their driver is the
-    # thing that is wrong.
-    #
-    # **Reported whether or not another vendor's card was found**, which
-    # the first version of this fix got wrong and the live run caught:
-    # on a machine with a working Intel card and a wedged NVIDIA driver,
-    # the NVIDIA card is the one the person cares about and the whole
-    # warning disappeared behind `if not gpus`.
-    broken = [
-        name for name in ("nvidia-smi", "rocm-smi", "xpu-smi") if probe([name]) is Probe.FAILED
-    ]
-    for name in broken:
-        warnings.append(
-            f"{name} is installed here and exited non-zero, so any GPU it manages could "
-            "not be read. On Linux that is usually a driver/library version mismatch "
-            f"after an update -- `{name}` itself will say so. This is not a PATH problem."
-        )
+    # thing that is wrong. Each detector above records its own failure as
+    # it happens, so the distinction costs no extra process -- and it is
+    # recorded whether or not ANOTHER vendor's card was found, because on
+    # a machine with a working Intel card and a wedged NVIDIA driver the
+    # NVIDIA card is the one the person cares about.
+    wedged = any("exited non-zero" in w for w in warnings)
 
-    if not gpus and not broken:
+    if not gpus and not wedged:
         warnings.append(
             "no accelerator was detected, so fit is scored against host memory alone. "
             "If you have a GPU, its vendor tool (nvidia-smi, rocm-smi, xpu-smi) is not on "
