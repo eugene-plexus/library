@@ -11,6 +11,7 @@ from .. import hardware, quants
 from .._generated.models import (
     HostHardware,
     KvCacheType,
+    ModelFileRole,
     ModelFit,
     ModelFormat,
     ModelStatus,
@@ -154,20 +155,35 @@ async def get_model_fit(
     budget = fit_mod.budget_from_hardware(detected, vram_override=vramBytes, ram_override=ramBytes)
     context = contextLength or config.guidance_context_length()
     shape = _shape_for(model)
+    # The disk footprint includes an optional vision projector. Merely
+    # finding it beside a GGUF does not put --mmproj on the launch line.
+    # Catalogue candidates already exclude it; local guidance must agree.
+    projector_bytes = (
+        sum(f.sizeBytes or 0 for f in model.files or [] if f.role is ModelFileRole.projector)
+        if model.format is ModelFormat.gguf
+        else 0
+    )
+    weights_bytes = max(0, (model.sizeBytes or 0) - projector_bytes)
 
     result = fit_mod.compute(
-        weights_bytes=model.sizeBytes or 0,
+        weights_bytes=weights_bytes,
         budget=budget,
         context_length=context,
         shape=shape,
         kv_cache_type=kvCacheType,
     )
+    if projector_bytes:
+        result.notes = [
+            *(result.notes or []),
+            "This estimate excludes the separate vision projector. Loading it for "
+            "images needs additional memory; finding it on disk does not load it.",
+        ]
     return ModelFit(
         modelId=model.id,
         path=model.path,
         fit=result,
         maxContextLength=fit_mod.max_context_that_fits(
-            weights_bytes=model.sizeBytes or 0,
+            weights_bytes=weights_bytes,
             budget=budget,
             shape=shape,
             kv_cache_type=kvCacheType,

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from eugene_plexus_library import hardware, quants
 from eugene_plexus_library._generated.models import Arch, Os
 
-from .conftest import qwen_like_kv, write_gguf
+from .conftest import projector_kv, qwen_like_kv, write_gguf
 
 # -- the quant table ----------------------------------------------------
 
@@ -159,3 +160,59 @@ def test_fit_accepts_a_budget_for_another_host(
 def test_fit_on_an_unknown_model_is_a_404(configured_client: TestClient) -> None:
     response = configured_client.get("/v1/models/deadbeef/fit")
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_a_projector_on_disk_does_not_change_text_model_fit(
+    configured_client: TestClient, models_dir: Path, sharded: bool
+) -> None:
+    """Scan real files, then cross a budget that fits only without mmproj.
+
+    Disk size must still grow, and every weight shard must still count.
+    Both the verdict and suggested context must remain the same after
+    discovering the optional file: normal runtime/benchmark loads omit it.
+    """
+    kv = qwen_like_kv(name="Vision", context_length=262144)
+    kv.update(
+        {
+            "llama.attention.head_count_kv": 8,
+            "llama.attention.key_length": 128,
+            "llama.attention.value_length": 128,
+        }
+    )
+    names = ["m-00001-of-00002.gguf", "m-00002-of-00002.gguf"] if sharded else ["m.gguf"]
+    weights = [write_gguf(models_dir / name, kv, payload=b"x" * 4096) for name in names]
+    weight_bytes = sum(path.stat().st_size for path in weights)
+
+    def scan() -> dict:
+        configured_client.post("/v1/scan", json={"full": True})
+        for _ in range(200):
+            if configured_client.get("/v1/scan").json()["state"] != "scanning":
+                break
+        models = configured_client.get("/v1/models").json()["models"]
+        assert len(models) == 1
+        return models[0]
+
+    model = scan()
+    url = f"/v1/models/{model['id']}/fit"
+    # 32 layers * 8 KV heads * (128 + 128) * f16 * 4096 context + 1 GiB buffers.
+    required = weight_bytes + 32 * 8 * 256 * 2 * 4096 + 1024**3
+    params = {"contextLength": 4096, "vramBytes": required, "ramBytes": 64 * 1024**3}
+    before = configured_client.get(url, params=params).json()
+    assert before["fit"]["weightsBytes"] == weight_bytes
+    assert before["fit"]["requiredBytes"] == required
+    assert before["fit"]["verdict"] == "fits"
+    assert before["maxContextLength"] == 4096
+
+    projector = write_gguf(
+        models_dir / "mmproj-F16.gguf", projector_kv(name="Vision"), payload=b"x" * 131072
+    )
+    model = scan()
+    assert model["sizeBytes"] == weight_bytes + projector.stat().st_size
+    assert model["capabilities"]["vision"] is True
+    assert any(file["role"] == "projector" for file in model["files"])
+    after = configured_client.get(url, params=params).json()
+    for key in ("weightsBytes", "requiredBytes", "verdict"):
+        assert after["fit"][key] == before["fit"][key]
+    assert after["maxContextLength"] == before["maxContextLength"]
+    assert any("excludes the separate vision projector" in note for note in after["fit"]["notes"])
