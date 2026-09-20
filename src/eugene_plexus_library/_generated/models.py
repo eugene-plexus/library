@@ -886,10 +886,10 @@ class RecommendedSampling(BaseModel):
 
 class ModelProfileSpec(BaseModel):
     """
-    Declarative half of a profile — the launch settings that worked
-    for one model. Used for create and replace bodies.
+    Declarative half of a profile — launch settings and generation
+    defaults for one model. Used for create and replace bodies.
 
-    Every field name here is a `RuntimeSpec` field name, on purpose:
+    Launch field names match `RuntimeSpec`, on purpose:
     composing a profile into a runtime declaration is a copy, not a
     translation, which is what lets the launch flow live in the
     caller and keep this component free of engine knowledge.
@@ -903,7 +903,24 @@ class ModelProfileSpec(BaseModel):
     )
     default: bool | None = Field(
         False,
-        description='The profile offered first when launching this model.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
+        description='The profile offered first when launching this model.\nIts maxTokens, temperature and topP also supply omitted\ngeneration parameters at the gateway, without restarting\nan existing runtime. Explicit request values always win.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
+    )
+    maxTokens: int | None = Field(
+        None,
+        description='Maximum output tokens when the request omits a limit. Absent uses the gateway default.',
+        ge=1,
+    )
+    temperature: float | None = Field(
+        None,
+        description='Sampling temperature when omitted by the caller. Zero is an explicit value.',
+        ge=0.0,
+        le=2.0,
+    )
+    topP: float | None = Field(
+        None,
+        description='Nucleus sampling cutoff when omitted by the caller. Absent leaves it unspecified.',
+        ge=0.0,
+        le=1.0,
     )
     engine: EngineKind = Field(
         ...,
@@ -939,6 +956,9 @@ class ModelProfile(BaseModel):
     )
     name: str
     default: bool
+    maxTokens: int | None = Field(None, ge=1)
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    topP: float | None = Field(None, ge=0.0, le=1.0)
     engine: EngineKind
     flags: dict[str, Any] | None = None
     extraArgs: list[str] | None = None

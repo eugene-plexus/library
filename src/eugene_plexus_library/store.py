@@ -362,6 +362,9 @@ class StateStore:
                 extraArgs=spec.extraArgs,
                 env=spec.env,
                 notes=spec.notes,
+                maxTokens=spec.maxTokens,
+                temperature=spec.temperature,
+                topP=spec.topP,
                 createdAt=now,
                 updatedAt=now,
             )
@@ -400,6 +403,9 @@ class StateStore:
                 extraArgs=spec.extraArgs,
                 env=spec.env,
                 notes=spec.notes,
+                maxTokens=spec.maxTokens,
+                temperature=spec.temperature,
+                topP=spec.topP,
                 createdAt=current.createdAt,
                 updatedAt=_now(),
             )
