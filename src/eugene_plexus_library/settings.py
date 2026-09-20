@@ -50,9 +50,11 @@ class Settings(BaseSettings):
     /v1/config to fix it. PATCH still writes through to `config_file`,
     so the repair survives the next boot."""
 
+    auth_verify_key: str | None = None
+    """Base64 public Ed25519 PEM from the agent. Exclusive with auth_signing_key."""
+
     auth_signing_key: str | None = None
-    """Base64 32-byte HMAC key from the agent at spawn time. Absent
-    means unauthenticated — the dev/standalone path only."""
+    """Legacy base64 32-byte HS256 key; used only until install rotation."""
 
     service_token: str | None = None
     """Long-lived service JWT. Not consumed: the library makes no
