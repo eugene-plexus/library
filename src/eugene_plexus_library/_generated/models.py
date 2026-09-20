@@ -542,9 +542,10 @@ class ConfigTestResult(BaseModel):
 
 class SecurityMode(StrEnum):
     """
-    Operator's choice for how the agent handles its master key
-    between restarts. Set during the wizard's security screen; can
-    be changed later from the Config page.
+    How a host retains access to its master encryption key between
+    restarts. The component's config schema lists the supported
+    subset: the agent offers the first two modes; the control root
+    also offers `passphrase_file`.
 
     * `prompt_on_startup` — passphrase required at every agent
       start. Master key lives only in process memory. Best for
@@ -557,18 +558,24 @@ class SecurityMode(StrEnum):
       user login; Eugene auto-recovers from restarts. Best for
       home / personal-use installs and anyone who wants minimum
       friction. Anyone with the OS account can also start Eugene.
+    * `passphrase_file` — the control root reads a mounted passphrase
+      at startup from `EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`. For
+      containers and other hosts without a keyring. An absent or
+      unreadable file leaves the root sealed, with a diagnosis in
+      its log. Access to that file permits unlocking the root.
 
     """
 
     prompt_on_startup = 'prompt_on_startup'
     os_keyring = 'os_keyring'
+    passphrase_file = 'passphrase_file'
 
 
 class AuthLoginRequest(BaseModel):
     """
     Login request body sent by the UI to `POST /v1/auth/login` on
     the agent. The passphrase is the same one the operator set
-    in the wizard. The agent bcrypt-compares it; on match,
+    in the wizard. The agent verifies its Argon2id hash; on match,
     issues a session token.
 
     """
@@ -1338,9 +1345,11 @@ class DownloadState(StrEnum):
 class Basis(StrEnum):
     """
     `metadata` when the model's own declared shape produced the
-    KV term — a local model, or a remote one after a preflight.
-    `estimate` when only the file size was available, which is
-    every catalogue candidate until someone preflights it.
+    KV term, whether read locally or by remote preflight.
+    `estimate` when only file size was available or when a
+    scalar fallback replaces declared per-layer attention terms
+    that were not retained. Local models and preflighted files
+    can therefore still report `estimate`; `notes` explains why.
 
     The honest distinction between "this is arithmetic" and
     "this is a guess with a number on it", and the field a UI
@@ -1834,7 +1843,7 @@ class Fit(BaseModel):
     )
     basis: Basis = Field(
         ...,
-        description='`metadata` when the model\'s own declared shape produced the\nKV term — a local model, or a remote one after a preflight.\n`estimate` when only the file size was available, which is\nevery catalogue candidate until someone preflights it.\n\nThe honest distinction between "this is arithmetic" and\n"this is a guess with a number on it", and the field a UI\nshould hang a "check this file" affordance off.\n',
+        description='`metadata` when the model\'s own declared shape produced the\nKV term, whether read locally or by remote preflight.\n`estimate` when only file size was available or when a\nscalar fallback replaces declared per-layer attention terms\nthat were not retained. Local models and preflighted files\ncan therefore still report `estimate`; `notes` explains why.\n\nThe honest distinction between "this is arithmetic" and\n"this is a guess with a number on it", and the field a UI\nshould hang a "check this file" affordance off.\n',
     )
     budget: MemoryBudget | None = None
     notes: list[str] | None = Field(
