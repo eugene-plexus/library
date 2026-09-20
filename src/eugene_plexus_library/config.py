@@ -115,13 +115,13 @@ FIELDS: list[ConfigField] = [
         key="followSymlinks",
         label="Follow symlinked directories",
         description=(
-            "Descend into directories that are symlinks. Off by default, "
-            "and deliberately: a symlink loop turns a scan into an "
-            "infinite walk, and on Linux and macOS a HuggingFace cache "
-            "links its snapshots into a content-addressed blob store, "
-            "which would report the same model repeatedly under hash "
-            "names. Turn it on if you deliberately symlink model "
-            "directories together."
+            "Descend into symlinked directories and Windows directory "
+            "junctions. Off by default; turn it on if you deliberately "
+            "link model directories together. Directory cycles are "
+            "skipped. Linked files are always read, including HuggingFace "
+            "snapshot files, and models keep their named paths rather "
+            "than the link targets. Explicitly configured roots are "
+            "always scanned. Changes take effect on the next scan."
         ),
         category="scanning",
         valueType=ConfigValueType.boolean,

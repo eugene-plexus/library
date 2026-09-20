@@ -15,8 +15,10 @@ same bug in the fixture.
 from __future__ import annotations
 
 import json
+import os
 import struct
-from collections.abc import Iterator
+import subprocess
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,38 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_library.app import create_app
 from eugene_plexus_library.settings import Settings
+
+
+def make_symlink(link: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        if os.name == "nt" and exc.winerror == 1314:
+            pytest.skip("Windows symlink creation needs Developer Mode or symlink privilege")
+        raise
+
+
+@pytest.fixture(params=["symlink", "junction"])
+def directory_link(request: pytest.FixtureRequest) -> Callable[[Path, Path], None]:
+    if request.param == "junction":
+        if os.name != "nt":
+            pytest.skip("directory junctions are Windows-only")
+
+        def junction(link: Path, target: Path) -> None:
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                check=True,
+                capture_output=True,
+            )
+            assert link.is_junction()
+
+        return junction
+
+    def symlink(link: Path, target: Path) -> None:
+        make_symlink(link, target, directory=True)
+
+    return symlink
+
 
 # GGUF value type tags, restated here rather than imported: a fixture
 # that shares constants with the code under test can agree with it about

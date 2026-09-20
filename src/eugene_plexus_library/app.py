@@ -81,7 +81,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     state_store.load()
     app.state.state_store = state_store
 
-    manager = ScanManager(state_store, roots=config_store.model_roots)
+    manager = ScanManager(
+        state_store,
+        roots=config_store.model_roots,
+        follow_symlinks=lambda: bool(config_store.get("followSymlinks")),
+    )
     app.state.scan_manager = manager
 
     # One client for the process, so the connection pool is reused;

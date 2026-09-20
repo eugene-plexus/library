@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
+
+import pytest
 
 from eugene_plexus_library._generated.models import (
     ModelFileRole,
@@ -12,10 +15,12 @@ from eugene_plexus_library._generated.models import (
     SkipReason,
 )
 from eugene_plexus_library._generated.models import Status1 as ScanRootStatus
+from eugene_plexus_library.paths import model_id
 from eugene_plexus_library.scanner import Scanner, cache_key
 
 from .conftest import (
     embedding_kv,
+    make_symlink,
     projector_kv,
     qwen_like_kv,
     write_gguf,
@@ -66,6 +71,103 @@ def test_name_comes_from_the_filename_not_the_metadata(models_dir: Path) -> None
 
 
 # --- what is not a model ------------------------------------------------
+
+
+@pytest.mark.parametrize("follow", [False, True])
+def test_directory_links_follow_the_setting_and_keep_the_alias(
+    models_dir: Path,
+    tmp_path: Path,
+    directory_link: Callable[[Path, Path], None],
+    follow: bool,
+) -> None:
+    target = write_gguf(tmp_path / "elsewhere" / "linked.gguf", qwen_like_kv())
+    link = models_dir / "alias"
+    directory_link(link, target.parent)
+    result = Scanner(follow_symlinks=follow).scan([models_dir])
+    assert [model.path for model in result.models] == ([str(link / target.name)] if follow else [])
+    if follow:
+        assert result.models[0].id == model_id(link / target.name)
+        assert result.models[0].root == str(models_dir)
+
+
+def test_directory_link_cycles_stop_without_discarding_distinct_aliases(
+    models_dir: Path, directory_link: Callable[[Path, Path], None]
+) -> None:
+    target = write_gguf(models_dir / "original" / "model.gguf", qwen_like_kv())
+    directory_link(target.parent / "back", models_dir)
+    directory_link(models_dir / "alias", target.parent)
+    calls = 0
+
+    def cancel_runaway() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls > 100
+
+    scanner = Scanner(follow_symlinks=True, should_cancel=cancel_runaway)
+    for _ in range(2):
+        calls = 0
+        result = scanner.scan([models_dir])
+        assert calls < 100, "the cycle was stopped only by cancellation"
+        assert {model.path for model in result.models} == {
+            str(target),
+            str(models_dir / "alias" / target.name),
+        }
+        assert len({model.id for model in result.models}) == 2
+        assert {entry.path for entry in result.skipped if "cycle" in (entry.detail or "")} == {
+            str(target.parent / "back"),
+            str(models_dir / "alias" / "back"),
+        }
+
+
+def test_an_explicit_linked_root_is_scanned_even_with_following_off(
+    models_dir: Path, tmp_path: Path, directory_link: Callable[[Path, Path], None]
+) -> None:
+    write_gguf(models_dir / "model.gguf", qwen_like_kv())
+    root = tmp_path / "root-alias"
+    directory_link(root, models_dir)
+    result = Scanner().scan([root])
+    assert [model.path for model in result.models] == [str(root / "model.gguf")]
+    assert result.models[0].root == str(root)
+
+
+def test_symlinked_gguf_files_are_read_at_the_named_path(models_dir: Path, tmp_path: Path) -> None:
+    target = write_gguf(tmp_path / "blobs" / "deadbeef", qwen_like_kv())
+    link = models_dir / "named-Q4_K_M.gguf"
+    make_symlink(link, target)
+    result = Scanner().scan([models_dir])
+    assert [model.path for model in result.models] == [str(link)]
+    assert result.models[0].id == model_id(link)
+    assert result.models[0].sizeBytes == target.stat().st_size
+    assert [entry.path for entry in result.models[0].files] == [str(link)]
+
+
+def test_a_real_hf_snapshot_uses_file_symlinks_not_copied_weights(models_dir: Path) -> None:
+    cache = models_dir / "models--org--linked"
+    blobs = write_hf_model(cache / "blobs")
+    snapshot = cache / "snapshots" / "aaaaaaaa"
+    snapshot.mkdir(parents=True)
+    for source in blobs.iterdir():
+        make_symlink(snapshot / source.name, source)
+    (cache / "refs").mkdir()
+    (cache / "refs" / "main").write_text(snapshot.name, encoding="utf-8")
+    result = Scanner().scan([models_dir])
+    assert [model.path for model in result.models] == [str(snapshot)]
+    model = result.models[0]
+    assert model.id == model_id(snapshot)
+    assert model.status == ModelStatus.present
+    assert model.parameters is not None and model.parameters > 0
+    assert model.safetensors.configPath == str(snapshot / "config.json")
+    assert {Path(entry.path).parent for entry in model.files} == {snapshot}
+    assert str(blobs) in _skips(result, SkipReason.not_a_model)
+
+
+@pytest.mark.parametrize("destination", ["missing", "broken.gguf"])
+def test_a_broken_file_symlink_does_not_hide_other_models(
+    models_dir: Path, destination: str
+) -> None:
+    make_symlink(models_dir / "broken.gguf", models_dir / destination)
+    target = write_gguf(models_dir / "working.gguf", qwen_like_kv())
+    assert [model.path for model in Scanner().scan([models_dir]).models] == [str(target)]
 
 
 def test_projector_is_not_a_model_and_is_attached_to_one(models_dir: Path) -> None:
