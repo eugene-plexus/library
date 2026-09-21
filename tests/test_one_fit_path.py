@@ -27,6 +27,7 @@ every six sliding over a 1024-token window.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -67,10 +68,18 @@ def per_layer_kv(architecture: str = "llama", *, blocks: int = BLOCKS) -> dict[s
 
 def scanned(client: TestClient, models_dir: Path, kv: dict[str, Any]) -> str:
     write_gguf(models_dir / "m.gguf", kv)
-    client.post("/v1/scan")
-    for _ in range(200):
-        if client.get("/v1/scan").json()["state"] != "scanning":
-            break
+
+    def wait_for_scan():
+        deadline = time.perf_counter() + 5
+        while client.get("/v1/scan").json()["state"] == "scanning":
+            assert time.perf_counter() < deadline, "fixture scan did not complete"
+            time.sleep(0.01)
+
+    # Startup may already be scanning an empty folder. Wait for it before
+    # requesting the scan that must include the fixture we just wrote.
+    wait_for_scan()
+    assert client.post("/v1/scan").status_code == 202
+    wait_for_scan()
     models = client.get("/v1/models").json()["models"]
     assert models, "the fixture model was not scanned"
     return str(models[0]["id"])
