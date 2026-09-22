@@ -30,6 +30,22 @@ from eugene_plexus_library.app import create_app
 from eugene_plexus_library.settings import Settings
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with no `EUGENE_PLEXUS_*` in the environment.
+
+    `Settings` reads the process environment, and a developer's machine is
+    exactly where one is set: a Windows service install leaves
+    `EUGENE_PLEXUS_LIBRARY_DEFAULT_MODEL_ROOTS` in the machine environment,
+    and with it seven tests about "no roots configured" failed here while
+    passing in CI -- asserting about the developer's install rather than
+    the code. The agent's suite has cleared the prefix the same way since
+    it met this; a test that wants a variable sets it itself.
+    """
+    for key in [k for k in os.environ if k.startswith("EUGENE_PLEXUS_")]:
+        monkeypatch.delenv(key, raising=False)
+
+
 def make_symlink(link: Path, target: Path, *, directory: bool = False) -> None:
     try:
         link.symlink_to(target, target_is_directory=directory)
