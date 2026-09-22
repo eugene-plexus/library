@@ -406,3 +406,23 @@ def test_a_single_candidate_repo_keeps_its_filename_as_a_label() -> None:
     groups, _, _ = catalogue._gguf_groups(one)
     assert len(groups) == 1
     assert groups[0].label == "model"
+
+
+def test_an_mlx_repo_reads_as_safetensors() -> None:
+    """mlx-community repos are tagged `mlx` with `library_name: "mlx"`
+    and usually NOT `transformers` — but on disk they are safetensors
+    directories. Before this, every MLX conversion came back
+    `formats: []` and a `format=safetensors` search filtered them out,
+    so the engine the roadmap adds had no discoverable models."""
+    row = catalogue.build_search_result(
+        {
+            "id": "mlx-community/Qwen3-0.6B-4bit",
+            "author": "mlx-community",
+            "downloads": 43_379,
+            "gated": False,
+            "tags": ["mlx", "license:apache-2.0"],
+            "library_name": "mlx",
+            "siblings": [{"rfilename": "model.safetensors"}],
+        }
+    )
+    assert row.formats == [ModelFormat.safetensors]

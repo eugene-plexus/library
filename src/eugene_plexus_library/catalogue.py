@@ -573,7 +573,16 @@ def build_search_result(entry: dict) -> CatalogueSearchResult:
     formats: list[ModelFormat] = []
     if "gguf" in tags or entry.get("library_name") == "gguf":
         formats.append(ModelFormat.gguf)
-    if "safetensors" in tags or entry.get("library_name") == "transformers":
+    # `mlx-community` repos are tagged `mlx` with `library_name: "mlx"`
+    # and usually NOT `transformers` — but on disk they are safetensors
+    # directories, which is the format vocabulary this catalogue speaks.
+    # Without this clause every MLX conversion came back `formats: []`
+    # and a `format=safetensors` search filtered them all out.
+    if (
+        "safetensors" in tags
+        or "mlx" in tags
+        or entry.get("library_name") in ("transformers", "mlx")
+    ):
         formats.append(ModelFormat.safetensors)
 
     gated_raw = entry.get("gated")

@@ -212,6 +212,29 @@ class ModelConfig:
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def mlx_quantization(self) -> tuple[int | None, int | None] | None:
+        """`(bits, group_size)` from an MLX-style top-level `quantization`
+        block, or None when the directory carries no such marker.
+
+        The one positive signal that a safetensors directory was
+        prepared by `mlx_lm.convert` for the MLX loader: vanilla HF
+        exports spell their quantization `quantization_config`, a
+        different key, and an MLX-quantized directory packs weights as
+        integer tensors no other engine here can load. Absence means
+        unknown, not incompatible — an unquantized MLX conversion writes
+        no block at all.
+        """
+        block = self.raw.get("quantization")
+        if not isinstance(block, dict):
+            return None
+        bits = block.get("bits")
+        group = block.get("group_size")
+        return (
+            bits if isinstance(bits, int) and not isinstance(bits, bool) else None,
+            group if isinstance(group, int) and not isinstance(group, bool) else None,
+        )
+
+    @property
     def is_embedding(self) -> bool:
         """Encoder architectures are embedding models. `BertModel` and
         friends have no LM head, so serving one as a chat model produces

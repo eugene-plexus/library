@@ -51,6 +51,7 @@ from pathlib import Path
 from ._generated.models import (
     GgufDetail,
     LibraryModel,
+    MlxQuantization,
     ModelCapabilities,
     ModelFile,
     ModelFileRole,
@@ -131,6 +132,22 @@ def cache_key(path: Path, stat: os.stat_result) -> CacheKey:
     exactly what a re-quantize-and-overwrite loop does.
     """
     return (normalize(path), stat.st_size, stat.st_mtime_ns)
+
+
+def _mlx_quantization(config: safetensors.ModelConfig) -> MlxQuantization | None:
+    """The MLX conversion marker, when `config.json` carries one.
+
+    Load-bearing for engine choice: an MLX-quantized directory packs its
+    weights as integer tensors that only the MLX loader reads, so the UI
+    should offer the mlx engine and not vLLM for it. Absence means
+    unknown, not incompatible — see the schema's own caveats, including
+    why `parameters` must not feed per-parameter arithmetic here.
+    """
+    marker = config.mlx_quantization
+    if marker is None:
+        return None
+    bits, group = marker
+    return MlxQuantization(bits=bits, groupSize=group)
 
 
 def _timestamp(stat: os.stat_result) -> datetime:
@@ -453,6 +470,7 @@ class Scanner:
             ),
             files=files,
             safetensors=SafetensorsDetail(
+                mlxQuantization=_mlx_quantization(config),
                 dtype=safetensors.dominant_dtype(dtype_counts),
                 shardCount=max(shards, 1),
                 repoId=safetensors.hf_repo_id(directory),

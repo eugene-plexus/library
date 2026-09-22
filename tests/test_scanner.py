@@ -523,3 +523,51 @@ def test_dataset_caches_are_pruned_whole(models_dir: Path) -> None:
     assert result.models == []
     skipped = _skips(result, SkipReason.not_a_model)
     assert skipped == [str(dataset)], "the dataset cache should be pruned, not walked"
+
+
+def test_an_mlx_quantization_block_is_recorded(models_dir: Path) -> None:
+    """`mlx_lm.convert` writes a top-level `quantization` block into
+    config.json — the one positive marker that a safetensors directory
+    was prepared for the MLX loader. The scanner records it so the UI
+    can offer the mlx engine (and not vLLM) for the directory."""
+    directory = write_hf_model(models_dir / "qwen3-0.6b-4bit")
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    config["quantization"] = {"bits": 4, "group_size": 64}
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    result = Scanner().scan([models_dir])
+
+    assert len(result.models) == 1
+    detail = result.models[0].safetensors
+    assert detail is not None
+    assert detail.mlxQuantization is not None
+    assert detail.mlxQuantization.bits == 4
+    assert detail.mlxQuantization.groupSize == 64
+
+
+def test_a_vanilla_hf_quantization_config_is_not_the_mlx_marker(models_dir: Path) -> None:
+    """HF exports spell theirs `quantization_config` — a different key,
+    a different loader. Reading it as the MLX marker would offer the mlx
+    engine for a bitsandbytes/GPTQ directory it cannot load."""
+    directory = write_hf_model(models_dir / "gptq-model")
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    config["quantization_config"] = {"bits": 4, "quant_method": "gptq"}
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    result = Scanner().scan([models_dir])
+
+    assert len(result.models) == 1
+    detail = result.models[0].safetensors
+    assert detail is not None
+    assert detail.mlxQuantization is None
+
+
+def test_a_plain_safetensors_directory_has_no_mlx_marker(models_dir: Path) -> None:
+    """Absence means unknown, not incompatible — an unquantized MLX
+    conversion writes no block, so nothing is claimed either way."""
+    write_hf_model(models_dir / "plain-model")
+    result = Scanner().scan([models_dir])
+
+    detail = result.models[0].safetensors
+    assert detail is not None
+    assert detail.mlxQuantization is None
