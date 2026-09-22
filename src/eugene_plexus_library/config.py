@@ -115,13 +115,13 @@ FIELDS: list[ConfigField] = [
         key="followSymlinks",
         label="Follow symlinked directories",
         description=(
-            "Descend into directories that are symlinks. Off by default, "
-            "and deliberately: a symlink loop turns a scan into an "
-            "infinite walk, and on Linux and macOS a HuggingFace cache "
-            "links its snapshots into a content-addressed blob store, "
-            "which would report the same model repeatedly under hash "
-            "names. Turn it on if you deliberately symlink model "
-            "directories together."
+            "Descend into symlinked directories and Windows directory "
+            "junctions. Off by default; turn it on if you deliberately "
+            "link model directories together. Directory cycles are "
+            "skipped. Linked files are always read, including HuggingFace "
+            "snapshot files, and models keep their named paths rather "
+            "than the link targets. Explicitly configured roots are "
+            "always scanned. Changes take effect on the next scan."
         ),
         category="scanning",
         valueType=ConfigValueType.boolean,
@@ -220,6 +220,21 @@ FIELDS: list[ConfigField] = [
         default=8192,
         minimum=256,
         maximum=1048576,
+    ),
+    ConfigField(
+        key="starterModelsFile",
+        label="Starter model list",
+        description=(
+            "A YAML file naming the handful of models a new install is "
+            "offered before it has any, one per size class. Empty means "
+            "the list that ships inside this component, which a review "
+            "keeps current; point this at your own file to recommend "
+            "something else, or at a file with an empty `classes:` list "
+            "to recommend nothing at all. The path is on the machine "
+            "the library runs on."
+        ),
+        category="guidance",
+        valueType=ConfigValueType.file_path,
     ),
     ConfigField(
         key="logLevel",
@@ -548,6 +563,11 @@ class ConfigStore:
     def max_concurrent_downloads(self) -> int:
         value = self.get("maxConcurrentDownloads")
         return value if isinstance(value, int) and value > 0 else 1
+
+    def starter_models_file(self) -> str | None:
+        """The operator's own list, or None for the one in the wheel."""
+        value = self.get("starterModelsFile")
+        return value.strip() if isinstance(value, str) and value.strip() else None
 
     def guidance_context_length(self) -> int:
         value = self.get("guidanceContextLength")

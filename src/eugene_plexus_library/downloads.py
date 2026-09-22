@@ -177,6 +177,9 @@ def resolve_destination(
         chosen = match
 
     if subdirectory:
+        # The sibling check `resolve_file` below exists to match. If you
+        # are adding a third field that joins onto a destination, it
+        # needs one too.
         candidate = (chosen / subdirectory).expanduser()
         if not path_utils.is_within(candidate, chosen):
             raise DownloadError(
@@ -193,6 +196,56 @@ def resolve_destination(
     if not name:
         return chosen, chosen / owner
     return chosen, chosen / owner / name
+
+
+def resolve_file(*, directory: Path, root: Path, name: str) -> Path:
+    """Where one file of a download lands. Refuses anything outside `root`.
+
+    **The rule is calling #3 and it was stated rather than enforced.**
+    `resolve_destination` above `is_within`-checks `subdirectory`; its
+    sibling field `filename` was joined onto the resolved directory two
+    functions later with nothing in between, so a single-file spec could
+    name a destination anywhere this process can write. Review §6.2 #14;
+    roadmap R1.2. A rule the product does not enforce is a slogan, and
+    this is the one the product calls non-negotiable.
+
+    **Every file, not just the renamed one.** The check is on the
+    resolved path rather than on the shape of a field, so the upstream
+    repo path gets it by the same line — and a future field that joins
+    onto a destination gets it by calling this.
+
+    **Refused, never sanitised.** A silently renamed file is worse than
+    a 400: the operator asked for a name and got a different one, and
+    either finds out when a runtime points at a path that is not there,
+    or does not find out and keeps a library whose names no longer say
+    what is in them. `PathTraversal` is the code `resolve_destination`
+    already uses, so no caller needs a new case.
+
+    Note `..` is not itself the subject: a name that climbs out and back
+    in is fine, because the question is where the bytes land. Checking
+    the spelling instead would refuse a legitimate name and still miss
+    an absolute one, which discards everything to its left in a join and
+    needs no `..` at all.
+    """
+    if not name or not name.strip():
+        raise DownloadError(
+            "A download file needs a name. An empty one resolves to the directory itself.",
+            code="PathTraversal",
+        )
+    # `os.path.normpath`, not `path_utils.normalize`: that one
+    # case-folds for identity comparison, and this value is stored and
+    # shown -- a Windows install would get its model files renamed to
+    # lowercase by the fix for a path bug. Not `resolve()` either, which
+    # follows symlinks (see `paths.py`'s module docstring).
+    candidate = Path(os.path.normpath((directory / name).expanduser()))
+    if not path_utils.is_within(candidate, root) or path_utils.same_path(candidate, directory):
+        raise DownloadError(
+            f"{name!r} resolves outside {root}. A download only ever writes inside the "
+            "model directory it names -- your model files stay where you put them, so a "
+            "name that leaves the folder is refused rather than quietly changed.",
+            code="PathTraversal",
+        )
+    return candidate
 
 
 def _part_path(destination: Path) -> Path:
@@ -246,7 +299,7 @@ class DownloadJob:
 
     def _observe(self, total: int) -> None:
         """Record a progress sample and refresh rate and ETA."""
-        now = time.monotonic()
+        now = time.perf_counter()
         self._samples.append((now, total))
         while len(self._samples) > 2 and now - self._samples[0][0] > RATE_WINDOW_SECONDS:
             self._samples.pop(0)
@@ -652,6 +705,31 @@ class DownloadManager:
     def _persist(self, record: Download) -> None:
         self._store.put_download(record)
 
+    async def claim(self, download_id: str) -> tuple[bool, Download] | None:
+        """Take the intent off a record, once. `None` when there is none.
+
+        **Under the manager's own lock**, because the point of this is
+        that exactly one caller gets it: two consoles polling the same
+        install will both see a finished download with `runWhenReady`
+        set, and without an atomic clear both would create a profile and
+        launch a runtime for the same model.
+
+        Idempotent by construction — a second claim finds the flag
+        already down and answers `False` — so a client that retries
+        after a timeout does not get told something is wrong when
+        nothing is.
+        """
+        async with self._lock:
+            job = self._jobs.get(download_id)
+            if job is None:
+                return None
+            record = job.record
+            if not record.runWhenReady:
+                return False, record
+            record.runWhenReady = False
+            self._persist(record)
+            return True, record
+
     # -- starting -----------------------------------------------------------
 
     async def start(self, spec: DownloadSpec) -> Download:
@@ -679,6 +757,13 @@ class DownloadManager:
                 "so the upstream names are kept.",
             )
 
+        # Before the network, not after: a name that cannot be written
+        # should not cost a round trip to learn about, and a refusal
+        # that arrives after `_file_metadata` is a refusal an operator
+        # waits for.
+        if spec.filename:
+            resolve_file(directory=directory, root=root, name=spec.filename)
+
         revision = spec.revision or "main"
         metadata = await self._file_metadata(spec.repo, revision, list(spec.files))
         commit = await self._pin_commit(spec.repo, revision, list(spec.files))
@@ -690,7 +775,7 @@ class DownloadManager:
             entries.append(
                 DownloadFile(
                     path=repo_path,
-                    destinationPath=str(directory / name),
+                    destinationPath=str(resolve_file(directory=directory, root=root, name=name)),
                     sizeBytes=meta.size,
                     bytesDownloaded=0,
                     state=DownloadState.queued,
@@ -716,6 +801,7 @@ class DownloadManager:
             bytesDownloaded=0,
             attempts=0,
             startedAt=_now(),
+            runWhenReady=bool(spec.runWhenReady),
             message=f"queued; {len(entries)} file(s) into {directory}",
         )
 

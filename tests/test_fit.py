@@ -150,6 +150,62 @@ def test_a_shapeless_model_says_it_is_estimating() -> None:
     )
     assert result.basis is Basis.estimate
     assert any("15%" in note for note in result.notes or [])
+    # The baseline is what it always was: an install that never touches
+    # the context control sees the figure this fallback produced before
+    # it learned to scale.
+    assert result.kvCacheBytes == int(8 * GIB * 0.15)
+
+
+def test_an_estimated_kv_cache_grows_with_the_context() -> None:
+    """The defect this exists to stop coming back.
+
+    An estimated fit used to be a *constant*, so the discovery screen's
+    context control moved its own label, the column header and the
+    number echoed back on every badge — and could not move one verdict.
+    A person stepping it down from 128k to find something their card
+    could hold was told nothing had changed.
+
+    Almost every catalogue verdict takes this branch: the hub reports a
+    repo's architecture, parameters and trained context and nothing
+    about layers or heads, so `basis: estimate` is the *normal* case on
+    Discover and the rare one on disk.
+    """
+    budget = fit.budget_from_hardware(DEV_BOX)
+
+    def kv(context_length: int) -> int:
+        return fit.compute(
+            weights_bytes=8 * GIB, budget=budget, context_length=context_length
+        ).kvCacheBytes
+
+    # Linear in context, because that is what a KV cache is. Within a
+    # byte: the result is truncated to an integer at each end.
+    assert abs(kv(16384) - 2 * kv(8192)) <= 1
+    assert abs(2 * kv(4096) - kv(8192)) <= 1
+    assert abs(kv(262144) - 32 * kv(8192)) <= 32
+
+    # And it reaches the verdict rather than stopping at the breakdown:
+    # 8 GiB of weights sit inside 28.9 GiB of free VRAM at 8k and do not
+    # at 262144, which is the whole point of asking.
+    assert (
+        fit.compute(weights_bytes=8 * GIB, budget=budget, context_length=8192).verdict
+        is FitVerdict.fits
+    )
+    assert (
+        fit.compute(weights_bytes=8 * GIB, budget=budget, context_length=262144).verdict
+        is not FitVerdict.fits
+    )
+
+
+def test_the_estimated_kv_note_carries_the_context_it_was_scaled_to() -> None:
+    """A breakdown reading "a rough 15% of the weights" beside a figure
+    that is 4.8x the weights is a note that contradicts its own number.
+    """
+    result = fit.compute(
+        weights_bytes=8 * GIB,
+        budget=fit.budget_from_hardware(DEV_BOX),
+        context_length=32768,
+    )
+    assert any("32,768" in note and "8,192 tokens" in note for note in result.notes or [])
 
 
 def test_a_shaped_model_says_it_is_not() -> None:
@@ -288,18 +344,26 @@ def test_largest_gpu_is_reported_separately_from_the_sum() -> None:
 
 
 def test_a_card_with_no_free_reading_falls_back_to_total() -> None:
-    """Intel's tool does not report free memory in any stable form. The
-    fallback is optimistic for that card alone, and the hardware
-    warnings name it."""
-    intel = HostHardware(
-        hostname="arc",
+    """A card whose total is known and whose free is not.
+
+    **The fixture was Intel's and could not be**, which is review §6.2
+    #28 and why this docstring changed: `_intel_gpus` reports
+    `vramTotalBytes=0`, never a real size, so a test asserting the
+    fallback against `16 * GIB` was green about a shape the detector
+    cannot emit while the shape it does emit went unasserted. The
+    unknown-size case is `tests/test_a_card_we_cannot_see.py` now; this
+    is the AMD shape, where `rocm-smi` gives a total and `used` may be
+    missing.
+    """
+    amd = HostHardware(
+        hostname="radeon",
         os=Os.linux,
         arch=Arch.x64,
         ramTotalBytes=32 * GIB,
         ramAvailableBytes=24 * GIB,
-        gpus=[Gpu(index=0, name="Arc A770", vendor=Vendor.intel, vramTotalBytes=16 * GIB)],
+        gpus=[Gpu(index=0, name="RX 7900 XTX", vendor=Vendor.amd, vramTotalBytes=16 * GIB)],
     )
-    budget = fit.budget_from_hardware(intel)
+    budget = fit.budget_from_hardware(amd)
     assert budget.vramFreeBytes == 16 * GIB
 
 

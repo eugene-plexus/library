@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+from datetime import date
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
 class LibraryFolder(BaseModel):
@@ -57,30 +58,42 @@ class Role(StrEnum):
     tool = 'tool'
 
 
-class Message(BaseModel):
-    """
-    A single message in a conversation. Deliberately close to the
-    OpenAI / Anthropic chat message format so drivers don't have to
-    re-shape on every hop.
+class TextContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['text']
+    text: str
 
+
+class Detail(StrEnum):
+    """
+    Explicit high/low processing modes are not supported.
     """
 
-    role: Role
-    content: str | None = Field(
-        None,
-        description='Message text. Text-only for now; multimodal extensions\ndeferred. **Nullable, and no longer required:** an assistant\nturn that only calls a tool has no text to carry, and the\nalternative — an empty string — would assert the model said\nnothing when in fact it said something that was not text.\n',
+    auto = 'auto'
+
+
+class ImageUrl(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
-    toolCalls: list[dict[str, Any]] | None = Field(
-        None,
-        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    url: str = Field(
+        ...,
+        description='Inline base64 PNG or JPEG data URL. No remote references.',
+        max_length=6990531,
     )
-    toolCallId: str | None = Field(
-        None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    detail: Detail | None = Field(
+        None, description='Explicit high/low processing modes are not supported.'
     )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
+
+
+class ImageContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
+    type: Literal['image_url']
+    image_url: ImageUrl
 
 
 class BackendKind(StrEnum):
@@ -236,6 +249,21 @@ class ModelFormat(StrEnum):
     safetensors = 'safetensors'
 
 
+class RetryDisposition(StrEnum):
+    """
+    Safe means this attempt did not accept application work and may
+    be replayed before any output. Terminal means the request must
+    be corrected. Indeterminate means work may have occurred; do not
+    replay automatically. Missing classification on a server failure
+    is indeterminate, never implicit permission to retry.
+
+    """
+
+    safe = 'safe'
+    terminal = 'terminal'
+    indeterminate = 'indeterminate'
+
+
 class Problem(BaseModel):
     """
     Error response shape, modeled on RFC 7807 (problem+json). Every
@@ -259,6 +287,15 @@ class Problem(BaseModel):
     component: str | None = Field(
         None,
         description='Eugene Plexus component name that originated the error\n(e.g. `"gateway"`, `"inference-driver:left"`).\n',
+    )
+    retryDisposition: RetryDisposition | None = Field(
+        None,
+        description='Safe means this attempt did not accept application work and may\nbe replayed before any output. Terminal means the request must\nbe corrected. Indeterminate means work may have occurred; do not\nreplay automatically. Missing classification on a server failure\nis indeterminate, never implicit permission to retry.\n',
+    )
+    retryAfterSeconds: float | None = Field(
+        None,
+        description='Parsed provider Retry-After delay; a scheduling hint, not permission to replay.',
+        ge=0.0,
     )
 
 
@@ -375,6 +412,20 @@ class ConfigValueType(StrEnum):
     host) plus its mounts; the per-node grid over it is the
     Library's Folders page, not this field.
 
+    `share_credentials` (R2.6, 2026-09-18) is an ordered JSON array
+    of `ShareCredential` — `{"host": <a file server>, "username":
+    ..., "password": ...}`. Its one user is the agent's
+    `shareCredentials`, which is how a host that runs Eugene as a
+    Windows **service** reaches an authenticated share at all: a
+    service has none of the per-user credentials the person who
+    installed it collected by hand. It is the only value here whose
+    entries contain a secret, so it carries `secret`'s rule per
+    entry rather than per field — the password is redacted in `GET`,
+    accepted in `PATCH`, and an entry that omits it keeps the stored
+    one. UIs render it as rows of host / user / password, with the
+    password a password input, and must not display a redacted
+    entry as though its password were empty.
+
     """
 
     string = 'string'
@@ -393,6 +444,7 @@ class ConfigValueType(StrEnum):
     model_slots = 'model_slots'
     path_mappings = 'path_mappings'
     library_folders = 'library_folders'
+    share_credentials = 'share_credentials'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -526,9 +578,10 @@ class ConfigTestResult(BaseModel):
 
 class SecurityMode(StrEnum):
     """
-    Operator's choice for how the agent handles its master key
-    between restarts. Set during the wizard's security screen; can
-    be changed later from the Config page.
+    How a host retains access to its master encryption key between
+    restarts. The component's config schema lists the supported
+    subset: the agent offers the first two modes; the control root
+    also offers `passphrase_file`.
 
     * `prompt_on_startup` — passphrase required at every agent
       start. Master key lives only in process memory. Best for
@@ -541,18 +594,24 @@ class SecurityMode(StrEnum):
       user login; Eugene auto-recovers from restarts. Best for
       home / personal-use installs and anyone who wants minimum
       friction. Anyone with the OS account can also start Eugene.
+    * `passphrase_file` — the control root reads a mounted passphrase
+      at startup from `EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`. For
+      containers and other hosts without a keyring. An absent or
+      unreadable file leaves the root sealed, with a diagnosis in
+      its log. Access to that file permits unlocking the root.
 
     """
 
     prompt_on_startup = 'prompt_on_startup'
     os_keyring = 'os_keyring'
+    passphrase_file = 'passphrase_file'
 
 
 class AuthLoginRequest(BaseModel):
     """
     Login request body sent by the UI to `POST /v1/auth/login` on
     the agent. The passphrase is the same one the operator set
-    in the wizard. The agent bcrypt-compares it; on match,
+    in the wizard. The agent verifies its Argon2id hash; on match,
     issues a session token.
 
     """
@@ -571,7 +630,7 @@ class AuthLoginResponse(BaseModel):
 
     sessionToken: str = Field(
         ...,
-        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`.\n',
+        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`. New installs and key rotations use JWT\n`alg: EdDSA` with Ed25519. Existing HS256 installs retain\ntheir 32-byte key until explicit rotation. Agent and control\nhold private signing keys; gateway, library and driver hold\npublic verification keys after migration. Verifiers select\nexactly one algorithm from trusted key material, not from\ntoken headers. Rotation invalidates all prior tokens;\nthere is no simultaneous HS256/EdDSA acceptance window.\n',
     )
     expiresAt: AwareDatetime
     operatorName: str | None = Field(
@@ -644,6 +703,55 @@ class RestartResult(BaseModel):
     message: str | None = Field(
         None,
         description='Optional human-readable note (e.g. "logs flushed, exiting\nnow"). UI may display this in the restart-progress dialog.\n',
+    )
+
+
+class ShareCredential(BaseModel):
+    """
+    A user name and password this host uses to reach one file server.
+
+    **The unit is the server, not the share**, and that is a Windows
+    constraint rather than a simplification: Windows refuses a second
+    set of credentials to a server it already holds a session with
+    (`ERROR_SESSION_CREDENTIAL_CONFLICT`, 1219), so a per-share
+    credential would be a field that cannot always be honoured. One
+    entry covers every share on that host.
+
+    **Why this exists at all.** An agent that runs as a Windows
+    service has no per-user credential store, so the entry a person
+    once typed into Explorer is invisible to it — and at Windows 11
+    defaults there is no guest fallback either
+    (`EnableInsecureGuestLogons` is 0), so a share that asks for
+    nobody in particular is still refused with
+    *"your organization's security policies block unauthenticated
+    guest access"* (measured 2026-09-18 against the live install's
+    own NAS). Without this the agent comes back after a reboot
+    unable to read a single model, with every health check green.
+
+    **Per node, and that is `library-folders-and-reach`'s shape
+    rather than a departure from it.** A folder states its `mounts`
+    once because a mount is a property of the share; a credential is
+    a property of *this machine's relationship to* the share, which
+    is exactly what `pathMappings` already is. Nodes do not inherit
+    credentials, and a folder never carries one.
+
+    Nothing here is required to mount anything: the agent asks the
+    OS to establish the session, and an operator who has already
+    arranged access another way leaves the list empty.
+
+    """
+
+    host: str = Field(
+        ...,
+        description="The file server, as the paths that need it spell it — a host\nname or an address, with no leading slashes and no share\nname. `192.168.16.252` covers `\\\\192.168.16.252\\downloads`\nand `\\\\192.168.16.252\\appdata` both. Matched\ncase-insensitively, because a server name is.\n\nA name and an address for the same machine are **two\ndifferent servers** to Windows, which keys a session by the\nname it was dialled with. That is a tripwire worth knowing\nrather than a rule to work around: spell it here the way the\nLibrary folder's mounts spell it.\n",
+    )
+    username: str = Field(
+        ...,
+        description='The account on the file server, not on this machine.\n`DOMAIN\\user` where the server wants one.\n',
+    )
+    password: str | None = Field(
+        None,
+        description="Redacted in `GET /v1/config` exactly as a `secret` scalar is\n— the value comes back as null and the entry keeps its `host`\nand `username`, so a UI can render the row without ever\nholding the secret. A `PATCH` that omits `password` on an\nentry whose `host` already exists **keeps the stored one**,\nso editing a user name does not silently blank the password;\nan explicit empty string clears it.\n\n**At rest it is sealed with the install's master key**, the\nsame envelope a driver's `apiKey` gets, so it is not\nreadable from the config file — and so it is readable only\nonce the agent is unlocked. On a host whose `securityMode`\nis `prompt_on_startup` that means shares are not reachable\nuntil somebody signs in, which is the same thing everything\nelse behind the master key already does and is reported the\nsame way rather than failing as a missing file.\n",
     )
 
 
@@ -814,10 +922,10 @@ class RecommendedSampling(BaseModel):
 
 class ModelProfileSpec(BaseModel):
     """
-    Declarative half of a profile — the launch settings that worked
-    for one model. Used for create and replace bodies.
+    Declarative half of a profile — launch settings and generation
+    defaults for one model. Used for create and replace bodies.
 
-    Every field name here is a `RuntimeSpec` field name, on purpose:
+    Launch field names match `RuntimeSpec`, on purpose:
     composing a profile into a runtime declaration is a copy, not a
     translation, which is what lets the launch flow live in the
     caller and keep this component free of engine knowledge.
@@ -831,7 +939,24 @@ class ModelProfileSpec(BaseModel):
     )
     default: bool | None = Field(
         False,
-        description='The profile offered first when launching this model.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
+        description='The profile offered first when launching this model.\nIts maxTokens, temperature and topP also supply omitted\ngeneration parameters at the gateway, without restarting\nan existing runtime. Explicit request values always win.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
+    )
+    maxTokens: int | None = Field(
+        None,
+        description='Maximum output tokens when the request omits a limit. Absent uses the gateway default.',
+        ge=1,
+    )
+    temperature: float | None = Field(
+        None,
+        description='Sampling temperature when omitted by the caller. Zero is an explicit value.',
+        ge=0.0,
+        le=2.0,
+    )
+    topP: float | None = Field(
+        None,
+        description='Nucleus sampling cutoff when omitted by the caller. Absent leaves it unspecified.',
+        ge=0.0,
+        le=1.0,
     )
     engine: EngineKind = Field(
         ...,
@@ -867,6 +992,9 @@ class ModelProfile(BaseModel):
     )
     name: str
     default: bool
+    maxTokens: int | None = Field(None, ge=1)
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    topP: float | None = Field(None, ge=0.0, le=1.0)
     engine: EngineKind
     flags: dict[str, Any] | None = None
     extraArgs: list[str] | None = None
@@ -999,6 +1127,21 @@ class CatalogueSort(StrEnum):
     created = 'created'
 
 
+class InterpretedAs(StrEnum):
+    """
+    How `q` was read. `repo` means it parsed as a repo
+    reference -- a hub URL, or a bare `owner/name` that
+    resolved -- and `results` holds that one repo; a client
+    should select it rather than make the person click the only
+    row. `search` is an ordinary query, including a bare
+    `owner/name` that upstream had no repo for.
+
+    """
+
+    search = 'search'
+    repo = 'repo'
+
+
 class GateKind(StrEnum):
     """
     Whether upstream restricts the *bytes*. `open` is unrestricted;
@@ -1118,6 +1261,43 @@ class AlreadyOwned(BaseModel):
     )
 
 
+class StarterSetSource(StrEnum):
+    """
+    `shipped` is the list inside the wheel; `configured` is a file
+    `starterModelsFile` points at. An operator who replaced the list
+    should see that they did.
+
+    A named schema rather than an inline enum, and the reason is a
+    codegen hazard rather than taste: `datamodel-code-generator`
+    names an inline enum after its property, so a second inline
+    `source:` anywhere in this document renames the FIRST one --
+    `MemoryBudget.source` became `Source1` and every existing
+    `Source.override` call site broke. Inline enums in a document
+    this size are a collision waiting for the next schema.
+
+    """
+
+    shipped = 'shipped'
+    configured = 'configured'
+
+
+class StarterRecommendation(BaseModel):
+    """
+    Which entry this machine should take, and why -- or, when
+    `sizeClass` is absent, why none of them.
+
+    """
+
+    sizeClass: str | None = Field(
+        None,
+        description="The recommended entry's `sizeClass`. Absent when nothing in\nthe list fits, in which case `reason` says what would.\n",
+    )
+    reason: str = Field(
+        ...,
+        description='Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n',
+    )
+
+
 class CatalogueCard(BaseModel):
     """
     The model card, as published.
@@ -1164,9 +1344,27 @@ class DownloadSpec(BaseModel):
         None,
         description='Relative destination under `root`, overriding the configured\nlayout. Path traversal is rejected; the result must stay\ninside the root.\n',
     )
+    runWhenReady: bool | None = Field(
+        False,
+        description="The operator asked for this model to be **run** when it\nlands, not merely fetched.\n\n**This component records it and never acts on it.** The\nlibrary does not launch anything — a launch is a profile, an\nengine and a runtime on some node's agent, and which node is\na question the library has no business answering. What this\nfield buys is that the *intent* outlives the browser tab\nthat expressed it: a 16 GB download takes long enough that\nthe person will close the laptop lid, and a console opening\nlater can see that a download was started in order to run\nsomething and carry on from there.\n\nExactly one console should carry on, which is what\n`POST /v1/downloads/{id}/claim` is for.\n",
+    )
     filename: str | None = Field(
         None,
         description='Override the written name of the **single-file** case. Rarely\nwanted: the upstream name is what the operator recognises,\nwhat the library will call it, and what\n`Runtime.modelAlias` defaults to — plainly-named files are\nthe point. Rejected when `files` holds more than one entry,\nbecause renaming one shard of a set breaks the set.\n',
+    )
+
+
+class DownloadClaim(BaseModel):
+    """
+    The answer to "am I the one who continues this?". `claimed` is
+    true for exactly one caller per download.
+
+    """
+
+    claimed: bool
+    modelId: str | None = Field(
+        None,
+        description='The local model the download produced, when the scan that\nfollows a completed transfer has named it. Absent while the\nscan is still running, which is a reason to wait rather than\na reason to give up — the claim is already yours.\n',
     )
 
 
@@ -1203,9 +1401,11 @@ class DownloadState(StrEnum):
 class Basis(StrEnum):
     """
     `metadata` when the model's own declared shape produced the
-    KV term — a local model, or a remote one after a preflight.
-    `estimate` when only the file size was available, which is
-    every catalogue candidate until someone preflights it.
+    KV term, whether read locally or by remote preflight.
+    `estimate` when only file size was available or when a
+    scalar fallback replaces declared per-layer attention terms
+    that were not retained. Local models and preflighted files
+    can therefore still report `estimate`; `notes` explains why.
 
     The honest distinction between "this is arithmetic" and
     "this is a guess with a number on it", and the field a UI
@@ -1228,10 +1428,25 @@ class FitVerdict(StrEnum):
       offload, materially slower, and a decision rather than a
       failure.
     * `no` — larger than VRAM and RAM together.
+    * `unknown` — there is a GPU here and we could not read how much
+      memory it has, so no comparison against it can be made. Added
+      2026-09-18 (roadmap R2.3, review §6.2 #28) because the
+      alternative was worse than silence: `_intel_gpus` reports
+      `vramTotalBytes: 0` for a card whose size `xpu-smi` will not
+      state, the verdict then took the *no accelerator* branch,
+      compared the weights against host memory, and told a 16 GB Arc
+      owner that a 30 GB model **fits** — with `gpuCount: 1` printed
+      beside it. Wrong in the direction that runs out of memory at
+      load.
 
-    Four values rather than a percentage because a percentage of
+      It is a property of the machine and not of the model, so every
+      candidate on such a host reports it, including small ones: a
+      favourable answer computed against a number we do not have is
+      right by luck.
+
+    Five values rather than a percentage because a percentage of
     *what* — VRAM, or VRAM plus RAM? — is precisely the ambiguity
-    the operator is trying to resolve, and because the four have
+    the operator is trying to resolve, and because they have
     different advice. `tight` and `split` are the two the field
     usually collapses into "won't fit", and they are the two worth
     naming.
@@ -1242,6 +1457,7 @@ class FitVerdict(StrEnum):
     tight = 'tight'
     split = 'split'
     no = 'no'
+    unknown = 'unknown'
 
 
 class Source(StrEnum):
@@ -1657,7 +1873,7 @@ class Fit(BaseModel):
     )
     weightsBytes: int | None = Field(
         None,
-        description='Summed over every file in the candidate, shards included.',
+        description="Summed over the candidate's files, shards included. For an\non-disk GGUF, excludes a separate vision projector whose size\nis known: guidance covers loading the main model. Unknown\nprojector sizes retain the conservative disk total.\n",
         ge=0,
     )
     kvCacheBytes: int | None = Field(
@@ -1683,7 +1899,7 @@ class Fit(BaseModel):
     )
     basis: Basis = Field(
         ...,
-        description='`metadata` when the model\'s own declared shape produced the\nKV term — a local model, or a remote one after a preflight.\n`estimate` when only the file size was available, which is\nevery catalogue candidate until someone preflights it.\n\nThe honest distinction between "this is arithmetic" and\n"this is a guess with a number on it", and the field a UI\nshould hang a "check this file" affordance off.\n',
+        description='`metadata` when the model\'s own declared shape produced the\nKV term, whether read locally or by remote preflight.\n`estimate` when only file size was available or when a\nscalar fallback replaces declared per-layer attention terms\nthat were not retained. Local models and preflighted files\ncan therefore still report `estimate`; `notes` explains why.\n\nThe honest distinction between "this is arithmetic" and\n"this is a guess with a number on it", and the field a UI\nshould hang a "check this file" affordance off.\n',
     )
     budget: MemoryBudget | None = None
     notes: list[str] | None = Field(
@@ -1761,6 +1977,14 @@ class QuantTable(BaseModel):
     tiers: list[QuantTier]
     updatedAt: AwareDatetime | None = Field(
         None, description='When this table was last revised, since the families move.'
+    )
+
+
+class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
+    root: list[TextContentPart | ImageContentPart] = Field(
+        ...,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        min_length=1,
     )
 
 
@@ -1943,6 +2167,14 @@ class Scan(BaseModel):
 
 class CatalogueSearchPage(BaseModel):
     results: list[CatalogueSearchResult]
+    interpretedAs: InterpretedAs | None = Field(
+        None,
+        description='How `q` was read. `repo` means it parsed as a repo\nreference -- a hub URL, or a bare `owner/name` that\nresolved -- and `results` holds that one repo; a client\nshould select it rather than make the person click the only\nrow. `search` is an ordinary query, including a bare\n`owner/name` that upstream had no repo for.\n',
+    )
+    interpretedFrom: str | None = Field(
+        None,
+        description='The repo id a `repo` interpretation resolved to, which is\nnot always what was typed: a URL carries a `/tree/` or\n`/blob/` tail and a person pastes the whole thing.\n',
+    )
     nextCursor: str | None = Field(
         None,
         description="Pass back as `cursor` for the next page. Absent on the last\npage. Opaque — it is upstream's own continuation token and\ncarries no page arithmetic.\n",
@@ -1997,6 +2229,56 @@ class CatalogueCandidate(BaseModel):
         None,
         description="Convenience copy of the repo's gate, on the row the operator\nis about to click.\n",
     )
+
+
+class StarterModel(BaseModel):
+    """
+    One entry: a base model, the repo a quant of it comes from, the
+    one file to fetch, and everything a fit needs -- measured once by
+    the review, carried here so no upstream call is required.
+
+    """
+
+    sizeClass: str = Field(
+        ...,
+        description='The bucket this entry fills, by total parameter count:\n`4B`, `8B`, `14B`, `30B`, `70B`. Total, not active -- a\nmixture-of-experts model holds every expert in memory, so\n30B-A3B is a 30B for the only purpose this number serves.\n',
+    )
+    baseModel: str = Field(
+        ...,
+        description='The model itself, e.g. `Qwen/Qwen3.5-9B`. What the ranking\nis about: a dozen publishers mirror one model and they are\none candidate, not a dozen.\n',
+    )
+    repo: str = Field(
+        ...,
+        description='The repo the file comes from -- one mirror of many, chosen\nfrom a short list of publishers a human maintains. Never the\nhighest-download repo automatically; that is how a\nkeyword-stuffed finetune becomes a default.\n',
+    )
+    file: str = Field(
+        ..., description='The repo-relative path of the recommended quant.'
+    )
+    label: str = Field(..., description='The quant, e.g. `Q4_K_M`.')
+    sizeBytes: int
+    parameters: int | None = None
+    architecture: str | None = Field(
+        None,
+        description="The GGUF architecture id, e.g. `qwen35`. Recorded because\nthe review checks it against the pinned engine's own\narchitecture list -- a model no engine here can load must\nnever be recommended.\n",
+    )
+    contextLength: int | None = Field(
+        None, description='What the model was trained for, not what fits.'
+    )
+    license: str | None = None
+    why: str = Field(
+        ...,
+        description="One sentence, in the review's words: why this entry is in\nthe list. Downloads, and the window they were counted over.\n",
+    )
+    downloads30d: int | None = Field(
+        None,
+        description='The 30-day download count the ranking used, as of\n`reviewed`. A number with a date on it rather than a live\none, because this endpoint makes no upstream call.\n',
+    )
+    fit: Fit | None = None
+    maxContextLength: int | None = Field(
+        None,
+        description='The largest context this entry fits entirely in GPU memory\nat, on the scored machine. The number a profile takes, and\nthe reason a client can say *fits at 75,520* rather than\njust *fits*.\n',
+    )
+    alreadyOwned: AlreadyOwned | None = None
 
 
 class CataloguePreflight(BaseModel):
@@ -2082,6 +2364,10 @@ class Download(BaseModel):
         None, description='Recent rate, not an average over the whole job.', ge=0.0
     )
     etaSeconds: int | None = Field(None, ge=0)
+    runWhenReady: bool | None = Field(
+        None,
+        description='The operator asked for this model to be run when it lands.\nRecorded, never acted on here — see `DownloadSpec`. Cleared\nby `POST /v1/downloads/{id}/claim`, so a finished download\nwhose flag is still set is one nobody has picked up yet.\n',
+    )
     attempts: int | None = Field(
         None,
         description='How many times the transfer has been (re)started, including\nautomatic retries. Visible because a 40 GB fetch over a\ndomestic link will meet transient failures, and the\ndifference between a flaky connection and a dead one is\nthis number moving.\n',
@@ -2104,6 +2390,32 @@ class Download(BaseModel):
     )
     message: str | None = Field(
         None, description='What the current phase is doing, for the progress dialog.'
+    )
+
+
+class Message(BaseModel):
+    """
+    A single message in a conversation. Deliberately close to the
+    OpenAI / Anthropic chat message format so drivers don't have to
+    re-shape on every hop.
+
+    """
+
+    role: Role
+    content: str | MessageContent1 | None = Field(
+        None,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+    )
+    toolCalls: list[dict[str, Any]] | None = Field(
+        None,
+        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    )
+    toolCallId: str | None = Field(
+        None,
+        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
     )
 
 
@@ -2181,6 +2493,38 @@ class CatalogueModel(BaseModel):
     warnings: list[str] | None = Field(
         None,
         description='Things to say before a download starts: the repo is gated,\nnothing here fits, the only thing that fits is a very low\nquant, upstream metadata was unreadable so the fit is a\nsize estimate.\n',
+    )
+
+
+class StarterSet(BaseModel):
+    """
+    The starter set as this install has it, scored against one
+    machine. Every field that could go stale carries the evidence
+    for how stale it is.
+
+    """
+
+    reviewed: date = Field(
+        ...,
+        description='When a human last accepted a review of this list. Shown to\nthe person, not just logged: "Reviewed 15 Sep 2026" is the\none thing that lets them judge a recommendation about a\nfield that moves monthly.\n',
+    )
+    reviewedDaysAgo: int | None = Field(
+        None,
+        description='Computed here so a client does not have to do date\narithmetic to decide whether to say "this is old".\n',
+    )
+    engine: str | None = Field(
+        None,
+        description='The engine build every entry was verified to load, e.g.\n`llama_cpp b10948`. A starter model the installed engine\ncannot load is the one recommendation worse than none, so\nthe build that proved it is recorded rather than assumed.\n',
+    )
+    source: StarterSetSource
+    models: list[StarterModel] = Field(
+        ...,
+        description='One entry per size class. Empty is valid and means there is\nno recommendation to make; a client offers search instead.\n',
+    )
+    recommended: StarterRecommendation | None = None
+    notes: list[str] | None = Field(
+        None,
+        description='What the caller should know about this answer: an empty\nlist and why, a list older than the release gate allows, a\nbudget that came from an override.\n',
     )
 
 

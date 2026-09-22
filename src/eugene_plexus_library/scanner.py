@@ -158,10 +158,12 @@ class Scanner:
         cache_lookup: CacheLookup | None = None,
         should_cancel: Callable[[], bool] | None = None,
         counters: ScanCounters | None = None,
+        follow_symlinks: bool = False,
     ) -> None:
         self._cache_lookup = cache_lookup or (lambda _key: None)
         self._should_cancel = should_cancel or (lambda: False)
         self.counters = counters or ScanCounters()
+        self._follow_symlinks = follow_symlinks
 
     # -- entry point ----------------------------------------------------
 
@@ -221,17 +223,33 @@ class Scanner:
         and descending into it to reject each one individually would
         dominate the scan.
         """
-        stack = [root]
+        stack: list[tuple[Path, frozenset[tuple[int, int]]]] = [(root, frozenset())]
         while stack:
             if self._should_cancel():
                 return
-            current = stack.pop()
+            current, ancestors = stack.pop()
+            try:
+                stat = current.stat()
+            except OSError as exc:
+                log.warning("cannot stat directory %s: %s", current, exc)
+                continue
+            identity = (stat.st_dev, stat.st_ino)
+            if identity in ancestors:
+                result.skipped.append(
+                    SkippedPath(
+                        path=str(current),
+                        reason=SkipReason.not_a_model,
+                        detail="directory link cycle: target is an ancestor",
+                    )
+                )
+                continue
+            ancestors = ancestors | {identity}
             yield current
 
             try:
                 with os.scandir(current) as it:
                     children = sorted(
-                        (e for e in it if e.is_dir(follow_symlinks=False)),
+                        (e for e in it if self._descend_into(e)),
                         key=lambda e: e.name,
                     )
             except OSError as exc:
@@ -259,21 +277,40 @@ class Scanner:
                         SkippedPath(path=entry.path, reason=SkipReason.not_a_model, detail=detail)
                     )
                     continue
-                stack.append(Path(entry.path))
+                stack.append((Path(entry.path), ancestors))
+
+    def _descend_into(self, entry: os.DirEntry[str]) -> bool:
+        try:
+            if not self._follow_symlinks and (entry.is_symlink() or Path(entry.path).is_junction()):
+                return False
+            return entry.is_dir()
+        except OSError as exc:
+            log.warning("cannot inspect directory entry %s: %s", entry.path, exc)
+            return False
 
     def _scan_directory(
         self, directory: Path, root: Path, result: ScanResult, seen: set[str]
     ) -> None:
+        entries: list[os.DirEntry[str]] = []
         try:
             with os.scandir(directory) as it:
-                entries = sorted(
-                    (e for e in it if e.is_file(follow_symlinks=False)),
-                    key=lambda e: e.name,
-                )
+                for entry in it:
+                    try:
+                        if entry.is_file():
+                            entries.append(entry)
+                    except OSError as exc:
+                        result.skipped.append(
+                            SkippedPath(
+                                path=entry.path,
+                                reason=SkipReason.unreadable_header,
+                                detail=f"cannot inspect file: {exc}",
+                            )
+                        )
         except OSError as exc:
             log.warning("cannot list %s: %s", directory, exc)
             return
 
+        entries.sort(key=lambda entry: entry.name)
         names = {e.name for e in entries}
 
         # A safetensors model *is* the directory, so that is decided

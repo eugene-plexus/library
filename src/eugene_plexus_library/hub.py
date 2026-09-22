@@ -63,6 +63,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections.abc import Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from typing import Any
@@ -70,6 +71,7 @@ from typing import Any
 import httpx
 
 from ._generated.models import CatalogueSort, GateKind
+from ._http import egress_client
 
 log = logging.getLogger(__name__)
 
@@ -298,7 +300,7 @@ class _TtlCache:
         if entry is None:
             return None
         stamped, value = entry
-        if time.monotonic() - stamped > self._ttl:
+        if time.perf_counter() - stamped > self._ttl:
             self._entries.pop(key, None)
             return None
         return value, stamped
@@ -306,7 +308,7 @@ class _TtlCache:
     def put(self, key: str, value: Any) -> None:
         if len(self._entries) >= CACHE_MAX_ENTRIES:
             self._entries.clear()
-        self._entries[key] = (time.monotonic(), value)
+        self._entries[key] = (time.perf_counter(), value)
 
     def clear(self) -> None:
         self._entries.clear()
@@ -335,7 +337,13 @@ class HubClient:
         client: httpx.AsyncClient | None = None,
         cache: _TtlCache | None = None,
     ) -> None:
-        self._client = client or httpx.AsyncClient(
+        # `egress_client`, deliberately: the hub is one of exactly two
+        # places this product talks to the public internet, so it KEEPS
+        # `trust_env` -- a user behind a corporate proxy reaches
+        # huggingface.co through it or not at all. What it gains is the
+        # process-wide SSL context, so constructing it does not parse
+        # certifi's PEM bundle again (~104 ms of synchronous CPU).
+        self._client = client or egress_client(
             follow_redirects=False,  # Trap 2. Never turn this on.
             timeout=REQUEST_TIMEOUT,
             headers={"User-Agent": USER_AGENT},
@@ -518,6 +526,78 @@ class HubClient:
         next_cursor = _next_cursor(response.headers.get("Link"))
         self._cache.put(key, (results, next_cursor))
         return results, next_cursor, None
+
+    async def list_models(
+        self,
+        *,
+        filters: Sequence[str] = ("gguf",),
+        sort: str = "downloads",
+        descending: bool = True,
+        limit: int = 100,
+        pages: int = 1,
+    ) -> list[dict[str, Any]]:
+        """A ranked listing with the metadata a review needs, expanded.
+
+        **`full=true` and `expand[]` are mutually destructive**, which
+        `search()` above cannot use and this needs. Measured against the
+        live hub: `full=true` returns neither `gguf` nor `cardData`, and
+        passing both leaves a projection of three keys -- `_id`, `id`
+        and `trendingScore` -- with the sort and filter silently
+        ignored. So the ranking call is its own method rather than a
+        flag on the search one; sharing them would mean one of the two
+        callers gets a body it cannot read and no error saying so.
+
+        `downloads` here is upstream's **30-day** figure;
+        `downloadsAllTime` is a separate field. That is the window the
+        review ranks on, and the window it reports.
+
+        Not cached. A monthly review wants today's numbers, and the TTL
+        cache exists for a UI firing on keystrokes.
+        """
+        self._require_enabled()
+        expand = [
+            "gguf",
+            "cardData",
+            "downloads",
+            "downloadsAllTime",
+            "gated",
+            "tags",
+            "likes",
+            "lastModified",
+            "pipeline_tag",
+        ]
+        params: list[tuple[str, str]] = [
+            ("limit", str(limit)),
+            ("sort", sort),
+            ("direction", "-1" if descending else "1"),
+        ]
+        params += [("filter", f) for f in filters]
+        params += [("expand[]", key) for key in expand]
+
+        collected: list[dict[str, Any]] = []
+        url: str | None = f"{self._base_url}/api/models"
+        query: list[tuple[str, str | int | float | bool | None]] = list(params)
+        for _ in range(max(pages, 1)):
+            if url is None:
+                break
+            try:
+                response = await self._client.get(url, params=query, headers=self._headers())
+            except httpx.HTTPError as exc:
+                raise HubError(
+                    f"Could not reach {self._base_url} to list models ({exc}).", status=503
+                ) from exc
+            if response.status_code >= 400:
+                self._raise_for(response, what="the model listing")
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise HubError("Upstream did not return a list of models.")
+            collected += [row for row in payload if isinstance(row, dict)]
+
+            cursor = _next_cursor(response.headers.get("Link"))
+            if not cursor:
+                break
+            query = [*params, ("cursor", cursor)]
+        return collected
 
     async def repo_info(self, repo: str, *, revision: str = "main") -> RepoInfo:
         url = f"{self._base_url}/api/models/{repo}"

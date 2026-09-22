@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 from ._generated.models import (
     Basis,
@@ -67,6 +68,32 @@ DEFAULT_CONTEXT_LENGTH = 8192
 trained context: current models declare 262144 and almost nobody can
 hold that, so defaulting to it would report `no` for everything."""
 
+ESTIMATED_KV_FRACTION = 0.15
+"""The fallback KV term, as a fraction of the weights **per
+`ESTIMATED_KV_BASELINE_CONTEXT` tokens** — not a flat fraction of the
+weights.
+
+Flat was a defect, and a quiet one. A KV cache is linear in context by
+construction: one entry per token, per attention layer. A constant made
+every estimated verdict identical at 4k and at 262144, so the discovery
+screen's context control changed its own label, changed the column
+header, changed the number echoed back on the badge — and could not
+change a single verdict. Someone stepping it down from 128k looking for
+something their card could hold was told nothing had moved, which is the
+one failure mode this module is written to avoid: guidance that is
+confidently wrong in the optimistic direction.
+
+It is still an estimate and still says so. It is now an estimate of the
+right *shape*: wrong by a factor, not by a factor that grows with the
+number the operator is turning."""
+
+ESTIMATED_KV_BASELINE_CONTEXT = 8192
+"""What `ESTIMATED_KV_FRACTION` is a fraction *at*.
+
+8192 because that is `DEFAULT_CONTEXT_LENGTH`, so an install that never
+touches the control sees exactly the figure this fallback produced
+before it learned to scale."""
+
 KV_ELEMENT_BYTES: dict[KvCacheType, float] = {
     KvCacheType.f16: 2.0,
     KvCacheType.q8_0: 1.0625,
@@ -78,11 +105,52 @@ f16 scale is 18 bytes for 32 elements, not 16."""
 
 
 @dataclass(frozen=True)
+class LayerKV:
+    """One layer's KV cost, because layers stopped being alike.
+
+    `window` is the sliding-attention window in tokens, or `None` for a
+    full-attention layer. A sliding layer never caches more than its
+    window however long the prompt is, which is the whole point of the
+    design and the term the scalar arithmetic below cannot express.
+    """
+
+    head_count_kv: int
+    key_length: int
+    value_length: int
+    window: int | None = None
+
+    def elements(self, context_length: int) -> int:
+        effective = min(context_length, self.window) if self.window else context_length
+        return effective * self.head_count_kv * (self.key_length + self.value_length)
+
+
+@dataclass(frozen=True)
 class ModelShape:
     """What the KV-cache term needs from a model's metadata.
 
     A typed carrier rather than a dict so a renamed field fails at the
     call site instead of silently producing a zero-sized cache.
+
+    ## Why there is a per-layer form as well as the scalars
+
+    The scalars assume every layer caches the same thing, which stopped
+    being true twice. First hybrids: some layers hold no KV at all, and
+    `attention_layers` exists for that. Then per-layer attention:
+    `attention.head_count_kv` is **an array** on a current mainstream
+    12B -- eight heads on five layers of every six and one on the sixth
+    -- and five of every six layers are sliding-window with their own
+    shorter key and value lengths and a 1024-token window.
+
+    Measured on that file at 16k context: the scalar arithmetic, falling
+    back to `head_count` because the array is not an integer, says
+    **24.0 GiB**. The per-layer truth is **0.56 GiB**. A factor of 43,
+    and 83 at the model's own trained context -- which is the difference
+    between "the starter card recommends this" and "the starter card
+    says a 7 GB model will not fit a 32 GB card".
+
+    So `layers` wins when the reader could build it, and the scalars
+    remain for every file that declares the simple form -- which is most
+    of them, and all of the older ones.
     """
 
     block_count: int | None = None
@@ -98,9 +166,29 @@ class ModelShape:
     context_length: int | None = None
     parameters: int | None = None
 
+    layers: tuple[LayerKV, ...] | None = None
+    """Per-layer KV, when the file declared enough to build it. Wins over
+    every scalar below -- see the class docstring for the 43x."""
+
+    per_layer_unavailable: bool = False
+    """The file HAS per-layer terms and this reader could not get them.
+
+    Different from "the file declares the simple form", which is most
+    files and is answered correctly by the scalars. This says the array
+    was there and was stepped over -- a scan keeps only arrays up to a
+    length limit -- so the scalars below are the 43x over-estimate, in
+    the direction that refuses a model which fits.
+
+    It exists because `basis: metadata` is the word that tells a person
+    the number is arithmetic rather than a guess, and saying it here
+    would be a lie. `compute` degrades the basis and says why.
+    """
+
     @property
     def complete(self) -> bool:
         """Is there enough here to compute a real KV cache size?"""
+        if self.layers:
+            return True
         return (
             self.effective_attention_layers is not None and self._per_token_elements() is not None
         )
@@ -137,12 +225,77 @@ class ModelShape:
         return heads_kv * (key_len + value_len)
 
     def kv_bytes(self, context_length: int, kv_cache_type: KvCacheType) -> int | None:
+        element = KV_ELEMENT_BYTES[kv_cache_type]
+        if self.layers:
+            return int(sum(layer.elements(context_length) for layer in self.layers) * element)
         layers = self.effective_attention_layers
         per_token = self._per_token_elements()
         if not layers or not per_token:
             return None
-        element = KV_ELEMENT_BYTES[kv_cache_type]
         return int(context_length * layers * per_token * element)
+
+    def kv_terms(self, kv_cache_type: KvCacheType) -> tuple[float, int] | None:
+        """`(bytes per token, fixed bytes)` -- the cache as a line in ctx.
+
+        Sliding layers stop growing at their window, so the cache is
+        affine in context rather than linear through the origin, and
+        `max_context_that_fits` cannot divide by a single per-token
+        figure any more. Above every window the slope is the
+        full-attention layers alone and the sliding ones are the
+        constant; at a context shorter than a window that over-charges
+        the fixed term, which errs pessimistic and is the direction this
+        module errs on purpose.
+        """
+        element = KV_ELEMENT_BYTES[kv_cache_type]
+        if self.layers:
+            slope = sum(
+                layer.head_count_kv * (layer.key_length + layer.value_length)
+                for layer in self.layers
+                if layer.window is None
+            )
+            fixed = sum(layer.elements(layer.window or 0) for layer in self.layers if layer.window)
+            return slope * element, int(fixed * element)
+        per_token = self.kv_bytes(1, kv_cache_type)
+        return (float(per_token), 0) if per_token else None
+
+
+def encode_layers(layers: tuple[LayerKV, ...] | None) -> list[list[int | None]] | None:
+    """Run-length: `[[count, heads, key, value, window|null], ...]`.
+
+    For a file to be read by a person before they accept it. A 48-layer
+    model with a five-in-six sliding pattern is sixteen runs rather than
+    forty-eight rows, and the runs make the pattern visible, which is
+    the point of a data file a human signs off on.
+    """
+    if not layers:
+        return None
+    runs: list[list[int | None]] = []
+    for layer in layers:
+        row = [1, layer.head_count_kv, layer.key_length, layer.value_length, layer.window]
+        if runs and runs[-1][1:] == row[1:]:
+            runs[-1][0] = (runs[-1][0] or 0) + 1
+        else:
+            runs.append(row)
+    return runs
+
+
+def decode_layers(runs: Any) -> tuple[LayerKV, ...] | None:
+    """The inverse. Any malformed run means "use the scalars"."""
+    if not isinstance(runs, list) or not runs:
+        return None
+    layers: list[LayerKV] = []
+    for run in runs:
+        if not isinstance(run, list | tuple) or len(run) != 5:
+            return None
+        count, heads, key, value, window = run
+        if not all(isinstance(v, int) for v in (count, heads, key, value)):
+            return None
+        if window is not None and not isinstance(window, int):
+            return None
+        if count <= 0 or count > 1024:
+            return None
+        layers += [LayerKV(heads, key, value, window)] * count
+    return tuple(layers)
 
 
 def budget_from_hardware(
@@ -194,10 +347,32 @@ def budget_from_hardware(
     )
 
 
+def card_of_unknown_size(budget: MemoryBudget) -> bool:
+    """Is there a GPU here whose memory we could not read?
+
+    **The distinction `_verdict` did not make** (review §6.2 #28). It
+    branched on `vram_total == 0`, which is true of a machine with no
+    GPU *and* of a machine with a GPU whose size no vendor tool would
+    state — and sent the second down the CPU branch, where 30 GB of
+    weights "fits" in 32 GB of host memory. The owner of a 16 GB Arc
+    meets that as an out-of-memory error at load.
+
+    `gpuCount` is the field that actually answers *is there a card*, and
+    it was sitting in the same object, printed beside the wrong verdict.
+    """
+    return (budget.gpuCount or 0) > 0 and (budget.vramTotalBytes or 0) == 0
+
+
 def _verdict(required: int, budget: MemoryBudget) -> FitVerdict:
     vram_free = budget.vramFreeBytes or 0
     vram_total = budget.vramTotalBytes or 0
     ram_available = budget.ramAvailableBytes or 0
+
+    if card_of_unknown_size(budget) and not budget.unifiedMemory:
+        # No comparison can be made, including a favourable one: a
+        # `fits` computed against a number we do not have is right by
+        # luck, and luck is not a verdict.
+        return FitVerdict.unknown
 
     if budget.unifiedMemory:
         # One pool. `tight` is what "would fit if you closed something"
@@ -249,15 +424,32 @@ def compute(
 
     kv_bytes = shape.kv_bytes(context_length, kv_cache_type)
     if kv_bytes is None:
-        # No usable shape. A flat fraction of the weights is a poor
-        # estimate and an honest one; `basis: estimate` is what says not
-        # to trust the breakdown.
-        kv_bytes = int(weights_bytes * 0.15)
+        # No usable shape. A fraction of the weights is a poor estimate
+        # and an honest one; `basis: estimate` is what says not to trust
+        # the breakdown. It scales with context because a KV cache does:
+        # a constant here is what made the context control inert.
+        kv_bytes = int(
+            weights_bytes * ESTIMATED_KV_FRACTION * (context_length / ESTIMATED_KV_BASELINE_CONTEXT)
+        )
         basis = Basis.estimate
         notes.append(
-            "KV cache is a rough 15% of the weights: this model's layer and attention "
-            "metadata was not available. Preflight the file (or scan it, once it is on "
-            "disk) for a real figure."
+            f"KV cache is a rough {ESTIMATED_KV_FRACTION:.0%} of the weights per "
+            f"{ESTIMATED_KV_BASELINE_CONTEXT:,} tokens of context, so "
+            f"{format_bytes(kv_bytes)} at {context_length:,}: this model's layer and "
+            "attention metadata was not available. Preflight the file (or scan it, once "
+            "it is on disk) for a real figure."
+        )
+    elif shape.per_layer_unavailable:
+        # The scalars answered, and this file said they are not the
+        # whole story. Reporting that as `metadata` is the failure mode
+        # this field exists for: the number is a scalar guess on a model
+        # whose layers are not alike, and it over-estimates by up to 43x
+        # -- which reads as "will not fit" about a model that fits.
+        basis = Basis.estimate
+        notes.append(
+            "this model declares per-layer attention and those terms were not stored "
+            "with it, so the cache above is the same-every-layer arithmetic and "
+            "over-estimates, possibly by a lot. Re-scan this directory for a real figure."
         )
     else:
         basis = Basis.metadata
@@ -268,6 +460,13 @@ def compute(
                 "under-estimates."
             )
 
+    if card_of_unknown_size(budget) and not budget.unifiedMemory:
+        notes.append(
+            f"this machine has {budget.gpuCount} graphics card(s) and no vendor tool here "
+            "would say how much memory they have, so there is nothing to compare against "
+            "-- the verdict is unknown rather than a guess. Install the card's own tool "
+            "(nvidia-smi, rocm-smi or xpu-smi), or score against a budget you supply."
+        )
     notes.append(f"assumes full GPU offload and a {kv_cache_type.value} KV cache")
     notes.append(f"includes a flat {overhead_bytes / GIB:.1f} GiB allowance for compute buffers")
     if (budget.gpuCount or 0) > 1:
@@ -316,13 +515,14 @@ def max_context_that_fits(
     to a multiple of 256, because a context of 31,847 is not a number
     anyone should be handed.
     """
-    per_token = shape.kv_bytes(1, kv_cache_type)
-    if not per_token:
+    terms = shape.kv_terms(kv_cache_type)
+    if terms is None or terms[0] <= 0:
         return None
+    per_token, fixed = terms
 
     vram_free = budget.vramFreeBytes or 0
     available = (vram_free if vram_free else (budget.ramAvailableBytes or 0)) - overhead_bytes
-    available -= weights_bytes
+    available -= weights_bytes + fixed
     if available <= 0:
         return None
 

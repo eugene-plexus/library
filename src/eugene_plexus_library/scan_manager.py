@@ -57,10 +57,12 @@ class ScanManager:
         store: StateStore,
         *,
         roots: Callable[[], list[Path]],
+        follow_symlinks: Callable[[], bool] | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._store = store
         self._resolve_roots = roots
+        self._resolve_follow_symlinks = follow_symlinks or (lambda: False)
         self._timeout = timeout_seconds
 
         self._lock = asyncio.Lock()
@@ -184,6 +186,7 @@ class ScanManager:
                 cache_lookup=(None if full else self._store.lookup),
                 should_cancel=self._cancel.is_set,
                 counters=self._counters,
+                follow_symlinks=self._resolve_follow_symlinks(),
             )
             result = await asyncio.wait_for(
                 asyncio.to_thread(scanner.scan, roots), timeout=self._timeout
@@ -191,9 +194,8 @@ class ScanManager:
         except TimeoutError:
             self._state = ScanState.failed
             self._error = (
-                f"scan exceeded {self._timeout:.0f}s and was abandoned. A symlink loop or an "
-                "unresponsive network mount is the usual cause; 'Follow symlinked directories' "
-                "is off by default for the first of those."
+                f"scan exceeded {self._timeout:.0f}s and was abandoned. Check for an "
+                "unresponsive network mount or scan fewer model directories at a time."
             )
             self._finished_at = datetime.now(tz=UTC)
             log.error("%s", self._error)

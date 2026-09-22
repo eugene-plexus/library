@@ -1,10 +1,18 @@
-"""Entrypoint: `python -m eugene_plexus_library`."""
+"""Entrypoint: `python -m eugene_plexus_library`.
+
+Serving is the default and the only thing the supervisor ever asks for.
+`starter-review` is a maintenance command a person or a monthly workflow
+runs; it lives behind a subcommand rather than a separate console script
+so there is one binary to find, and it is dispatched before any config
+or port resolution because it needs neither.
+"""
 
 from __future__ import annotations
 
 import contextlib
 import logging
 import os
+import sys
 
 import uvicorn
 
@@ -26,6 +34,11 @@ def _resolve_port() -> int:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "starter-review":
+        from .starter_review import main as review_main
+
+        raise SystemExit(review_main(sys.argv[2:]))
+
     settings = load_settings()
 
     # Bootstrap the config store only to discover the log level. The
@@ -52,6 +65,14 @@ def main() -> None:
         host=settings.bind_host,
         port=_resolve_port(),
         log_level=log_level.lower(),
+        # **Trust no forwarding header from anyone.** uvicorn's default
+        # is `"127.0.0.1"`, and every request this component receives
+        # arrives over loopback -- from the gateway, from an agent, or
+        # from the browser's proxy. So the default let any caller set
+        # `scope["client"]`, in the access log and in whatever reads it
+        # next. Review §6.1 #1, roadmap R1.2; the agent's `peer.py`
+        # carries the argument.
+        forwarded_allow_ips=[],
     )
 
 

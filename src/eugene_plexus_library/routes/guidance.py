@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from fastapi import APIRouter, HTTPException, Query, Request, status
 
 from .. import fit as fit_mod
@@ -9,6 +11,7 @@ from .. import hardware, quants
 from .._generated.models import (
     HostHardware,
     KvCacheType,
+    ModelFileRole,
     ModelFit,
     ModelFormat,
     ModelStatus,
@@ -152,20 +155,35 @@ async def get_model_fit(
     budget = fit_mod.budget_from_hardware(detected, vram_override=vramBytes, ram_override=ramBytes)
     context = contextLength or config.guidance_context_length()
     shape = _shape_for(model)
+    # The disk footprint includes an optional vision projector. Merely
+    # finding it beside a GGUF does not put --mmproj on the launch line.
+    # Catalogue candidates already exclude it; local guidance must agree.
+    projector_bytes = (
+        sum(f.sizeBytes or 0 for f in model.files or [] if f.role is ModelFileRole.projector)
+        if model.format is ModelFormat.gguf
+        else 0
+    )
+    weights_bytes = max(0, (model.sizeBytes or 0) - projector_bytes)
 
     result = fit_mod.compute(
-        weights_bytes=model.sizeBytes or 0,
+        weights_bytes=weights_bytes,
         budget=budget,
         context_length=context,
         shape=shape,
         kv_cache_type=kvCacheType,
     )
+    if projector_bytes:
+        result.notes = [
+            *(result.notes or []),
+            "This estimate excludes the separate vision projector. Loading it for "
+            "images needs additional memory; finding it on disk does not load it.",
+        ]
     return ModelFit(
         modelId=model.id,
         path=model.path,
         fit=result,
         maxContextLength=fit_mod.max_context_that_fits(
-            weights_bytes=model.sizeBytes or 0,
+            weights_bytes=weights_bytes,
             budget=budget,
             shape=shape,
             kv_cache_type=kvCacheType,
@@ -177,41 +195,69 @@ async def get_model_fit(
 def _shape_for(model: object) -> fit_mod.ModelShape:
     """Recover the KV-cache terms from a stored library entry.
 
-    The scan keeps selected raw KV pairs on `gguf.metadata` as an escape
-    hatch for the long tail, and this is one of the things that pays
-    for: the layer and head counts are architecture-prefixed, so they
-    are read back by suffix rather than by a fixed key set.
+    **This delegates, and that is the whole of review §6.1 #4.** It used
+    to read the stored KV dict itself, with a `by_suffix` helper that
+    accepted only `int` and never built the per-layer form -- so when
+    `attention.head_count_kv` came back as an array (which it is on a
+    current mainstream 12B) it fell through to `head_count`, the
+    pre-grouped-query assumption, ignored the sliding-window layers
+    entirely, and answered tens of GiB of KV where the truth is under
+    one. The starter set and the catalogue, which go through
+    `preflight.shape_from_gguf`, answered correctly for the same file.
+    Two numbers, one file, both labelled `basis: metadata`.
 
-    A safetensors entry has none of this — the shape lives in
+    The route had one commit, from M3, and the 43x fix of 2026-09-16
+    landed in `preflight.py` and here in `fit.py` and not in it. **A
+    second shape builder is the defect; there is one now.**
+
+    The scan keeps selected raw KV pairs on `gguf.metadata` as an escape
+    hatch for the long tail, so the material is all here -- what was
+    missing was the reading. `GgufMetadata` is rebuilt from that dict
+    (with `array_lengths` recovered from the synthetic `<key>.length`
+    entries `public_kv` writes, which is how a stepped-over per-layer
+    array stays visible as one) and handed to the one reader.
+
+    A safetensors entry has none of this -- the shape lives in
     `config.json`, which the scan reads for architecture and context and
-    not for head counts — so its fit stays an estimate and says so.
+    not for head counts -- so its fit stays an estimate and says so.
     """
+    from .. import preflight
     from .._generated.models import LibraryModel
+    from ..formats import gguf as gguf_format
 
     assert isinstance(model, LibraryModel)
     if model.format is not ModelFormat.gguf or model.gguf is None:
         return fit_mod.ModelShape(context_length=model.contextLength, parameters=model.parameters)
 
     raw = model.gguf.metadata or {}
+    kv: dict[str, object] = {}
+    array_lengths: dict[str, int] = {}
+    for key, value in raw.items():
+        # `public_kv` folds a stepped-over array in as `<key>.length`.
+        # Splitting it back out is what lets `per_layer_dropped` tell
+        # "this file declares the simple form" from "this file has
+        # per-layer attention and we did not keep it" -- and those get
+        # different answers about whether the number is metadata.
+        if key.endswith(".length") and isinstance(value, int):
+            array_lengths[key[: -len(".length")]] = value
+        else:
+            kv[key] = value
 
-    def by_suffix(suffix: str) -> int | None:
-        for key, value in raw.items():
-            if key.endswith(f".{suffix}") and isinstance(value, int):
-                return value
-        return None
-
-    blocks = by_suffix("block_count")
-    interval = by_suffix("full_attention_interval")
-    attention = max(blocks // interval, 1) if blocks and interval and interval > 1 else blocks
-
-    return fit_mod.ModelShape(
-        block_count=blocks,
-        attention_layers=attention,
-        head_count_kv=by_suffix("attention.head_count_kv"),
-        key_length=by_suffix("attention.key_length"),
-        value_length=by_suffix("attention.value_length"),
-        embedding_length=by_suffix("embedding_length"),
-        head_count=by_suffix("attention.head_count"),
-        context_length=model.contextLength,
+    meta = gguf_format.GgufMetadata(
+        version=model.gguf.ggufVersion or 0,
+        tensor_count=0,
+        kv_count=len(kv),
+        header_bytes=0,
+        kv=kv,
+        array_lengths=array_lengths,
+    )
+    shape = preflight.shape_from_gguf(meta)
+    # `context_length` and `parameters` are the library's own reading of
+    # the entry rather than the file's -- the scan reconciles a
+    # safetensors sidecar and a filename into them -- so they are kept
+    # over what the KV block alone would say.
+    return replace(
+        shape,
+        context_length=model.contextLength or shape.context_length,
         parameters=model.parameters,
     )

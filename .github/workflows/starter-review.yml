@@ -1,0 +1,93 @@
+# The monthly review that keeps the starter model list honest.
+#
+# Decision #4 of the hobbyist UX plan -- ship a recommended first model
+# -- was taken on one condition: an automated process that reviews the
+# state of local inference before a release and says whether to keep or
+# replace the default. This is that process, on a schedule.
+#
+# **It never commits.** The run files an issue holding the report and the
+# proposed file; a person reads it, diffs it, and accepts it by editing
+# `src/eugene_plexus_library/starter_models.yaml` in a normal commit.
+# A tool that edits what it reviews has nothing to compare against next
+# month, which is exactly what the two-review hysteresis needs.
+#
+# **Monthly and not on release day.** On release day there is no second
+# month of evidence to have, so a launch-week spike would be
+# indistinguishable from a trend. The release gate reads the *latest*
+# review; this workflow is what makes there be one.
+name: Starter model review
+
+on:
+  schedule:
+    # 06:00 UTC on the first of each month.
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: 'llama.cpp build tag to check architectures against (default: the one in starter_models.yaml)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  review:
+    name: Review the starter set
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Run the review
+        id: review
+        # Non-zero means at least one class is REPLACE or REVIEW, which
+        # is a thing for a person to read rather than a failed build --
+        # so the step records the verdict and does not fail the job.
+        run: |
+          set +e
+          python -m eugene_plexus_library starter-review \
+            ${{ inputs.engine && format('--engine {0}', inputs.engine) || '' }} \
+            --report review.md \
+            --proposed proposed.yaml
+          echo "unresolved=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble the issue body
+        run: |
+          {
+            cat review.md
+            echo
+            echo '## Proposed `starter_models.yaml`'
+            echo
+            echo 'Nothing has been applied. Diff this against the file in the repo, and if you accept it, commit it.'
+            echo
+            echo '```yaml'
+            cat proposed.yaml
+            echo '```'
+          } > issue.md
+
+      - name: File the report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Starter model review — $(date -u +%Y-%m-%d)" \
+            --label "starter-review" \
+            --body-file issue.md
+
+      - name: Upload the report and the proposal
+        uses: actions/upload-artifact@v4
+        with:
+          name: starter-review-${{ github.run_id }}
+          path: |
+            review.md
+            proposed.yaml

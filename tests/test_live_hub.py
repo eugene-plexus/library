@@ -85,12 +85,12 @@ def test_a_real_repo_groups_into_choices(live_client: TestClient) -> None:
 def test_a_remote_header_reads_for_a_fraction_of_the_file(live_client: TestClient) -> None:
     """The milestone's best result: ~11 MB of a 16.5 GB file gives the
     machine-readable quant and the real layer shape."""
-    started = time.monotonic()
+    started = time.perf_counter()
     body = live_client.get(
         "/v1/catalogue/model/preflight",
         params={"repo": REPO, "file": QUANT, "contextLength": 32768},
     ).json()
-    elapsed = time.monotonic() - started
+    elapsed = time.perf_counter() - started
 
     assert body["fileType"] == 15, "general.file_type, not the filename"
     assert body["quantization"] == "Q4_K_M"

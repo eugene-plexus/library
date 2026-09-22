@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -218,6 +219,58 @@ def test_an_unknown_engine_is_rejected_by_the_schema(
 
 
 # --- scan --------------------------------------------------------------------
+
+
+def test_follow_symlinks_changes_the_next_scan_without_a_restart(
+    configured_client: TestClient,
+    models_dir: Path,
+    tmp_path: Path,
+    directory_link: Callable[[Path, Path], None],
+) -> None:
+    target = write_gguf(tmp_path / "elsewhere" / "linked.gguf", qwen_like_kv())
+    link = models_dir / "linked-directory"
+    directory_link(link, target.parent)
+    declared_path = str(link / target.name)
+    saved_profile = None
+    saved_id = None
+    _wait_for_scan(configured_client)
+
+    for follow, expected_status in (
+        (False, None),
+        (True, "present"),
+        (False, "missing"),
+        (True, "present"),
+    ):
+        response = configured_client.patch("/v1/config", json={"followSymlinks": follow})
+        assert response.status_code == 200
+        assert response.json()["applied"] == ["followSymlinks"]
+        assert response.json()["rejected"] == []
+        assert configured_client.post("/v1/scan").status_code == 202
+        scan = _wait_for_scan(configured_client)
+        assert scan["state"] == "done", scan
+        models = configured_client.get("/v1/models", params={"path": declared_path}).json()[
+            "models"
+        ]
+        if expected_status is None:
+            assert models == []
+        else:
+            assert len(models) == 1
+            assert models[0]["path"] == declared_path
+            assert models[0]["status"] == expected_status
+            if saved_profile is None:
+                saved_id = models[0]["id"]
+                profile = configured_client.post(
+                    f"/v1/models/{saved_id}/profiles",
+                    json={"name": "tuned", "engine": "llama_cpp", "flags": {"contextSize": 4096}},
+                )
+                assert profile.status_code == 201
+                saved_profile = profile.json()
+            else:
+                assert models[0]["id"] == saved_id
+                assert configured_client.get(f"/v1/models/{saved_id}/profiles").json()[
+                    "profiles"
+                ] == [saved_profile]
+        assert target.is_file()
 
 
 def test_scan_reports_what_it_skipped(configured_client: TestClient, models_dir: Path) -> None:

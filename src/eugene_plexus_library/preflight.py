@@ -117,14 +117,130 @@ def attention_layers(meta: gguf.GgufMetadata) -> int | None:
     return blocks
 
 
-def shape_from_gguf(meta: gguf.GgufMetadata) -> fit_mod.ModelShape:
-    """The KV-cache terms, read off the file's own KV block."""
+def per_layer_kv(meta: gguf.GgufMetadata) -> tuple[fit_mod.LayerKV, ...] | None:
+    """One `LayerKV` per layer, when the file says enough to build them.
+
+    **`attention.head_count_kv` is not always an integer.** On a current
+    mainstream 12B it is an array of 48 -- eight heads on five layers of
+    every six, one on the sixth -- and the scalar reader below returns
+    `None` for it and falls back to `head_count`, which is the
+    pre-grouped-query assumption. Together with the sliding-window
+    layers that array goes with, the scalar arithmetic reported
+    **24.0 GiB** of KV at 16k where the truth is **0.56 GiB**.
+
+    `attention.sliding_window_pattern` is a bool array, `True` where the
+    layer slides; `key_length_swa` / `value_length_swa` are that layer's
+    own dimensions, which are shorter. Absent the pattern, a declared
+    `sliding_window` with no per-layer mask is not applied at all --
+    guessing which layers slide would be inventing the number this
+    module exists to stop inventing.
+
+    `None` means "use the scalars", which is most files and every older
+    one.
+    """
 
     def integer(suffix: str) -> int | None:
         value = meta.arch_key(suffix)
         return int(value) if isinstance(value, int) else None
 
     blocks = integer("block_count")
+    if not blocks:
+        return None
+
+    heads_kv = meta.arch_key("attention.head_count_kv")
+    pattern = meta.arch_key("attention.sliding_window_pattern")
+    if not isinstance(heads_kv, list) and not isinstance(pattern, list):
+        # Nothing per-layer to say. The scalars describe this file.
+        return None
+
+    key_length = integer("attention.key_length")
+    value_length = integer("attention.value_length")
+    if key_length is None or value_length is None:
+        embedding = integer("embedding_length")
+        head_count = integer("attention.head_count")
+        if not embedding or not head_count:
+            return None
+        key_length = key_length or embedding // head_count
+        value_length = value_length or embedding // head_count
+
+    key_swa = integer("attention.key_length_swa") or key_length
+    value_swa = integer("attention.value_length_swa") or value_length
+    window = integer("attention.sliding_window")
+
+    def head_at(index: int) -> int | None:
+        if isinstance(heads_kv, list):
+            value = heads_kv[index] if index < len(heads_kv) else None
+            return int(value) if isinstance(value, int) else None
+        if isinstance(heads_kv, int):
+            return heads_kv
+        return integer("attention.head_count")
+
+    layers: list[fit_mod.LayerKV] = []
+    for index in range(blocks):
+        heads = head_at(index)
+        if not heads:
+            return None
+        slides = (
+            bool(pattern[index]) if isinstance(pattern, list) and index < len(pattern) else False
+        )
+        if slides and not window:
+            # It says a layer slides but not how far. Charging it the
+            # full context is the pessimistic read, and pessimistic is
+            # the direction this module errs in.
+            slides = False
+        layers.append(
+            fit_mod.LayerKV(
+                head_count_kv=heads,
+                key_length=key_swa if slides else key_length,
+                value_length=value_swa if slides else value_length,
+                window=window if slides else None,
+            )
+        )
+    return tuple(layers)
+
+
+# The keys whose absence-as-a-length means "this file has per-layer
+# attention and we did not keep it". Read as names rather than inferred,
+# because the point is to notice a term we know we needed.
+_PER_LAYER_KEYS = ("attention.head_count_kv", "attention.sliding_window_pattern")
+
+
+def per_layer_dropped(meta: gguf.GgufMetadata) -> bool:
+    """Did this file declare a per-layer term that was stepped over?
+
+    `array_lengths` records the length of every array the reader walked
+    past instead of keeping, so a key present there and absent from `kv`
+    is one we know existed and cannot use. That is a different situation
+    from a file that declares the simple scalar form, and the difference
+    is exactly what `basis` is supposed to tell a person.
+    """
+    arch = meta.architecture
+    if arch is None:
+        return False
+    return any(
+        f"{arch}.{suffix}" in meta.array_lengths and meta.arch_key(suffix) is None
+        for suffix in _PER_LAYER_KEYS
+    )
+
+
+def shape_from_gguf(meta: gguf.GgufMetadata) -> fit_mod.ModelShape:
+    """The KV-cache terms, read off the file's own KV block.
+
+    **The one place a shape is built from a GGUF.** It was not, for a
+    while: `routes/guidance.py` grew its own reader at M3 and the 43x
+    per-layer fix landed here and not there, so `GET
+    /v1/models/{id}/fit` answered 4,864 where the starter set answered
+    262,144 for the same file -- both saying `basis: metadata` (review
+    §6.1 #4). That route delegates here now, and the rule is that a
+    second shape builder is the bug rather than the fix.
+    """
+
+    def integer(suffix: str) -> int | None:
+        value = meta.arch_key(suffix)
+        return int(value) if isinstance(value, int) else None
+
+    blocks = integer("block_count")
+    layers = per_layer_kv(meta)
     return fit_mod.ModelShape(
         block_count=blocks,
         attention_layers=attention_layers(meta),
@@ -134,6 +250,8 @@ def shape_from_gguf(meta: gguf.GgufMetadata) -> fit_mod.ModelShape:
         embedding_length=integer("embedding_length"),
         head_count=integer("attention.head_count"),
         context_length=meta.context_length,
+        layers=layers,
+        per_layer_unavailable=layers is None and per_layer_dropped(meta),
     )
 
 
