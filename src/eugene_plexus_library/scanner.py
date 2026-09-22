@@ -41,6 +41,7 @@ projectors are re-read every scan without caching and it costs nothing.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Callable, Iterator
@@ -50,6 +51,7 @@ from pathlib import Path
 
 from ._generated.models import (
     GgufDetail,
+    KevCheckpointDetail,
     LibraryModel,
     MlxQuantization,
     ModelCapabilities,
@@ -148,6 +150,27 @@ def _mlx_quantization(config: safetensors.ModelConfig) -> MlxQuantization | None
         return None
     bits, group = marker
     return MlxQuantization(bits=bits, groupSize=group)
+
+
+KEV_HEAD_NAME = "head.pt"
+
+
+def _is_kev_checkpoint(names: set[str]) -> bool:
+    """`adapter_config.json` + `head.pt`: the decision head is the one
+    positive marker separating a Kev checkpoint from an ordinary LoRA."""
+    return safetensors.ADAPTER_CONFIG_NAME in names and KEV_HEAD_NAME in names
+
+
+def _kev_role(name: str) -> ModelFileRole:
+    if name.endswith(".safetensors"):
+        return ModelFileRole.weights
+    if name == KEV_HEAD_NAME:
+        return ModelFileRole.weights
+    if name in ("tokenizer.json", "tokenizer_config.json") or name in TOKENIZER_NAMES:
+        return ModelFileRole.tokenizer
+    if name.endswith(".json"):
+        return ModelFileRole.config
+    return ModelFileRole.other
 
 
 def _timestamp(stat: os.stat_result) -> datetime:
@@ -355,6 +378,21 @@ class Scanner:
         if not weight_names:
             return False
 
+        if _is_kev_checkpoint(names):
+            # An adapter directory WITH a decision head is not a LoRA to
+            # skip — it is a launchable Kev decision checkpoint, and
+            # `head.pt` is what tells the two apart. Decided before the
+            # adapter skip below or every checkpoint would vanish as
+            # "a LoRA, not a model" (measured layout: jaredpalmer/kev-0.8b
+            # is adapter_config.json + adapter_model.safetensors + head.pt
+            # + tokenizer + provenance.json, with NO base config.json).
+            model = self._kev_model(directory, root, entries, names)
+            if model is not None and model.path not in seen:
+                seen.add(model.path)
+                result.models.append(model)
+                self.counters.models_found += 1
+            return True
+
         if safetensors.is_adapter_dir(directory, names):
             result.skipped.append(
                 SkippedPath(
@@ -476,6 +514,70 @@ class Scanner:
                 repoId=safetensors.hf_repo_id(directory),
                 revision=revision,
                 configPath=str(config_path),
+            ),
+            modifiedAt=_timestamp(primary_stat),
+        )
+
+    def _kev_model(
+        self,
+        directory: Path,
+        root: Path,
+        entries: list[os.DirEntry[str]],
+        names: set[str],
+    ) -> LibraryModel | None:
+        """One Kev decision checkpoint, files and provenance included.
+
+        The point of recording it is reproducibility: the checkpoint is
+        only half a runnable model — Kev downloads the base named in
+        `adapter_config.json` separately — so `kev.baseModel` is what an
+        offline restore needs to pre-fetch. Every artifact the loader
+        reads (adapter, decision head, tokenizer, calibration) is in
+        `files` with a role. Decision-only: `capabilities.decision`,
+        never `chat` — offering it a conversation fails clearly at the
+        driver instead of producing prose.
+        """
+        try:
+            raw = json.loads(
+                (directory / safetensors.ADAPTER_CONFIG_NAME).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            raw = {}
+        base_model = raw.get("base_model_name_or_path") if isinstance(raw, dict) else None
+
+        files: list[ModelFile] = []
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            role = _kev_role(entry.name)
+            files.append(
+                ModelFile(path=str(directory / entry.name), role=role, sizeBytes=_stat_size(entry))
+            )
+
+        try:
+            primary_stat = directory.stat()
+        except OSError:
+            return None
+        revision = safetensors.hf_revision(directory)
+        return LibraryModel(
+            id=model_id(directory),
+            path=str(directory),
+            root=str(root),
+            format=ModelFormat.kev_checkpoint,
+            name=safetensors.hf_model_name(directory) or display_name(directory),
+            status=ModelStatus.present,
+            sizeBytes=sum(f.sizeBytes or 0 for f in files),
+            fileCount=len(files),
+            capabilities=ModelCapabilities(
+                chat=False,
+                embedding=False,
+                vision=False,
+                decision=True,
+            ),
+            files=files,
+            kev=KevCheckpointDetail(
+                baseModel=str(base_model) if base_model else None,
+                repoId=safetensors.hf_repo_id(directory),
+                revision=revision,
             ),
             modifiedAt=_timestamp(primary_stat),
         )

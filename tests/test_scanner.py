@@ -571,3 +571,56 @@ def test_a_plain_safetensors_directory_has_no_mlx_marker(models_dir: Path) -> No
     detail = result.models[0].safetensors
     assert detail is not None
     assert detail.mlxQuantization is None
+
+
+def _write_kev_checkpoint(directory: Path) -> Path:
+    """The measured jaredpalmer/kev-0.8b layout: adapter + decision head
+    + tokenizer + provenance, and NO base config.json."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "Qwen/Qwen3.5-0.8B-Base", "r": 16}),
+        encoding="utf-8",
+    )
+    write_safetensors(directory / "adapter_model.safetensors", {"lora_A": ("F32", [64])})
+    (directory / "head.pt").write_bytes(b"\x80\x02fake-head")
+    (directory / "provenance.json").write_text("{}", encoding="utf-8")
+    (directory / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (directory / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    return directory
+
+
+def test_a_kev_checkpoint_is_a_decision_model_not_a_skipped_lora(models_dir: Path) -> None:
+    """`head.pt` beside `adapter_config.json` is the marker: without this
+    rule the checkpoint vanishes as 'a LoRA, not a model', which is
+    exactly what the pre-B2 scanner did to it."""
+    directory = _write_kev_checkpoint(models_dir / "kev-0.8b")
+    result = Scanner().scan([models_dir])
+
+    assert len(result.models) == 1
+    model = result.models[0]
+    assert model.format == ModelFormat.kev_checkpoint
+    assert model.path == str(directory)
+    assert model.capabilities is not None
+    assert model.capabilities.decision is True
+    assert model.capabilities.chat is False
+    assert model.kev is not None
+    # The half the directory does NOT contain — what an offline restore
+    # must pre-fetch before a launch can work.
+    assert model.kev.baseModel == "Qwen/Qwen3.5-0.8B-Base"
+    roles = {Path(f.path).name: f.role.value for f in model.files or []}
+    assert roles["adapter_model.safetensors"] == "weights"
+    assert roles["head.pt"] == "weights"
+    assert roles["tokenizer.json"] == "tokenizer"
+    assert roles["provenance.json"] == "config"
+
+
+def test_a_plain_lora_is_still_skipped(models_dir: Path) -> None:
+    """The adapter skip survives: no decision head, no model."""
+    directory = models_dir / "my-lora"
+    directory.mkdir()
+    (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
+    write_safetensors(directory / "adapter_model.safetensors", {"w": ("F32", [4])})
+    result = Scanner().scan([models_dir])
+
+    assert result.models == []
+    assert str(directory) in _skips(result, SkipReason.adapter)
