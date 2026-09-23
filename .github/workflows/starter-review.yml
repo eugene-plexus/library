@@ -37,9 +37,9 @@ jobs:
     name: Review the starter set
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -85,7 +85,7 @@ jobs:
             --body-file issue.md
 
       - name: Upload the report and the proposal
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: starter-review-${{ github.run_id }}
           path: |
