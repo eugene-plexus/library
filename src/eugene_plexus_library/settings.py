@@ -50,15 +50,18 @@ class Settings(BaseSettings):
     /v1/config to fix it. PATCH still writes through to `config_file`,
     so the repair survives the next boot."""
 
-    auth_verify_key: str | None = None
-    """Base64 public Ed25519 PEM from the agent. Exclusive with auth_signing_key."""
+    trust_bundle_file: str | None = None
+    """The trust bundle the agent keeps beside `node.yaml`, reloaded when it changes."""
 
-    auth_signing_key: str | None = None
-    """Legacy base64 32-byte HS256 key; used only until install rotation."""
+    trust_authority: str | None = None
+    """The public key that bundle must be signed by (base64url Ed25519)."""
+
+    auth_recipient: str | None = None
+    """This machine as a token's audience names it: `node:<name>`."""
 
     service_token: str | None = None
-    """Long-lived service JWT. Not consumed: the library makes no
-    outbound calls to peers, deliberately."""
+    """This library's own token, addressed to this machine alone. Not
+    consumed: the library makes no outbound calls to peers, deliberately."""
 
     master_key: str | None = None
     """Base64 32-byte secretbox key for at-rest config decryption."""

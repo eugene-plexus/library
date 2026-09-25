@@ -9,21 +9,19 @@ other read here takes a service token.
 
 from __future__ import annotations
 
-import secrets
 import sys
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
-import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from eugene_plexus_library.app import create_app
-from eugene_plexus_library.auth_state import AuthState
 from eugene_plexus_library.directory_listing import ListingError, list_directory
 from eugene_plexus_library.settings import Settings
+
+from .conftest import FakeInstall
 
 
 def _tree(tmp_path: Path) -> Path:
@@ -108,35 +106,23 @@ def test_no_path_is_the_starting_points(client: TestClient) -> None:
 
 
 @pytest.fixture
-def signing_key() -> bytes:
-    return secrets.token_bytes(32)
-
-
-@pytest.fixture
-def authed_client(tmp_path: Path, signing_key: bytes) -> Iterator[TestClient]:
+def authed_client(tmp_path: Path, install: FakeInstall) -> Iterator[TestClient]:
     settings = Settings(config_file=tmp_path / "config.yaml", state_file=tmp_path / "state.json")
     app: FastAPI = create_app(settings=settings)
-    app.state.auth_state = AuthState(signing_key=signing_key, service_token=None, master_key=None)
+    app.state.auth_state = install.auth_state()
     with TestClient(app) as authed:
         yield authed
 
 
-def _issue(signing_key: bytes, *, aud: str) -> str:
-    now = int(time.time())
-    return jwt.encode(
-        {"sub": aud, "aud": aud, "iat": now, "exp": now + 60}, signing_key, algorithm="HS256"
-    )
-
-
 def test_a_service_token_reads_models_but_does_not_walk_the_disk(
-    authed_client: TestClient, signing_key: bytes
+    authed_client: TestClient, install: FakeInstall
 ) -> None:
     """Every other read here accepts a service token; this one does not.
     A component doing its job has no business listing the operator's
     directories."""
-    service = {"Authorization": f"Bearer {_issue(signing_key, aud='service:gateway')}"}
+    service = {"Authorization": f"Bearer {install.service('gateway')}"}
     assert authed_client.get("/v1/models", headers=service).status_code == 200
     assert authed_client.get("/v1/directories", headers=service).status_code == 401
     assert authed_client.get("/v1/directories").status_code == 401
-    operator = {"Authorization": f"Bearer {_issue(signing_key, aud='operator')}"}
+    operator = {"Authorization": f"Bearer {install.session()}"}
     assert authed_client.get("/v1/directories", headers=operator).status_code == 200
