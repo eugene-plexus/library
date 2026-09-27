@@ -8,10 +8,12 @@ written for one card:
   console describing two 5090s could only say "one 5090", and a model
   that fits across both read as spilling into system RAM;
 * an override kept THIS host's card count. A console scoring a worker's
-  5090 from a library in a container with no GPU passed 30 GiB and a
-  `gpuCount` of 0, and the starter set, which reads `gpuCount` to decide
-  whether there is a card at all, recommended the smallest model "on a
-  machine with no graphics card".
+  5090 from a library with no GPU (a container without passthrough, the
+  default) passed 30 GiB and a `gpuCount` of 0, and the starter set,
+  which reads `gpuCount` to decide whether there is a card at all, would
+  recommend the smallest model "on a machine with no graphics card". The
+  live install's library has its P4000 passed through, so it kept a count
+  of one: right for one card by coincidence, wrong for a node with two.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ GIB = 1024**3
 
 
 def _nas() -> hardware.HostHardware:
-    """The container library on the live install: no GPU, plenty of RAM."""
+    """A library in a container without GPU passthrough: no GPU, plenty of RAM."""
     return hardware.HostHardware.model_validate(
         {
             "hostname": "nas",
@@ -63,8 +65,8 @@ def test_zero_passed_from_another_host_is_no_card() -> None:
 
 
 def test_the_starter_set_does_not_tell_a_5090_it_has_no_graphics_card() -> None:
-    """**The defect, where a person meets it.** The live install's library
-    is in a container with no GPU and every launch goes to a 5090."""
+    """**The defect, where a person meets it**: a GPU-less library scoring
+    the 5090 every launch goes to."""
     budget = fit_mod.budget_from_hardware(_nas(), vram_override=30 * GIB, ram_override=90 * GIB)
     built = starter.build(
         starter.load(), budget=budget, context_length=16384, kv_cache_type=KvCacheType.f16

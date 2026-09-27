@@ -339,12 +339,15 @@ def budget_from_hardware(
         source = Source.override
         # **The caller's cards, not this host's** (2026-09-27). The count
         # was left at this host's, so a console scoring a worker's 5090
-        # from a library in a container with no GPU passed a budget of
-        # 30 GiB and a `gpuCount` of 0. The starter set reads `gpuCount`
-        # to decide whether a machine has a card at all, and inverted its
-        # recommendation to the smallest model, "on a machine with no
-        # graphics card", about a 5090. A positive override is at least
-        # one card; zero is the caller saying there is none.
+        # from a library with no GPU (a container without passthrough,
+        # the default) passed a budget of 30 GiB and a `gpuCount` of 0.
+        # The starter set reads `gpuCount` to decide whether a machine has
+        # a card at all, and inverted its recommendation to the smallest
+        # model, "on a machine with no graphics card", about a 5090. A
+        # library with its own card kept a count of one, which is right
+        # for one card by coincidence and wrong for a node with two. A
+        # positive override is at least one card; zero is the caller
+        # saying there is none.
         if gpu_count_override is not None:
             gpu_count = gpu_count_override
         else:
