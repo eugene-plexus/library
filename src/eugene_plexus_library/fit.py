@@ -304,6 +304,7 @@ def budget_from_hardware(
     vram_override: int | None = None,
     ram_override: int | None = None,
     unified_override: bool | None = None,
+    gpu_count_override: int | None = None,
 ) -> MemoryBudget:
     """Collapse detected hardware into the numbers a verdict needs.
 
@@ -332,9 +333,27 @@ def budget_from_hardware(
     largest = max(per_gpu_free, default=0)
 
     source = Source.detected
+    gpu_count = len(hardware.gpus or [])
     if vram_override is not None:
         vram_free = vram_total = largest = vram_override
         source = Source.override
+        # **The caller's cards, not this host's** (2026-09-27). The count
+        # was left at this host's, so a console scoring a worker's 5090
+        # from a library in a container with no GPU passed a budget of
+        # 30 GiB and a `gpuCount` of 0. The starter set reads `gpuCount`
+        # to decide whether a machine has a card at all, and inverted its
+        # recommendation to the smallest model, "on a machine with no
+        # graphics card", about a 5090. A positive override is at least
+        # one card; zero is the caller saying there is none.
+        if gpu_count_override is not None:
+            gpu_count = gpu_count_override
+        else:
+            gpu_count = 1 if vram_override > 0 else 0
+        if gpu_count > 1:
+            # One number for several cards says nothing about the largest;
+            # llama.cpp's default split follows free memory, so an even
+            # share is the honest reading of an even budget.
+            largest = vram_override // gpu_count
 
     ram_total = hardware.ramTotalBytes or 0
     ram_available = hardware.ramAvailableBytes or ram_total
@@ -353,10 +372,22 @@ def budget_from_hardware(
         largestGpuFreeBytes=largest,
         ramAvailableBytes=ram_available,
         ramTotalBytes=ram_total,
-        gpuCount=len(hardware.gpus or []),
+        gpuCount=gpu_count,
         unifiedMemory=unified,
         source=source,
     )
+
+
+def overhead_for(budget: MemoryBudget, per_card: int = DEFAULT_OVERHEAD_BYTES) -> int:
+    """The compute-buffer allowance, once per card the model spans.
+
+    llama.cpp splits a model across every visible card by default, and
+    each card holds its own compute buffers and driver context. Measured
+    2026-09-27 on a 27B at 16k context: a 505 MiB compute buffer on one
+    card, 226 + 609 MiB on two devices. One allowance for two cards was
+    an under-count that would OOM the second card at load.
+    """
+    return per_card * max(1, budget.gpuCount or 0)
 
 
 def card_of_unknown_size(budget: MemoryBudget) -> bool:
@@ -480,7 +511,18 @@ def compute(
             "(nvidia-smi, rocm-smi or xpu-smi), or score against a budget you supply."
         )
     notes.append(f"assumes full GPU offload and a {kv_cache_type.value} KV cache")
-    notes.append(f"includes a flat {overhead_bytes / GIB:.1f} GiB allowance for compute buffers")
+    cards = budget.gpuCount or 0
+    overhead_total = overhead_for(budget, overhead_bytes)
+    if cards > 1:
+        notes.append(
+            f"includes a {overhead_bytes / GIB:.1f} GiB allowance for compute buffers on each "
+            f"of the {cards} cards the model is spread across, {overhead_total / GIB:.1f} GiB "
+            "in all"
+        )
+    else:
+        notes.append(
+            f"includes a flat {overhead_bytes / GIB:.1f} GiB allowance for compute buffers"
+        )
     if (budget.gpuCount or 0) > 1:
         notes.append(
             f"scored against {budget.gpuCount} GPUs summed; the largest single card has "
@@ -490,13 +532,13 @@ def compute(
     if budget.source == Source.override:
         notes.append("scored against a caller-supplied budget, not this host's detected memory")
 
-    required = weights_bytes + kv_bytes + overhead_bytes
+    required = weights_bytes + kv_bytes + overhead_total
     return Fit(
         verdict=_verdict(required, budget),
         requiredBytes=required,
         weightsBytes=weights_bytes,
         kvCacheBytes=kv_bytes,
-        overheadBytes=overhead_bytes,
+        overheadBytes=overhead_total,
         contextLength=context_length,
         kvCacheType=kv_cache_type,
         attentionLayers=shape.effective_attention_layers,
@@ -533,7 +575,9 @@ def max_context_that_fits(
     per_token, fixed = terms
 
     vram_free = budget.vramFreeBytes or 0
-    available = (vram_free if vram_free else (budget.ramAvailableBytes or 0)) - overhead_bytes
+    available = (vram_free if vram_free else (budget.ramAvailableBytes or 0)) - overhead_for(
+        budget, overhead_bytes
+    )
     available -= weights_bytes + fixed
     if available <= 0:
         return None

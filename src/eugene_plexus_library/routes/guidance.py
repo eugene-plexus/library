@@ -41,6 +41,11 @@ VRAM_DESCRIPTION = (
     "different building."
 )
 RAM_DESCRIPTION = "Override the detected host-memory budget, in bytes."
+GPU_COUNT_DESCRIPTION = (
+    "How many cards `vramBytes` is the combined free memory of, for a launch that "
+    "spreads one model across them. Each card holds its own compute buffers, so the "
+    "overhead allowance is counted once per card. Omitted, `vramBytes` is one card."
+)
 UNIFIED_DESCRIPTION = (
     "Score against one pool shared with host memory: an integrated GPU, Apple silicon "
     "or a GB10 on a host this library did not measure. Pass the device's own "
@@ -128,6 +133,7 @@ async def get_model_fit(
         default=None, ge=0, description="Override the detected host-memory budget, in bytes."
     ),
     unifiedMemory: bool | None = Query(default=None, description=UNIFIED_DESCRIPTION),
+    gpuCount: int | None = Query(default=None, ge=1, description=GPU_COUNT_DESCRIPTION),
 ) -> ModelFit:
     """Will a model already on this disk run here, and at what context?
 
@@ -164,6 +170,7 @@ async def get_model_fit(
         vram_override=vramBytes,
         ram_override=ramBytes,
         unified_override=unifiedMemory,
+        gpu_count_override=gpuCount,
     )
     context = contextLength or config.guidance_context_length()
     shape = _shape_for(model)

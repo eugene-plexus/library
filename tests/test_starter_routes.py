@@ -226,3 +226,12 @@ def test_a_shared_memory_gpu_on_another_host_is_scored_as_one_pool(
     ).json()
     assert body["models"], body
     assert all(m["fit"]["budget"]["unifiedMemory"] is True for m in body["models"])
+
+
+def test_the_starter_route_takes_the_card_count(catalogue_client: TestClient) -> None:
+    body = catalogue_client.get(
+        "/v1/catalogue/starter",
+        params={"vramBytes": 60 * GIB, "ramBytes": 64 * GIB, "gpuCount": 2},
+    ).json()
+    assert body["models"], body
+    assert all(m["fit"]["budget"]["gpuCount"] == 2 for m in body["models"])
