@@ -495,6 +495,39 @@ def _os_gpus(os_kind: Os, ram_available: int | None, warnings: list[str]) -> tup
     return gpus, shared
 
 
+def _beside_nvidia(os_kind: Os, first_index: int, ram_available: int | None) -> list[Gpu]:
+    """A discrete AMD or Intel card beside the NVIDIA ones (2026-09-27).
+
+    On Windows the build for such a machine is the CUDA one with the
+    Vulkan backend added, and it uses both cards; `gpu_probe.beside_nvidia`
+    is the agent's rule, copied, so the two components count the same
+    cards. On Linux the builds cannot be combined and this is empty.
+    """
+    try:
+        found = gpu_probe.adapters(os_kind.value)
+    except gpu_probe.GpuProbeError:
+        return []
+    extra = gpu_probe.beside_nvidia(
+        os_kind.value,
+        detect_arch().value,
+        found,
+        vulkan_loader=gpu_probe.vulkan_loader_present(os_kind.value),
+    )
+    gpus: list[Gpu] = []
+    for offset, adapter in enumerate(extra):
+        total, free = adapter.budget(ram_available)
+        gpus.append(
+            Gpu(
+                index=first_index + offset,
+                name=adapter.name,
+                vendor=_VENDOR.get(adapter.vendor, Vendor.unknown),
+                vramTotalBytes=total or 0,
+                vramFreeBytes=free,
+            )
+        )
+    return gpus
+
+
 def detect() -> HostHardware:
     """Read this host's memory and accelerators.
 
@@ -515,6 +548,8 @@ def detect() -> HostHardware:
         gpus = _apple_gpu(ram_total, warnings)
     else:
         gpus = _nvidia_gpus(warnings)
+        if gpus:
+            gpus += _beside_nvidia(os_kind, len(gpus), ram_available)
         if not gpus:
             gpus = _amd_gpus(warnings)
         if not gpus:

@@ -179,3 +179,38 @@ def test_a_shared_pool_is_not_scored_as_spilling_into_itself(
     shared = configured_client.get(url, params={**params, "unifiedMemory": "true"}).json()
     assert shared["fit"]["budget"]["unifiedMemory"] is True
     assert shared["fit"]["verdict"] != FitVerdict.split.value
+
+
+RX_7900 = gpu_probe.Adapter(
+    name="AMD Radeon RX 7900 XTX",
+    vendor=gpu_probe.AMD,
+    integrated=False,
+    dedicated_bytes=24 * GIB,
+    shared_bytes=32 * GIB,
+    dedicated_used_bytes=1 * GIB,
+    shared_used_bytes=0,
+)
+
+
+def test_a_discrete_card_beside_nvidia_is_counted_too(windows_with, monkeypatch) -> None:
+    """The agent's build for this machine uses both cards, so the library
+    scores against both (2026-09-27). The integrated GPU stays out."""
+    windows_with([RADEON_IGPU, RTX_5090, RX_7900])
+    monkeypatch.setattr(
+        hardware,
+        "_nvidia_gpus",
+        lambda warnings: [
+            hardware.Gpu(
+                index=0,
+                name="NVIDIA GeForce RTX 5090",
+                vendor=Vendor.nvidia,
+                vramTotalBytes=32 * GIB,
+                vramFreeBytes=29 * GIB,
+            )
+        ],
+    )
+    detected = hardware.detect()
+    assert [(g.index, g.name) for g in detected.gpus or []] == [
+        (0, "NVIDIA GeForce RTX 5090"),
+        (1, "AMD Radeon RX 7900 XTX"),
+    ]
