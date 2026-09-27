@@ -41,6 +41,12 @@ VRAM_DESCRIPTION = (
     "different building."
 )
 RAM_DESCRIPTION = "Override the detected host-memory budget, in bytes."
+UNIFIED_DESCRIPTION = (
+    "Score against one pool shared with host memory: an integrated GPU, Apple silicon "
+    "or a GB10 on a host this library did not measure. Pass the device's own "
+    "`sharedMemory`. Without it a `vramBytes` override reads as a card with memory of "
+    "its own, and a partial offload is scored as spilling into the same RAM."
+)
 
 
 def _problem(status_code: int, title: str, detail: str) -> HTTPException:
@@ -121,6 +127,7 @@ async def get_model_fit(
     ramBytes: int | None = Query(
         default=None, ge=0, description="Override the detected host-memory budget, in bytes."
     ),
+    unifiedMemory: bool | None = Query(default=None, description=UNIFIED_DESCRIPTION),
 ) -> ModelFit:
     """Will a model already on this disk run here, and at what context?
 
@@ -152,7 +159,12 @@ async def get_model_fit(
         )
 
     detected = await _detect(request)
-    budget = fit_mod.budget_from_hardware(detected, vram_override=vramBytes, ram_override=ramBytes)
+    budget = fit_mod.budget_from_hardware(
+        detected,
+        vram_override=vramBytes,
+        ram_override=ramBytes,
+        unified_override=unifiedMemory,
+    )
     context = contextLength or config.guidance_context_length()
     shape = _shape_for(model)
     # The disk footprint includes an optional vision projector. Merely

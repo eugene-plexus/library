@@ -303,6 +303,7 @@ def budget_from_hardware(
     *,
     vram_override: int | None = None,
     ram_override: int | None = None,
+    unified_override: bool | None = None,
 ) -> MemoryBudget:
     """Collapse detected hardware into the numbers a verdict needs.
 
@@ -315,6 +316,12 @@ def budget_from_hardware(
     A card that reports no free memory falls back to its total, which
     makes the verdict optimistic for that card alone; Intel is the case
     that does this, and it is named in the hardware warnings.
+
+    `unified_override` is the caller saying the device it measured shares
+    host memory (`ComputeDevice.sharedMemory` on the agent). Without it
+    an integrated GPU on another host, passed as `vram_override`, read as
+    a card with memory of its own, and a model too big for it was scored
+    as a partial offload into RAM that is the same RAM (2026-09-27).
     """
     per_gpu_free = [
         (gpu.vramFreeBytes if gpu.vramFreeBytes is not None else gpu.vramTotalBytes)
@@ -335,6 +342,11 @@ def budget_from_hardware(
         ram_total = ram_available = ram_override
         source = Source.override
 
+    unified = bool(hardware.unifiedMemory)
+    if unified_override is not None:
+        unified = unified_override
+        source = Source.override
+
     return MemoryBudget(
         vramFreeBytes=vram_free,
         vramTotalBytes=vram_total,
@@ -342,7 +354,7 @@ def budget_from_hardware(
         ramAvailableBytes=ram_available,
         ramTotalBytes=ram_total,
         gpuCount=len(hardware.gpus or []),
-        unifiedMemory=bool(hardware.unifiedMemory),
+        unifiedMemory=unified,
         source=source,
     )
 

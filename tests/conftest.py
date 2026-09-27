@@ -52,6 +52,20 @@ def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_gpus_from_the_operating_system(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The OS's own GPU list is empty unless a test says otherwise.
+
+    `gpu_probe.adapters()` asks DXCore on Windows and sysfs on Linux, so
+    without this every hardware test would describe the machine it ran
+    on -- a 5090 and an integrated Radeon on the development box, nothing
+    on CI. The same leak as the ambient environment, one layer down.
+    """
+    from eugene_plexus_library import gpu_probe
+
+    monkeypatch.setattr(gpu_probe, "adapters", lambda os_name=None: [])
+
+
 def make_symlink(link: Path, target: Path, *, directory: bool = False) -> None:
     try:
         link.symlink_to(target, target_is_directory=directory)

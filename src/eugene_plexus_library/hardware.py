@@ -53,6 +53,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 
+from . import gpu_probe
 from ._generated.models import Arch, Gpu, HostHardware, Os, Vendor
 
 log = logging.getLogger(__name__)
@@ -417,6 +418,83 @@ def _apple_gpu(ram_total: int | None, warnings: list[str]) -> list[Gpu]:
     ]
 
 
+_VENDOR = {
+    gpu_probe.NVIDIA: Vendor.nvidia,
+    gpu_probe.AMD: Vendor.amd,
+    gpu_probe.INTEL: Vendor.intel,
+}
+
+_HIP_SDK_PATHS = (r"C:\Program Files\AMD\ROCm", r"C:\Program Files\AMD\HIP SDK")
+
+
+def _rocm_installed(os_kind: Os) -> bool:
+    """AMD's SDK on disk: the agent's `rocm_installed`, restated here
+    because components share schemas and not code."""
+    if os_kind == Os.windows:
+        env = os.environ.get("HIP_PATH") or os.environ.get("ROCM_PATH")
+        if env and os.path.isdir(env):
+            return True
+        return any(os.path.isdir(p) for p in _HIP_SDK_PATHS)
+    return os.path.isdir("/opt/rocm")
+
+
+def _os_gpus(os_kind: Os, ram_available: int | None, warnings: list[str]) -> tuple[list[Gpu], bool]:
+    """The GPUs no vendor tool answered for, from the operating system.
+
+    **The Arc report (2026-09-27).** An Intel Arc or an AMD Radeon on
+    Windows has none of `nvidia-smi`, `rocm-smi` and `xpu-smi` unless its
+    owner installed an SDK, so this surface said "no accelerator was
+    detected" about a machine whose Vulkan build was using its GPU, and
+    every fit was scored against RAM. `gpu_probe` is the same module the
+    agent uses, copied, and `gpu_probe.family` the same decision, so the
+    library scores against the card the agent's build computes on. One
+    difference, named: this side passes `sycl=False`, because it runs no
+    `sycl-ls`; that changes the answer only for a machine with an AMD and
+    an Intel GPU and oneAPI installed.
+
+    Returns the GPUs and whether they share host memory.
+    """
+    try:
+        found = gpu_probe.adapters(os_kind.value)
+    except gpu_probe.GpuProbeError as exc:
+        warnings.append(f"could not list this machine's GPUs from the operating system: {exc}")
+        return [], False
+    if not found:
+        return [], False
+    chosen = gpu_probe.family(
+        os_kind.value,
+        detect_arch().value,
+        found,
+        vulkan_loader=gpu_probe.vulkan_loader_present(os_kind.value),
+        rocm=_rocm_installed(os_kind),
+    )
+    warnings.extend(chosen.notes)
+    gpus: list[Gpu] = []
+    for index, adapter in enumerate(chosen.adapters):
+        total, free = adapter.budget(ram_available)
+        if total is None:
+            warnings.append(
+                f"{adapter.name} does not report its memory on this platform, so every fit "
+                "against it is unknown rather than a guess."
+            )
+        elif free is None:
+            warnings.append(
+                f"how much of {adapter.name}'s memory is in use could not be read, so its "
+                "free memory is unknown and scoring uses its total."
+            )
+        gpus.append(
+            Gpu(
+                index=index,
+                name=adapter.name,
+                vendor=_VENDOR.get(adapter.vendor, Vendor.unknown),
+                vramTotalBytes=total or 0,
+                vramFreeBytes=free,
+            )
+        )
+    shared = bool(chosen.adapters) and all(a.integrated for a in chosen.adapters)
+    return gpus, shared
+
+
 def detect() -> HostHardware:
     """Read this host's memory and accelerators.
 
@@ -441,6 +519,8 @@ def detect() -> HostHardware:
             gpus = _amd_gpus(warnings)
         if not gpus:
             gpus = _intel_gpus(warnings)
+        if not gpus:
+            gpus, unified = _os_gpus(os_kind, ram_available, warnings)
 
     # **Which kind of nothing** (review §6.2 #29). A tool that is not
     # installed and a tool that is installed and broken are two different
@@ -455,10 +535,10 @@ def detect() -> HostHardware:
 
     if not gpus and not wedged:
         warnings.append(
-            "no accelerator was detected, so fit is scored against host memory alone. "
-            "If you have a GPU, its vendor tool (nvidia-smi, rocm-smi, xpu-smi) is not on "
-            "this process's PATH -- which is a common outcome when a supervisor spawns a "
-            "child with a trimmed environment."
+            "no accelerator was detected, by a vendor tool or by the operating system, so "
+            "fit is scored against host memory alone. If you have a GPU, its vendor tool "
+            "(nvidia-smi, rocm-smi, xpu-smi) is not on this process's PATH -- which is a "
+            "common outcome when a supervisor spawns a child with a trimmed environment."
         )
     elif not gpus:
         warnings.append("fit is scored against host memory alone, because no GPU was read.")

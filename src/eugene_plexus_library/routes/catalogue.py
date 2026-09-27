@@ -59,6 +59,12 @@ VRAM_DESCRIPTION = (
     "different building."
 )
 RAM_DESCRIPTION = "Override the detected host-memory budget, in bytes."
+UNIFIED_DESCRIPTION = (
+    "Score against one pool shared with host memory: an integrated GPU, Apple silicon "
+    "or a GB10 on a host this library did not measure. Pass the device's own "
+    "`sharedMemory`. Without it a `vramBytes` override reads as a card with memory of "
+    "its own, and a partial offload is scored as spilling into the same RAM."
+)
 
 
 def _problem(
@@ -114,10 +120,16 @@ def _client(request: Request) -> HubClient:
 
 
 async def _budget(
-    request: Request, *, vram: int | None = None, ram: int | None = None
+    request: Request,
+    *,
+    vram: int | None = None,
+    ram: int | None = None,
+    unified: bool | None = None,
 ) -> MemoryBudget:
     detected = await asyncio.to_thread(hardware.detect)
-    return fit_mod.budget_from_hardware(detected, vram_override=vram, ram_override=ram)
+    return fit_mod.budget_from_hardware(
+        detected, vram_override=vram, ram_override=ram, unified_override=unified
+    )
 
 
 @router.get("/v1/catalogue/search", response_model=CatalogueSearchPage)
@@ -293,6 +305,7 @@ async def get_catalogue_model(
     ramBytes: int | None = Query(
         default=None, ge=0, description="Override the detected host-memory budget, in bytes."
     ),
+    unifiedMemory: bool | None = Query(default=None, description=UNIFIED_DESCRIPTION),
 ) -> CatalogueModel:
     """One repo, its download candidates, and which of them will fit.
 
@@ -318,7 +331,7 @@ async def get_catalogue_model(
     except HubError as exc:
         raise _from_hub_error(exc) from exc
 
-    budget = await _budget(request, vram=vramBytes, ram=ramBytes)
+    budget = await _budget(request, vram=vramBytes, ram=ramBytes, unified=unifiedMemory)
     return catalogue_mod.build_model(
         info=info,
         files=files,
@@ -344,6 +357,7 @@ async def get_starter_models(
     ),
     vramBytes: int | None = Query(default=None, ge=0, description=VRAM_DESCRIPTION),
     ramBytes: int | None = Query(default=None, ge=0, description=RAM_DESCRIPTION),
+    unifiedMemory: bool | None = Query(default=None, description=UNIFIED_DESCRIPTION),
 ) -> StarterSet:
     """The shipped starter set, scored against this machine.
 
@@ -361,7 +375,7 @@ async def get_starter_models(
     config: ConfigStore = request.app.state.config_store
     store: StateStore = request.app.state.state_store
     starter = starter_mod.load(config.starter_models_file())
-    budget = await _budget(request, vram=vramBytes, ram=ramBytes)
+    budget = await _budget(request, vram=vramBytes, ram=ramBytes, unified=unifiedMemory)
     return starter_mod.build(
         starter,
         budget=budget,
@@ -434,6 +448,7 @@ async def preflight_catalogue_file(
     ramBytes: int | None = Query(
         default=None, ge=0, description="Override the detected host-memory budget, in bytes."
     ),
+    unifiedMemory: bool | None = Query(default=None, description=UNIFIED_DESCRIPTION),
 ) -> CataloguePreflight:
     """Read one remote file's real metadata before downloading it.
 
@@ -462,7 +477,7 @@ async def preflight_catalogue_file(
         # the probed file's own size from its HEAD.
         log.info("preflight %s: could not read the file list (%s)", repo, exc)
 
-    budget = await _budget(request, vram=vramBytes, ram=ramBytes)
+    budget = await _budget(request, vram=vramBytes, ram=ramBytes, unified=unifiedMemory)
     try:
         return await preflight_mod.preflight(
             client,

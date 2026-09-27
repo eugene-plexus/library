@@ -213,3 +213,16 @@ def test_an_ordinary_query_is_still_an_ordinary_search(
     body = catalogue_client.get("/v1/catalogue/search", params={"q": "qwen"}).json()
     assert body["interpretedAs"] == "search"
     assert [r["repo"] for r in body["results"]] == ["org/from-search"]
+
+
+def test_a_shared_memory_gpu_on_another_host_is_scored_as_one_pool(
+    catalogue_client: TestClient,
+) -> None:
+    """`unifiedMemory` reaches the starter set, which is where an
+    integrated-GPU owner is first told what fits (2026-09-27)."""
+    body = catalogue_client.get(
+        "/v1/catalogue/starter",
+        params={"vramBytes": 14 * GIB, "ramBytes": 26 * GIB, "unifiedMemory": "true"},
+    ).json()
+    assert body["models"], body
+    assert all(m["fit"]["budget"]["unifiedMemory"] is True for m in body["models"])
