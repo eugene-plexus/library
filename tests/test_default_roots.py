@@ -151,7 +151,9 @@ def test_the_schema_reports_this_installs_default(tmp_path: Path) -> None:
     field = next(f for f in store.schema().fields if f.key == "modelRoots")
 
     assert field.default == [{"path": "/models", "mounts": []}]
-    assert DEFAULT_ROOTS_VARIABLE in (field.description or "")
+    # Where it comes from is its own field now, not a sentence appended to
+    # the description (settings never lie, 2026-09-30).
+    assert DEFAULT_ROOTS_VARIABLE in (field.defaultSource or "")
     assert field.valueType.value == "library_folders"
 
 

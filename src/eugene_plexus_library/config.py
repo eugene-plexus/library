@@ -265,30 +265,57 @@ ROOTS_KEY = "modelRoots"
 DEFAULT_ROOTS_VARIABLE = "EUGENE_PLEXUS_LIBRARY_DEFAULT_MODEL_ROOTS"
 
 
-def as_schema(*, default_roots: Sequence[str] = ()) -> ConfigSchema:
+#: What an unset value does, shown where the control would otherwise be
+#: blank (settings never lie, 2026-09-30).
+UNSET_MEANS: dict[str, str] = {
+    "hfToken": "Not set: the hub is asked anonymously, which reaches every public model.",
+    "starterModelsFile": "Not set: uses the starter list shipped with this version.",
+    ROOTS_KEY: "No folders: nothing is scanned, and a download has nowhere to go.",
+}
+
+
+def as_schema(
+    *, default_roots: Sequence[str] = (), pending: dict[str, Any] | None = None
+) -> ConfigSchema:
     """The field metadata, with the roots' default as this install has it.
 
     A picker rendering the schema shows the default beside the field,
     so an operator in a container sees `/models` and where it came from
     rather than an empty list that the effective config contradicts.
+    `pending` is `ConfigStore.pending_restart()`: a field saved but not yet
+    in effect says so, and what the running library uses.
     """
-    fields = list(FIELDS)
-    if default_roots:
-        index = next(i for i, f in enumerate(fields) if f.key == ROOTS_KEY)
-        field = fields[index]
-        fields[index] = field.model_copy(
-            update={
-                "default": coerce_folders(list(default_roots)),
-                "description": (
-                    f"{field.description} On this install the default is "
-                    f"{', '.join(default_roots)}, set by its environment "
-                    f"({DEFAULT_ROOTS_VARIABLE}) with no mounts declared; clearing the "
-                    f"list returns to it, and adding mounts to it replaces it with an "
-                    f"explicit list that says the same path."
-                ),
-            }
-        )
+    fields: list[ConfigField] = []
+    for field in FIELDS:
+        update: dict[str, Any] = {}
+        if field.key in UNSET_MEANS:
+            update["unsetMeans"] = UNSET_MEANS[field.key]
+        if field.key == ROOTS_KEY and default_roots:
+            update["default"] = coerce_folders(list(default_roots))
+            update["defaultSource"] = (
+                f"Set by this install's environment ({DEFAULT_ROOTS_VARIABLE}), with no "
+                "mounts declared. Clearing the list returns to it; adding mounts replaces it "
+                "with an explicit list that says the same path."
+            )
+        if pending and field.key in pending:
+            update["pendingRestart"] = True
+            if not field.sensitive:
+                update["inEffect"] = pending[field.key]
+        fields.append(field.model_copy(update=update) if update else field)
     return ConfigSchema(component="library", fields=fields, categories=CATEGORY_LABELS)
+
+
+def _is_unset(field: ConfigField, value: Any) -> bool:
+    """None, or an empty string where empty means nothing: a secret (an
+    empty token is no token) and an address (an empty hub address is the
+    hub). Those used to be stored as given and shown as a value."""
+    if value is None:
+        return True
+    return (
+        isinstance(value, str)
+        and not value.strip()
+        and field.valueType in (ConfigValueType.secret, ConfigValueType.url)
+    )
 
 
 def _defaults(*, default_roots: Sequence[str] = ()) -> dict[str, Any]:
@@ -398,7 +425,10 @@ class ConfigStore:
         # gets: the default is never written, so the file keeps meaning
         # "what the operator chose" and the variable keeps applying.
         self._roots_defaulted = bool(self._default_roots)
-        self._pending_restart: set[str] = set()
+        # What this process runs on for every `requiresRestart` field, as
+        # loaded. A field is pending a restart while its saved value
+        # differs, and the schema says so (settings never lie, 2026-09-30).
+        self._started: dict[str, Any] = dict(self._values)
         self._master_key = master_key
 
     def _field_defaults(self) -> dict[str, Any]:
@@ -412,9 +442,18 @@ class ConfigStore:
                     raise ValueError(f"config file {self._path} must be a YAML mapping at the root")
                 merged = self._field_defaults()
                 for key, value in raw.items():
-                    if key not in _FIELDS_BY_KEY:
+                    field = _FIELDS_BY_KEY.get(key)
+                    if field is None:
                         continue
-                    merged[key] = self._decrypt_loaded(key, value)
+                    value = self._decrypt_loaded(key, value)
+                    # A `null` (or, for a secret or an address, an empty
+                    # string) in the file is the default, as a PATCH of
+                    # null is. `catalogueEnabled: null` used to turn the
+                    # catalogue off while GET said null and the schema said
+                    # it was on; an empty token read as "<redacted>".
+                    if _is_unset(field, value):
+                        value = field.default
+                    merged[key] = value
                 # An empty list on disk is "nothing configured", and the
                 # environment's default fills it -- including a file
                 # written before the variable existed, which is every
@@ -432,6 +471,7 @@ class ConfigStore:
                 self._values = self._field_defaults()
                 self._roots_defaulted = bool(self._default_roots)
                 self._write_locked()
+            self._started = dict(self._values)
 
     def _decrypt_loaded(self, key: str, value: Any) -> Any:
         if not security.is_envelope(value):
@@ -458,7 +498,17 @@ class ConfigStore:
             return ConfigDocument.model_validate(out)
 
     def schema(self) -> ConfigSchema:
-        return as_schema(default_roots=self._default_roots)
+        return as_schema(default_roots=self._default_roots, pending=self.pending_restart())
+
+    def pending_restart(self) -> dict[str, Any]:
+        """`requiresRestart` fields whose saved value is not the one this
+        process runs on, with the value it runs on."""
+        with self._lock:
+            return {
+                f.key: self._started.get(f.key)
+                for f in FIELDS
+                if f.requiresRestart and self._values.get(f.key) != self._started.get(f.key)
+            }
 
     @property
     def default_roots(self) -> list[str]:
@@ -474,6 +524,7 @@ class ConfigStore:
     def apply_patch(self, request: ConfigUpdateRequest) -> ConfigUpdateResult:
         applied: list[str] = []
         rejected: list[ConfigFieldError] = []
+        pending_restart: list[str] = []
         patch: dict[str, Any] = request.model_dump()
 
         with self._lock:
@@ -500,14 +551,19 @@ class ConfigStore:
                     if self._roots_defaulted:
                         new_value = None
 
+                if _is_unset(field, new_value):
+                    new_value = None
                 if new_value is None and defaults.get(key) is not None:
                     self._values[key] = defaults[key]
                 else:
                     self._values[key] = new_value
 
                 applied.append(key)
-                if field.requiresRestart:
-                    self._pending_restart.add(key)
+                # This PATCH's keys only, and only while they differ from
+                # what the process runs on: the contract's subset of
+                # `applied`. It was every restart key saved since start.
+                if field.requiresRestart and self._values.get(key) != self._started.get(key):
+                    pending_restart.append(key)
 
             if applied:
                 self._write_locked()
@@ -515,8 +571,8 @@ class ConfigStore:
             return ConfigUpdateResult(
                 applied=applied,
                 rejected=rejected,
-                requiresRestart=bool(self._pending_restart),
-                pendingRestart=sorted(self._pending_restart),
+                requiresRestart=bool(pending_restart),
+                pendingRestart=pending_restart,
             )
 
     def get(self, key: str) -> Any:

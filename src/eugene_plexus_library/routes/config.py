@@ -47,7 +47,20 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
     scans they didn't ask for.
     """
     store: ConfigStore = request.app.state.config_store
-    return store.apply_patch(body)
+    result = store.apply_patch(body)
+    # The hub client is reconfigured by every catalogue route, and a
+    # download is not one: a token saved here reached the next search but
+    # not the next download, which used the old one. Now, for everything.
+    client = getattr(request.app.state, "hub_client", None)
+    if client is not None and {"hfToken", "catalogueBaseUrl", "catalogueEnabled"} & set(
+        result.applied
+    ):
+        client.configure(
+            base_url=store.catalogue_base_url(),
+            token=store.hf_token(),
+            enabled=store.catalogue_enabled(),
+        )
+    return result
 
 
 @router.post("/v1/config/test", response_model=ConfigTestResult)
