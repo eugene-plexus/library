@@ -177,6 +177,76 @@ def test_flags_are_stored_not_validated(configured_client: TestClient, models_di
     assert response.json()["flags"] == {"notARealFlag": "banana"}
 
 
+BUILT_BY = {
+    "buildId": "b-1",
+    "node": "laptop",
+    "accuracy": "high",
+    "builtAt": "2026-09-30T12:00:00Z",
+    "engineVersion": "b11254",
+    "flags": {"contextSize": 65536, "cacheType": "q8_0", "flashAttention": "on"},
+    "decodeTokensPerSecond": 48.4,
+    "deepDepth": 2048,
+    "deepDecodeTokensPerSecond": 44.1,
+    "graphicsMemoryBytes": 7_600_000_000,
+    "sameTopTokenPercent": 97.2,
+    "evaluationSource": "bundled",
+}
+
+
+def test_a_built_profile_keeps_its_record_through_an_edit_that_omits_it(
+    configured_client: TestClient, models_dir: Path
+) -> None:
+    """PB2. Every edit path in the UI writes a whole profile, and none of
+    them knows about `builtBy`; a whole-document replace would drop the
+    record on the first edit, where the design labels an edited profile's
+    numbers rather than deleting them. Absent keeps it; null clears it."""
+    model_id = _one_model(configured_client, models_dir)
+    created = configured_client.post(
+        f"/v1/models/{model_id}/profiles",
+        json={
+            "name": "Built for laptop",
+            "engine": "llama_cpp",
+            "flags": dict(BUILT_BY["flags"]),
+            "builtBy": BUILT_BY,
+        },
+    )
+    assert created.status_code == 201
+    profile = created.json()
+    assert profile["builtBy"]["buildId"] == "b-1"
+    url = f"/v1/models/{model_id}/profiles/{profile['id']}"
+
+    edited = configured_client.put(
+        url,
+        json={
+            "name": "Built for laptop",
+            "engine": "llama_cpp",
+            "flags": {"contextSize": 32768, "cacheType": "q8_0", "flashAttention": "on"},
+        },
+    )
+    assert edited.status_code == 200
+    assert edited.json()["builtBy"] == configured_client.get(url).json()["builtBy"]
+    assert edited.json()["builtBy"]["flags"]["contextSize"] == 65536
+    assert edited.json()["flags"]["contextSize"] == 32768
+
+    cleared = configured_client.put(
+        url, json={"name": "Built for laptop", "engine": "llama_cpp", "builtBy": None}
+    )
+    assert cleared.status_code == 200
+    assert cleared.json().get("builtBy") is None
+
+
+def test_a_built_by_record_must_name_its_build(
+    configured_client: TestClient, models_dir: Path
+) -> None:
+    model_id = _one_model(configured_client, models_dir)
+    broken = {k: v for k, v in BUILT_BY.items() if k != "buildId"}
+    response = configured_client.post(
+        f"/v1/models/{model_id}/profiles",
+        json={"name": "x", "engine": "llama_cpp", "builtBy": broken},
+    )
+    assert response.status_code == 422
+
+
 def test_duplicate_profile_name_is_a_conflict(
     configured_client: TestClient, models_dir: Path
 ) -> None:

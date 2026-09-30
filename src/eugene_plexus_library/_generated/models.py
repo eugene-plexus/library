@@ -1366,88 +1366,24 @@ class RecommendedSampling(BaseModel):
     topP: float | None = None
 
 
-class ModelProfileSpec(BaseModel):
+class ProfileBuiltAccuracy(StrEnum):
     """
-    Declarative half of a profile — launch settings and generation
-    defaults for one model. Used for create and replace bodies.
-
-    Launch field names match `RuntimeSpec`, on purpose:
-    composing a profile into a runtime declaration is a copy, not a
-    translation, which is what lets the launch flow live in the
-    caller and keep this component free of engine knowledge.
-
+    The accuracy level the build was asked for; the agent's `ProfileBuildAccuracy`.
     """
 
-    name: str = Field(
-        ...,
-        description='Operator-supplied label, unique per model — "long context",\n"cpu only", "gpu 1". Names rather than numbers because the\nreason a profile exists is the thing worth remembering about\nit.\n',
-        min_length=1,
-    )
-    default: bool | None = Field(
-        False,
-        description='The profile offered first when launching this model.\nIts maxTokens, temperature and topP also supply omitted\ngeneration parameters at the gateway, without restarting\nan existing runtime. Explicit request values always win.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
-    )
-    maxTokens: int | None = Field(
-        None,
-        description='Maximum output tokens when the request omits a limit. Absent uses the gateway default.',
-        ge=1,
-    )
-    temperature: float | None = Field(
-        None,
-        description='Sampling temperature when omitted by the caller. Zero is an explicit value.',
-        ge=0.0,
-        le=2.0,
-    )
-    topP: float | None = Field(
-        None,
-        description='Nucleus sampling cutoff when omitted by the caller. Absent leaves it unspecified.',
-        ge=0.0,
-        le=1.0,
-    )
-    engine: EngineKind = Field(
-        ...,
-        description='Which engine these flags are written for. Flags are not\nportable between engines, so a profile is only ever offered\nfor the engine it names — and a model whose format no\ninstalled engine can load has nowhere to use one at all. The\nengine side of that answer is\n`EngineDescriptor.modelFormats` on the agent.\n',
-    )
-    flags: dict[str, Any] | None = Field(
-        None,
-        description="Curated engine flags, keyed by the field names in the\nadapter's `flagSchema` — context size, GPU layers, batch\nsize, parallel slots. Copied onto `RuntimeSpec.flags`\nverbatim.\n\n**Stored, not validated.** The validator is the agent's\nadapter schema, at runtime-creation time. A profile is\nallowed to be wrong; the runtime that uses it is not, and\nthat is where an unknown key becomes a 400. Validating in\nboth places would mean two copies of engine knowledge and\none of them going stale.\n",
-    )
-    extraArgs: list[str] | None = Field(
-        None,
-        description='Verbatim extra arguments, for the long tail a curated\nsurface always misses. `--lora` lives here, which is why\nadapters are not modelled as their own thing yet.\n',
-    )
-    env: dict[str, str] | None = Field(
-        None,
-        description='Extra environment for the engine process. This is where\n`CUDA_VISIBLE_DEVICES` goes, and therefore where the\ntwo-replicas-on-two-GPUs case comes from: the same profile\ntwice with a different device pinned. It is also the\nstrongest argument for profiles being plural.\n',
-    )
-    notes: str | None = Field(
-        None,
-        description='Free text from the operator. Tuning a model is empirical and\nthe reasoning evaporates — "OOMs above 24 layers on the\n3090" is worth more later than the flag value it explains.\n',
-    )
+    max = 'max'
+    high = 'high'
+    medium = 'medium'
+    low = 'low'
 
 
-class ModelProfile(BaseModel):
+class ProfileBuiltEvaluationSource(StrEnum):
     """
-    A saved profile, as stored: the spec plus server-owned
-    identifiers and timestamps.
-
+    The agent's `EvaluationTextSource`. A custom text is identified by the build, never stored.
     """
 
-    id: str = Field(
-        ..., description='Server-assigned profile id, unique within the model.'
-    )
-    name: str
-    default: bool
-    maxTokens: int | None = Field(None, ge=1)
-    temperature: float | None = Field(None, ge=0.0, le=2.0)
-    topP: float | None = Field(None, ge=0.0, le=1.0)
-    engine: EngineKind
-    flags: dict[str, Any] | None = None
-    extraArgs: list[str] | None = None
-    env: dict[str, str] | None = None
-    notes: str | None = None
-    createdAt: AwareDatetime | None = None
-    updatedAt: AwareDatetime | None = None
+    bundled = 'bundled'
+    custom = 'custom'
 
 
 class ScanRequest(BaseModel):
@@ -2290,8 +2226,81 @@ class SafetensorsDetail(BaseModel):
     )
 
 
-class ModelProfileList(BaseModel):
-    profiles: list[ModelProfile]
+class ProfileBuiltBy(BaseModel):
+    """
+    What the settings builder set on a profile, and what it measured,
+    on which machine. The UI compares `flags` with the profile's own
+    flags to say which settings the builder set and whether any has
+    been edited since; once one has, the measured numbers no longer
+    describe the profile and are labelled so.
+
+    """
+
+    buildId: str = Field(
+        ..., description="The agent's `ProfileBuild.id`.", min_length=1
+    )
+    node: str = Field(..., description='The machine it was measured on.', min_length=1)
+    accuracy: ProfileBuiltAccuracy
+    builtAt: AwareDatetime
+    engineVersion: str | None = Field(
+        None, description='The llama.cpp build it was measured with.'
+    )
+    flags: dict[str, Any] = Field(
+        ...,
+        description="The flags the builder set, as it set them: `contextSize`,\n`cacheType`, `flashAttention` when the cache is quantised,\nand `memoryMargin` when a margin was asked for. `gpuLayers`\nis never among them: placement is llama.cpp's at every launch.\n",
+    )
+    decodeTokensPerSecond: float | None = Field(
+        None, description='Measured decode speed with an empty context.', gt=0.0
+    )
+    deepDepth: int | None = Field(
+        None,
+        description='The context depth of the second measurement (2,048 for every candidate).',
+        ge=0,
+    )
+    deepDecodeTokensPerSecond: float | None = Field(None, gt=0.0)
+    graphicsMemoryBytes: int | None = Field(
+        None,
+        description='Graphics memory used when the result was loaded to confirm it, where the machine can measure it.',
+        ge=0,
+    )
+    sameTopTokenPercent: float | None = Field(
+        None,
+        description='How often the chosen cache picks the same next token as the\nf16 cache on the evaluation text. Null when the f16 cache was\nchosen, since nothing that changes answers was set.\n',
+        ge=0.0,
+        le=100.0,
+    )
+    evaluationSource: ProfileBuiltEvaluationSource | None = Field(
+        None,
+        description='Which text the quality measurement used; null when none was made.',
+    )
+
+
+class ModelProfile(BaseModel):
+    """
+    A saved profile, as stored: the spec plus server-owned
+    identifiers and timestamps.
+
+    """
+
+    id: str = Field(
+        ..., description='Server-assigned profile id, unique within the model.'
+    )
+    name: str
+    default: bool
+    maxTokens: int | None = Field(None, ge=1)
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    topP: float | None = Field(None, ge=0.0, le=1.0)
+    engine: EngineKind
+    flags: dict[str, Any] | None = None
+    extraArgs: list[str] | None = None
+    env: dict[str, str] | None = None
+    notes: str | None = None
+    builtBy: ProfileBuiltBy | None = Field(
+        None,
+        description="The settings builder's record, when it wrote this profile. Kept by a replace that omits it.",
+    )
+    createdAt: AwareDatetime | None = None
+    updatedAt: AwareDatetime | None = None
 
 
 class SkippedPath(BaseModel):
@@ -2772,6 +2781,74 @@ class LibraryModel(BaseModel):
     error: str | None = Field(
         None,
         description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
+    )
+
+
+class ModelProfileList(BaseModel):
+    profiles: list[ModelProfile]
+
+
+class ModelProfileSpec(BaseModel):
+    """
+    Declarative half of a profile — launch settings and generation
+    defaults for one model. Used for create and replace bodies.
+
+    Launch field names match `RuntimeSpec`, on purpose:
+    composing a profile into a runtime declaration is a copy, not a
+    translation, which is what lets the launch flow live in the
+    caller and keep this component free of engine knowledge.
+
+    """
+
+    name: str = Field(
+        ...,
+        description='Operator-supplied label, unique per model — "long context",\n"cpu only", "gpu 1". Names rather than numbers because the\nreason a profile exists is the thing worth remembering about\nit.\n',
+        min_length=1,
+    )
+    default: bool | None = Field(
+        False,
+        description='The profile offered first when launching this model.\nIts maxTokens, temperature and topP also supply omitted\ngeneration parameters at the gateway, without restarting\nan existing runtime. Explicit request values always win.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
+    )
+    maxTokens: int | None = Field(
+        None,
+        description='Maximum output tokens when the request omits a limit. Absent uses the gateway default.',
+        ge=1,
+    )
+    temperature: float | None = Field(
+        None,
+        description='Sampling temperature when omitted by the caller. Zero is an explicit value.',
+        ge=0.0,
+        le=2.0,
+    )
+    topP: float | None = Field(
+        None,
+        description='Nucleus sampling cutoff when omitted by the caller. Absent leaves it unspecified.',
+        ge=0.0,
+        le=1.0,
+    )
+    engine: EngineKind = Field(
+        ...,
+        description='Which engine these flags are written for. Flags are not\nportable between engines, so a profile is only ever offered\nfor the engine it names — and a model whose format no\ninstalled engine can load has nowhere to use one at all. The\nengine side of that answer is\n`EngineDescriptor.modelFormats` on the agent.\n',
+    )
+    flags: dict[str, Any] | None = Field(
+        None,
+        description="Curated engine flags, keyed by the field names in the\nadapter's `flagSchema` — context size, GPU layers, batch\nsize, parallel slots. Copied onto `RuntimeSpec.flags`\nverbatim.\n\n**Stored, not validated.** The validator is the agent's\nadapter schema, at runtime-creation time. A profile is\nallowed to be wrong; the runtime that uses it is not, and\nthat is where an unknown key becomes a 400. Validating in\nboth places would mean two copies of engine knowledge and\none of them going stale.\n",
+    )
+    extraArgs: list[str] | None = Field(
+        None,
+        description='Verbatim extra arguments, for the long tail a curated\nsurface always misses. `--lora` lives here, which is why\nadapters are not modelled as their own thing yet.\n',
+    )
+    env: dict[str, str] | None = Field(
+        None,
+        description='Extra environment for the engine process. This is where\n`CUDA_VISIBLE_DEVICES` goes, and therefore where the\ntwo-replicas-on-two-GPUs case comes from: the same profile\ntwice with a different device pinned. It is also the\nstrongest argument for profiles being plural.\n',
+    )
+    notes: str | None = Field(
+        None,
+        description='Free text from the operator. Tuning a model is empirical and\nthe reasoning evaporates — "OOMs above 24 layers on the\n3090" is worth more later than the flag value it explains.\n',
+    )
+    builtBy: ProfileBuiltBy | None = Field(
+        None,
+        description="The settings builder's record, for a profile it wrote\n(`docs/design/profile-builder.md` §6). **The one field a\nreplace does not replace by omission:** absent from a `PUT`\nbody keeps the stored record, and only an explicit `null`\nclears it. It is a record of a past measurement rather than\na setting, and every edit path that writes a whole profile\nwould otherwise drop it on the first edit -- where the\ndesign says an edited profile's numbers are labelled, not\ndeleted.\n",
     )
 
 

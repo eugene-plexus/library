@@ -365,6 +365,7 @@ class StateStore:
                 maxTokens=spec.maxTokens,
                 temperature=spec.temperature,
                 topP=spec.topP,
+                builtBy=spec.builtBy,
                 createdAt=now,
                 updatedAt=now,
             )
@@ -394,6 +395,14 @@ class StateStore:
             # one default" invariant a caller can rely on; clearing it
             # would need a second call to restore.
             is_default = bool(spec.default) or (current.default and len(profiles) == 1)
+            # `builtBy` is the one field a replace does not replace by
+            # omission: it records a past measurement, not a setting, and
+            # every edit path writes a whole profile. Absent keeps it;
+            # only an explicit null clears it (library.yaml,
+            # `ModelProfileSpec.builtBy`). An edit is what makes the
+            # record's numbers stale, and the UI labels them for that
+            # rather than losing them.
+            built_by = spec.builtBy if "builtBy" in spec.model_fields_set else current.builtBy
             updated = ModelProfile(
                 id=current.id,
                 name=spec.name,
@@ -406,6 +415,7 @@ class StateStore:
                 maxTokens=spec.maxTokens,
                 temperature=spec.temperature,
                 topP=spec.topP,
+                builtBy=built_by,
                 createdAt=current.createdAt,
                 updatedAt=_now(),
             )
