@@ -19,7 +19,10 @@
 #
 # Every number under `recommended:` and `shape:` was measured from the
 # file itself, which is what lets `GET /v1/catalogue/starter` score a
-# fit with no upstream call at all.
+# fit with no upstream call at all. `expertBytes` too, the dense entries'
+# 0 included: read from each file's tensor table on 2026-09-30 (header
+# only, over HTTP Range), so a dense entry's split is named `layers` from
+# a measurement rather than left unknown (A3c).
 reviewed: '2026-09-30'
 engine: llama_cpp b10999
 classes:
@@ -37,7 +40,8 @@ classes:
     repos: [unsloth/Qwen3.5-4B-GGUF, bartowski/Qwen_Qwen3.5-4B-GGUF, Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-GGUF,
       lmstudio-community/Qwen3.5-4B-GGUF]
     consecutiveReviewsAtTop: 2
-  recommended: {file: Qwen3.5-4B-Q4_K_M.gguf, label: Q4_K_M, sizeBytes: 2740937888, bitsPerWeight: 5.21}
+  recommended: {file: Qwen3.5-4B-Q4_K_M.gguf, label: Q4_K_M, sizeBytes: 2740937888, bitsPerWeight: 5.21,
+    expertBytes: 0}
   shape: {blockCount: 32, attentionLayers: 8, headCountKv: 4, keyLength: 256, valueLength: 256, embeddingLength: 2560,
     headCount: 16}
 - class: 8B
@@ -54,7 +58,8 @@ classes:
     repos: [HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive, ggml-org/gemma-4-E4B-it-GGUF, lmstudio-community/gemma-4-E4B-it-GGUF,
       unsloth/gemma-4-E4B-it-GGUF]
     consecutiveReviewsAtTop: 2
-  recommended: {file: gemma-4-E4B-it-Q4_K_M.gguf, label: Q4_K_M, sizeBytes: 5335291936, bitsPerWeight: 5.68}
+  recommended: {file: gemma-4-E4B-it-Q4_K_M.gguf, label: Q4_K_M, sizeBytes: 5335291936, bitsPerWeight: 5.68,
+    expertBytes: 0}
   shape:
     blockCount: 42
     attentionLayers: 42
@@ -93,7 +98,8 @@ classes:
       HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced, yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF,
       lmstudio-community/gemma-4-12B-it-GGUF]
     consecutiveReviewsAtTop: 2
-  recommended: {file: gemma-4-12b-it-Q4_K_M.gguf, label: Q4_K_M, sizeBytes: 7121861440, bitsPerWeight: 4.78}
+  recommended: {file: gemma-4-12b-it-Q4_K_M.gguf, label: Q4_K_M, sizeBytes: 7121861440, bitsPerWeight: 4.78,
+    expertBytes: 0}
   shape:
     blockCount: 48
     attentionLayers: 48
@@ -133,7 +139,8 @@ classes:
       HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF, lmstudio-community/Qwen3.8-27B-GGUF,
       0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF]
     consecutiveReviewsAtTop: 2
-  recommended: {file: Qwen3.8-27B-UD-Q4_K_M.gguf, label: UD-Q4_K_M, sizeBytes: 16464440224, bitsPerWeight: 4.82}
+  recommended: {file: Qwen3.8-27B-UD-Q4_K_M.gguf, label: UD-Q4_K_M, sizeBytes: 16464440224, bitsPerWeight: 4.82,
+    expertBytes: 0}
   shape: {blockCount: 65, attentionLayers: 16, headCountKv: 4, keyLength: 256, valueLength: 256, embeddingLength: 5120,
     headCount: 24}
 - class: 30B MoE

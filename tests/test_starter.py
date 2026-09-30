@@ -18,6 +18,7 @@ import yaml
 from eugene_plexus_library import fit as fit_mod
 from eugene_plexus_library import starter
 from eugene_plexus_library._generated.models import (
+    FitOffload,
     FitVerdict,
     KvCacheType,
     MemoryBudget,
@@ -89,6 +90,38 @@ def test_the_shipped_list_loads_and_every_entry_can_be_scored() -> None:
         assert row.size_bytes > 0
         assert row.file.endswith(".gguf")
         assert row.shape.complete, f"{row.base_model} cannot be scored from its recorded shape"
+
+
+def test_every_shipped_entry_records_its_expert_share() -> None:
+    """A3c. An entry with no `expertBytes` scores a split with `offload:
+    null`, which the UI must write as *not known* -- so a dense 27B that
+    spills on an 8 GB card read "needs RAM too" where it has always read
+    "partial offload". The dense entries' 0 was read from each file's own
+    tensor table, like the MoE entry's share, so every entry says it."""
+    for row in starter.load().entries:
+        assert row.expert_bytes is not None, f"{row.base_model} records no expert share"
+
+
+def test_a_shipped_dense_entry_that_spills_says_it_moves_layers() -> None:
+    """On an 8 GB card the dense 27B spills, and says how."""
+    card = MemoryBudget(
+        vramFreeBytes=7 * GIB,
+        vramTotalBytes=8 * GIB,
+        largestGpuFreeBytes=7 * GIB,
+        ramAvailableBytes=24 * GIB,
+        ramTotalBytes=32 * GIB,
+        gpuCount=1,
+        unifiedMemory=False,
+        source=Source.override,
+    )
+    result = starter.build(
+        starter.load(), budget=card, context_length=16384, kv_cache_type=KvCacheType.f16
+    )
+    by_class = {m.sizeClass: m for m in result.models}
+    dense = by_class["30B"]
+    assert dense.fit is not None and dense.fit.verdict is FitVerdict.split
+    assert dense.fit.offload is FitOffload.layers
+    assert by_class["30B MoE"].fit.offload is FitOffload.experts
 
 
 def test_the_shipped_list_names_the_engine_it_was_verified_against() -> None:
