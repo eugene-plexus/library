@@ -250,7 +250,7 @@ def write_safetensors(
     self-consistent; the tensor bytes themselves are zeros, because
     nothing here ever reads past the header.
     """
-    sizes = {"F32": 4, "F16": 2, "BF16": 2, "I64": 8, "U8": 1}
+    sizes = {"F32": 4, "F16": 2, "BF16": 2, "I64": 8, "U8": 1, "U32": 4}
     header: dict[str, Any] = {}
     offset = 0
     for name, (dtype, shape) in tensors.items():

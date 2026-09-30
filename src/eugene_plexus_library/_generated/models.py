@@ -1303,12 +1303,15 @@ class MlxQuantization(BaseModel):
     directory packs its weights as integer tensors that no other
     engine here can load.
 
-    Two honest caveats, recorded rather than papered over: an
+    One honest caveat, recorded rather than papered over: an
     *unquantized* MLX conversion carries no such block and reads as
     a plain safetensors directory — absence means unknown, not
-    incompatible — and `parameters` for an MLX-quantized directory
-    counts packed storage elements rather than model parameters, so
-    per-parameter arithmetic must not be built on it.
+    incompatible. `parameters` for an MLX-quantized directory is the
+    model's parameter count, recovered from the packed storage (each
+    quantized module holds its `scales` times its group size); it
+    is absent when a group size cannot be read. Until A4
+    (2026-09-30) it counted packed storage elements instead, which
+    read a 0.6B model as 93M.
 
     """
 

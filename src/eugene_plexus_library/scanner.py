@@ -507,6 +507,7 @@ class Scanner:
 
         parameters = 0
         dtype_counts: dict[str, int] = {}
+        elements: dict[str, int] = {}
         for name in weight_names:
             try:
                 header = safetensors.read_header(directory / name)
@@ -515,6 +516,11 @@ class Scanner:
             parameters += header.parameters
             for dtype, count in header.dtype_counts.items():
                 dtype_counts[dtype] = dtype_counts.get(dtype, 0) + count
+            elements.update(header.elements)
+        quantization = config.raw.get("quantization")
+        if isinstance(quantization, dict):
+            # An MLX conversion stores packed words, not parameters (A4).
+            parameters = safetensors.mlx_parameters(elements, quantization) or 0
 
         files = self._safetensors_files(entries, weight_names[0])
         shards = sum(1 for n in weight_names if safetensors.shard_position(Path(n)) is not None)
@@ -537,9 +543,7 @@ class Scanner:
                 chat=not config.is_embedding,
                 embedding=config.is_embedding,
                 vision=False,
-                chatTemplate=(
-                    "chat_template" in config.raw or (directory / "chat_template.jinja").exists()
-                ),
+                chatTemplate=safetensors.has_chat_template(directory, config.raw),
             ),
             files=files,
             safetensors=SafetensorsDetail(

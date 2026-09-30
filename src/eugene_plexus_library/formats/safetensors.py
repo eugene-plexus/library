@@ -109,11 +109,51 @@ class SafetensorsHeader:
 
     dtype_counts: dict[str, int] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    elements: dict[str, int] = field(default_factory=dict)
+    """Stored elements per tensor, which is what `mlx_parameters` needs to
+    tell packed storage from parameters."""
 
     @property
     def dominant_dtype(self) -> str | None:
         """The dtype most of this file's weights are in."""
         return dominant_dtype(self.dtype_counts)
+
+
+def mlx_parameters(elements: dict[str, int], quantization: dict[str, Any]) -> int | None:
+    """Model parameters of an MLX-quantized directory, from its packed storage.
+
+    **Why (A4, 2026-09-30).** The library reported
+    `mlx-community/Qwen3-0.6B-4bit` as 93,188,096 parameters, on a GitHub
+    macOS runner: summed shapes count storage elements, and MLX's
+    `QuantizedLinear` stores `<module>.weight` as uint32 words holding
+    32/bits values each, beside `<module>.scales` and `<module>.biases`,
+    one of each per group of `group_size` inputs. So a quantized module
+    holds `scales x group_size` parameters, whatever width packed them,
+    and its scales and biases are bookkeeping. A module the conversion
+    left unquantized (a norm, say) has no `.scales` and counts as stored.
+
+    `quantization` is `config.json`'s top-level block: its `group_size`,
+    and a per-module entry wherever the conversion chose differently.
+    None when a quantized module's group size cannot be read, since an
+    absent count is honest and a wrong one is not.
+    """
+    default_group = quantization.get("group_size")
+    total = 0
+    for name, count in elements.items():
+        if name.endswith(".scales"):
+            module = name[: -len(".scales")]
+            override = quantization.get(module)
+            group = override.get("group_size") if isinstance(override, dict) else default_group
+            if not isinstance(group, int) or isinstance(group, bool) or group <= 0:
+                return None
+            total += count * group
+        elif (
+            name.endswith((".weight", ".biases")) and f"{name.rsplit('.', 1)[0]}.scales" in elements
+        ):
+            continue
+        else:
+            total += count
+    return total
 
 
 def dominant_dtype(counts: dict[str, int]) -> str | None:
@@ -179,6 +219,7 @@ def parse_header(raw: bytes, *, name: str = "<stream>") -> SafetensorsHeader:
 
     parameters = 0
     dtype_counts: dict[str, int] = {}
+    elements: dict[str, int] = {}
     for tensor_name, entry in header.items():
         if not isinstance(entry, dict):
             raise SafetensorsError(f"{name}: tensor {tensor_name!r} is not an object")
@@ -193,6 +234,7 @@ def parse_header(raw: bytes, *, name: str = "<stream>") -> SafetensorsHeader:
             count *= dimension
         parameters += count
         dtype_counts[dtype] = dtype_counts.get(dtype, 0) + count
+        elements[tensor_name] = count
 
     return SafetensorsHeader(
         header_bytes=8 + len(raw),
@@ -200,7 +242,29 @@ def parse_header(raw: bytes, *, name: str = "<stream>") -> SafetensorsHeader:
         parameters=parameters,
         dtype_counts=dtype_counts,
         metadata=metadata,
+        elements=elements,
     )
+
+
+def has_chat_template(directory: Path, config: dict[str, Any]) -> bool:
+    """Whether a HuggingFace directory carries a chat template.
+
+    **Three places, and the commonest was missed (A4, 2026-09-30).** A
+    template lives in `tokenizer_config.json` for most models, as
+    `chat_template`; newer exports write `chat_template.jinja` (or
+    `chat_template.json`) beside it; `config.json` rarely holds one. The
+    library read only the last two, so `mlx-community/Qwen3-0.6B-4bit`,
+    whose template is in its tokenizer config, read as having none.
+    """
+    if "chat_template" in config:
+        return True
+    if (directory / "chat_template.jinja").exists() or (directory / "chat_template.json").exists():
+        return True
+    try:
+        tokenizer = json.loads((directory / "tokenizer_config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(tokenizer, dict) and bool(tokenizer.get("chat_template"))
 
 
 @dataclass
