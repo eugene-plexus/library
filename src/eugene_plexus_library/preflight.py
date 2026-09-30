@@ -282,7 +282,11 @@ async def read_gguf_header(
                 status=502,
             )
         try:
-            meta = gguf.read_metadata_stream(io.BytesIO(buffer), name=PurePosixPath(path).name)
+            # The tensor table too, for expert bytes; it follows the KV
+            # block, so the window grows to it the same way.
+            meta = gguf.read_metadata_stream(
+                io.BytesIO(buffer), name=PurePosixPath(path).name, tensors=True
+            )
         except gguf.GgufTruncated as exc:
             if len(buffer) < window:
                 # The file itself is shorter than the window, so there
@@ -408,6 +412,8 @@ async def preflight(
                 context_length=context_length,
                 shape=shape,
                 kv_cache_type=kv_cache_type,
+                # One part's table is not a sharded model's: unknown then.
+                expert_bytes=meta.expert_bytes if (meta.shard_count or 1) == 1 else None,
             ),
         )
 

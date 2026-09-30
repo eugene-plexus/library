@@ -234,6 +234,14 @@ class GgufMetadata:
     """Element counts for arrays that were stepped over rather than
     read. `tokenizer.ggml.tokens` here is the vocabulary size."""
 
+    tensor_bytes: int | None = None
+    """Every tensor's data size summed from the tensor table, or None when
+    the table was not read or named a type this reader does not know."""
+
+    expert_bytes: int | None = None
+    """The MoE expert tensors' share of `tensor_bytes` (0 for a dense
+    model), under the same conditions. See `read_tensor_table`."""
+
     @property
     def architecture(self) -> str | None:
         value = self.kv.get("general.architecture")
@@ -456,8 +464,8 @@ class _Reader:
         return self._pos
 
 
-def read_metadata(path: Path) -> GgufMetadata:
-    """Read one GGUF file's header and KV block.
+def read_metadata(path: Path, *, tensors: bool = False) -> GgufMetadata:
+    """Read one GGUF file's header and KV block, and optionally its tensor table.
 
     Raises `GgufError` for anything that is not a readable GGUF —
     including a file that merely has the extension. `OSError` is left to
@@ -466,10 +474,91 @@ def read_metadata(path: Path) -> GgufMetadata:
     as a malformed one.
     """
     with path.open("rb") as fh:
-        return read_metadata_stream(fh, name=path.name)
+        return read_metadata_stream(fh, name=path.name, tensors=tensors)
 
 
-def read_metadata_stream(fh: BinaryIO, *, name: str = "<stream>") -> GgufMetadata:
+# ggml's own type table: (elements per block, bytes per block), by the
+# `ggml_type` id stored for each tensor. Checked 2026-09-30 by summing the
+# table for two real files against their data regions (Qwen3-30B-A3B
+# Q4_K_M and UD-Q3_K_XL): equal to within alignment padding. An id not
+# here is a type this reader will not size, and says so with None rather
+# than guessing -- the module's rule.
+GGML_TYPE_SIZES: dict[int, tuple[int, int]] = {
+    0: (1, 4),  # F32
+    1: (1, 2),  # F16
+    2: (32, 18),  # Q4_0
+    3: (32, 20),  # Q4_1
+    6: (32, 22),  # Q5_0
+    7: (32, 24),  # Q5_1
+    8: (32, 34),  # Q8_0
+    9: (32, 36),  # Q8_1
+    10: (256, 84),  # Q2_K
+    11: (256, 110),  # Q3_K
+    12: (256, 144),  # Q4_K
+    13: (256, 176),  # Q5_K
+    14: (256, 210),  # Q6_K
+    15: (256, 292),  # Q8_K
+    16: (256, 66),  # IQ2_XXS
+    17: (256, 74),  # IQ2_XS
+    18: (256, 98),  # IQ3_XXS
+    19: (256, 50),  # IQ1_S
+    20: (32, 18),  # IQ4_NL
+    21: (256, 110),  # IQ3_S
+    22: (256, 82),  # IQ2_S
+    23: (256, 136),  # IQ4_XS
+    24: (1, 1),  # I8
+    25: (1, 2),  # I16
+    26: (1, 4),  # I32
+    27: (1, 8),  # I64
+    28: (1, 8),  # F64
+    29: (256, 56),  # IQ1_M
+    30: (1, 2),  # BF16
+    34: (256, 54),  # TQ1_0
+    35: (256, 66),  # TQ2_0
+    39: (32, 17),  # MXFP4
+}
+# MoE expert tensors: `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`,
+# `ffn_gate_up_exps`, and the chunked `_chexps` forms llama.cpp's own fit
+# names in its placements. A shared expert (`_shexp`) is always active and
+# stays with the rest.
+_EXPERT_TENSOR = re.compile(r"_(?:ch)?exps(?:\.|$)")
+_MAX_TENSORS = 1 << 20
+_MAX_DIMS = 8
+
+
+def is_expert_tensor(name: str) -> bool:
+    return _EXPERT_TENSOR.search(name) is not None
+
+
+def _read_tensor_table(reader: _Reader, count: int) -> tuple[int | None, int | None]:
+    """Sum every tensor's bytes and the experts' share, from the table alone."""
+    total = 0
+    experts = 0
+    known = True
+    for _ in range(min(count, _MAX_TENSORS)):
+        name = reader.string()
+        dims = int(reader.scalar(T_UINT32))
+        if dims < 1 or dims > _MAX_DIMS:
+            raise reader._fail(f"implausible dimension count {dims} for tensor {name!r}")
+        elements = 1
+        for _ in range(dims):
+            elements *= int(reader.scalar(T_UINT64))
+        ggml_type = int(reader.scalar(T_UINT32))
+        reader.scalar(T_UINT64)  # offset
+        size = GGML_TYPE_SIZES.get(ggml_type)
+        if size is None or elements % size[0]:
+            known = False
+            continue
+        nbytes = elements // size[0] * size[1]
+        total += nbytes
+        if is_expert_tensor(name):
+            experts += nbytes
+    return (total, experts) if known else (None, None)
+
+
+def read_metadata_stream(
+    fh: BinaryIO, *, name: str = "<stream>", tensors: bool = False
+) -> GgufMetadata:
     """The same parse, over any seekable binary stream.
 
     Exists so a *remote* header can be read: M3's preflight fetches the
@@ -501,14 +590,25 @@ def read_metadata_stream(fh: BinaryIO, *, name: str = "<stream>") -> GgufMetadat
         key = reader.string()
         tag = int(reader.scalar(T_UINT32))
         kv[key] = reader.value(tag, key=key, lengths=lengths)
+    header_bytes = reader.tell()
+
+    # The tensor table follows the KV block: names, shapes, types and
+    # offsets, a few kilobytes, never a weight. Read on request only, so a
+    # remote preflight's window is unchanged unless it asks for it.
+    tensor_bytes: int | None = None
+    expert_bytes: int | None = None
+    if tensors:
+        tensor_bytes, expert_bytes = _read_tensor_table(reader, tensor_count)
 
     return GgufMetadata(
         version=version,
         tensor_count=tensor_count,
         kv_count=kv_count,
-        header_bytes=reader.tell(),
+        header_bytes=header_bytes,
         kv=kv,
         array_lengths=lengths,
+        tensor_bytes=tensor_bytes,
+        expert_bytes=expert_bytes,
     )
 
 

@@ -46,6 +46,7 @@ from typing import Any
 from ._generated.models import (
     Basis,
     Fit,
+    FitOffload,
     FitVerdict,
     HostHardware,
     KvCacheType,
@@ -457,6 +458,7 @@ def compute(
     shape: ModelShape | None = None,
     kv_cache_type: KvCacheType = KvCacheType.f16,
     overhead_bytes: int = DEFAULT_OVERHEAD_BYTES,
+    expert_bytes: int | None = None,
 ) -> Fit:
     """Score one candidate. Reports its own inputs, always.
 
@@ -464,6 +466,11 @@ def compute(
     and this one will sometimes be wrong — so `notes` carries the
     assumptions in words and `basis` says whether the KV term came from
     metadata or from a guess with a number on it.
+
+    `expert_bytes` is the MoE expert tensors' share of the weights (0 for
+    a dense model, None when unknown). It does not change the verdict,
+    which is about whether the bytes fit anywhere; it decides `offload`,
+    how a `tight` or `split` would run (moe-aware-fit §1.3).
     """
     notes: list[str] = []
     shape = shape or ModelShape()
@@ -536,8 +543,23 @@ def compute(
         notes.append("scored against a caller-supplied budget, not this host's detected memory")
 
     required = weights_bytes + kv_bytes + overhead_total
+    verdict = _verdict(required, budget)
+    offload = offload_for(
+        verdict,
+        weights_bytes=weights_bytes,
+        expert_bytes=expert_bytes,
+        kv_bytes=kv_bytes,
+        overhead_bytes=overhead_total,
+        budget=budget,
+    )
+    if offload is FitOffload.experts:
+        notes.append(
+            f"a mixture-of-experts model: its {format_bytes(weights_bytes - (expert_bytes or 0))} "
+            "of non-expert weights and the cache fit on the card, so llama.cpp can keep every "
+            f"layer there and move expert weights ({format_bytes(expert_bytes)}) to system memory"
+        )
     return Fit(
-        verdict=_verdict(required, budget),
+        verdict=verdict,
         requiredBytes=required,
         weightsBytes=weights_bytes,
         kvCacheBytes=kv_bytes,
@@ -547,8 +569,84 @@ def compute(
         attentionLayers=shape.effective_attention_layers,
         basis=basis,
         budget=budget,
+        expertBytes=expert_bytes,
+        offload=offload,
         notes=notes,
     )
+
+
+def offload_for(
+    verdict: FitVerdict,
+    *,
+    weights_bytes: int,
+    expert_bytes: int | None,
+    kv_bytes: int,
+    overhead_bytes: int,
+    budget: MemoryBudget,
+) -> FitOffload | None:
+    """How a `tight` or `split` would run: experts to system memory, or layers.
+
+    `experts` when the model has expert tensors and everything else — the
+    non-expert weights, the cache and the overhead — fits in free VRAM:
+    then llama.cpp's fit keeps every layer on the card and moves only
+    expert weights (profile-builder §0 M2), measured at 46.5 tok/s for a
+    30B-A3B on 8 GB where the dense 27B, moved by whole layers, ran at 4.9.
+    `layers` otherwise. None when the verdict involves no offload or the
+    expert share is unknown: a description made without the number would
+    be a guess.
+    """
+    if verdict not in (FitVerdict.tight, FitVerdict.split):
+        return None
+    if expert_bytes is None:
+        return None
+    if expert_bytes <= 0:
+        return FitOffload.layers
+    on_card = weights_bytes - expert_bytes + kv_bytes + overhead_bytes
+    return FitOffload.experts if on_card <= (budget.vramFreeBytes or 0) else FitOffload.layers
+
+
+def max_context_experts_in_ram(
+    *,
+    weights_bytes: int,
+    expert_bytes: int | None,
+    budget: MemoryBudget,
+    shape: ModelShape,
+    kv_cache_type: KvCacheType = KvCacheType.f16,
+    overhead_bytes: int = DEFAULT_OVERHEAD_BYTES,
+    ceiling: int | None = None,
+) -> int | None:
+    """Longest context with every layer on the card and experts in system memory.
+
+    The card holds the non-expert weights, the cache and the overhead;
+    system memory must hold the experts. Solved like `max_context_that_fits`
+    (the cache is affine in context), then capped by what VRAM and RAM hold
+    together. None for a dense model, an unknown expert share, a budget
+    with no card, or when even the non-expert part does not fit.
+    """
+    if not expert_bytes or expert_bytes <= 0:
+        return None
+    terms = shape.kv_terms(kv_cache_type)
+    if terms is None or terms[0] <= 0:
+        return None
+    per_token, fixed = terms
+    vram_free = budget.vramFreeBytes or 0
+    ram_available = budget.ramAvailableBytes or 0
+    if vram_free <= 0 or budget.unifiedMemory:
+        return None
+    overhead = overhead_for(budget, overhead_bytes)
+    on_card = vram_free - overhead - (weights_bytes - expert_bytes) - fixed
+    if on_card <= 0:
+        return None
+    # Everything must also fit somewhere: weights + cache + overhead within
+    # the card and system memory together.
+    overall = vram_free + ram_available - overhead - weights_bytes - fixed
+    context = int(min(on_card, overall) // per_token)
+    limit = ceiling if ceiling is not None else shape.context_length
+    if limit:
+        context = min(context, limit)
+    if context < 256:
+        return context if context > 0 else None
+    return (context // 256) * 256
 
 
 def max_context_that_fits(

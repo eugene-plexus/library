@@ -184,6 +184,41 @@ def _stat_size(entry: os.DirEntry[str]) -> int | None:
         return None
 
 
+def _lacks_expert_bytes(model: LibraryModel) -> bool:
+    """A GGUF entry cached before the tensor table was read (2026-09-30).
+
+    Re-read once rather than served: without `expertBytes` a MoE model's
+    fit cannot say that its experts, not its layers, would move, and a
+    library that never re-scans would never learn it. One header read per
+    model, after which the entry carries the number and is cached again.
+    """
+    return (
+        model.format is ModelFormat.gguf
+        and model.gguf is not None
+        and model.gguf.expertBytes is None
+    )
+
+
+def _expert_bytes(metadata: gguf.GgufMetadata, shards: list[os.DirEntry[str]]) -> int | None:
+    """Expert bytes across every part of a model; None if any part is unknown.
+
+    A sharded model's tensors are spread over its parts, each with its own
+    table, so the first part's table is not the model's.
+    """
+    total = metadata.expert_bytes
+    if total is None:
+        return None
+    for entry in shards:
+        try:
+            part = gguf.read_metadata(Path(entry.path), tensors=True).expert_bytes
+        except (gguf.GgufError, OSError):
+            return None
+        if part is None:
+            return None
+        total += part
+    return total
+
+
 class Scanner:
     """Walks roots and produces models.
 
@@ -688,7 +723,7 @@ class Scanner:
                 return
 
             cached = self._cache_lookup(cache_key(path, stat))
-            if cached is not None:
+            if cached is not None and not _lacks_expert_bytes(cached):
                 cached_models.append(cached)
                 return
 
@@ -758,7 +793,8 @@ class Scanner:
 
     def _read_gguf(self, path: Path, result: ScanResult) -> gguf.GgufMetadata | None:
         try:
-            return gguf.read_metadata(path)
+            # The tensor table too, for `expertBytes` (moe-aware-fit §1.2).
+            return gguf.read_metadata(path, tensors=True)
         except gguf.GgufError as exc:
             detail = str(exc)
         except OSError as exc:
@@ -807,6 +843,7 @@ class Scanner:
         name = display_name(path)
         declared = metadata.name
         sampling = metadata.recommended_sampling
+        expert_bytes = _expert_bytes(metadata, shards)
 
         return LibraryModel(
             id=model_id(path),
@@ -838,6 +875,7 @@ class Scanner:
                 ggufVersion=metadata.version,
                 shardCount=len(shards) + 1,
                 vocabSize=metadata.vocab_size,
+                expertBytes=expert_bytes,
                 projectorPath=projector.path if projector is not None else None,
                 recommendedSampling=(
                     RecommendedSampling(

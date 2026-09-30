@@ -1863,6 +1863,26 @@ class Basis(StrEnum):
     estimate = 'estimate'
 
 
+class FitOffload(StrEnum):
+    """
+    How a verdict of `tight` or `split` would run, because the two
+    differ by an order of magnitude and one word covered both
+    (`docs/design/moe-aware-fit.md` §0 M2-M3):
+    * `experts` — a MoE model whose non-expert weights, cache and
+      overhead fit in free VRAM. llama.cpp keeps every layer on the
+      card and moves only expert weights to system memory: measured
+      at 46.5 tok/s for a 30B-A3B on an 8 GB budget.
+    * `layers` — whole layers move to system memory: measured at 4.9
+      tok/s for a dense 27B on the same budget.
+    It describes placement, never a predicted speed; the profile
+    builder measures that.
+
+    """
+
+    experts = 'experts'
+    layers = 'layers'
+
+
 class FitVerdict(StrEnum):
     """
     * `fits` — inside **free** VRAM. Fully offloaded, no host memory
@@ -1871,8 +1891,9 @@ class FitVerdict(StrEnum):
       an idle GPU; something is holding memory right now, and
       closing it is the operator's call.
     * `split` — needs host memory as well. Runnable with partial
-      offload, materially slower, and a decision rather than a
-      failure.
+      offload, and a decision rather than a failure. How much slower
+      depends on what moves, which `Fit.offload` says: experts (a
+      MoE model, little slower) or whole layers (much slower).
     * `no` — larger than VRAM and RAM together.
     * `unknown` — there is a GPU here and we could not read how much
       memory it has, so no comparison against it can be made. Added
@@ -2218,6 +2239,11 @@ class GgufDetail(BaseModel):
         description='Token count. Worth reporting for its own sake and because it\nexplains the scan cost: the tokenizer lives in the KV block,\nso a 248k-token vocab means ~10.9 MB of metadata to walk\npast before the quant can be read.\n',
         ge=0,
     )
+    expertBytes: int | None = Field(
+        None,
+        description='Bytes of mixture-of-experts expert tensors (names carrying\n`_exps`), summed from the tensor table that follows the KV\nblock: names, shapes and offsets, never a weight. 0 for a\ndense model. Null when the table was not read (a scan from\nbefore 2026-09-30, or a header cut short).\n\nThe number that tells a MoE model from a dense one of the\nsame size: on Qwen3-30B-A3B Q4_K_M it is 16.35 GiB of 17.28,\nand everything else is 0.93 GiB, so a small card holds all of\nthat plus the cache and llama.cpp moves only experts to system\nmemory (`docs/design/moe-aware-fit.md` §0).\n',
+        ge=0,
+    )
     projectorPath: str | None = Field(
         None,
         description='Absolute path to the vision projector found beside this\nmodel, if any. Becomes `--mmproj` on the launch line.\nllama-server can also find it unaided, but it is reported\nbecause "this model can see" is a fact the browser should\nshow and a profile should be able to override.\n',
@@ -2387,6 +2413,15 @@ class Fit(BaseModel):
         description='`metadata` when the model\'s own declared shape produced the\nKV term, whether read locally or by remote preflight.\n`estimate` when only file size was available or when a\nscalar fallback replaces declared per-layer attention terms\nthat were not retained. Local models and preflighted files\ncan therefore still report `estimate`; `notes` explains why.\n\nThe honest distinction between "this is arithmetic" and\n"this is a guess with a number on it", and the field a UI\nshould hang a "check this file" affordance off.\n',
     )
     budget: MemoryBudget | None = None
+    expertBytes: int | None = Field(
+        None,
+        description='The part of `weightsBytes` that is MoE expert tensors; null when unknown, 0 for a dense model.',
+        ge=0,
+    )
+    offload: FitOffload | None = Field(
+        None,
+        description='Null for `fits`, `no` and `unknown`, and when expert sizes are not known.',
+    )
     notes: list[str] | None = Field(
         None,
         description='The assumptions in words: full offload, F16 KV cache, layer\ncount assumed to be attention count, the overhead allowance\nused. Guidance that does not state its assumptions cannot be\nargued with, and this one will sometimes be wrong.\n',
@@ -2409,6 +2444,11 @@ class ModelFit(BaseModel):
     modelContextLength: int | None = Field(
         None,
         description="What the model was trained for, for comparison. These two\nare frequently far apart — a current 27B declares 262144 and\nalmost nobody can hold that — and showing only the model's\nnumber is the comfortable lie M2 named.\n",
+        ge=0,
+    )
+    maxContextExpertsInRam: int | None = Field(
+        None,
+        description='For a MoE model: the largest context whose non-expert\nweights, cache and overhead fit in free VRAM with every expert\nin system memory (which must hold them). The number for a card\nsmaller than the file, where `maxContextLength` is absent or\nsmall: it is how long a conversation can be while llama.cpp\nkeeps every layer on the card. Null for a dense model, or when\nexpert sizes or system memory do not allow it.\n',
         ge=0,
     )
 

@@ -183,6 +183,7 @@ async def get_model_fit(
         else 0
     )
     weights_bytes = max(0, (model.sizeBytes or 0) - projector_bytes)
+    expert_bytes = model.gguf.expertBytes if model.gguf is not None else None
 
     result = fit_mod.compute(
         weights_bytes=weights_bytes,
@@ -190,6 +191,7 @@ async def get_model_fit(
         context_length=context,
         shape=shape,
         kv_cache_type=kvCacheType,
+        expert_bytes=expert_bytes,
     )
     if projector_bytes:
         result.notes = [
@@ -208,6 +210,13 @@ async def get_model_fit(
             kv_cache_type=kvCacheType,
         ),
         modelContextLength=model.contextLength,
+        maxContextExpertsInRam=fit_mod.max_context_experts_in_ram(
+            weights_bytes=weights_bytes,
+            expert_bytes=expert_bytes,
+            budget=budget,
+            shape=shape,
+            kv_cache_type=kvCacheType,
+        ),
     )
 
 
