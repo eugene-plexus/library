@@ -20,7 +20,7 @@
 # Every number under `recommended:` and `shape:` was measured from the
 # file itself, which is what lets `GET /v1/catalogue/starter` score a
 # fit with no upstream call at all.
-reviewed: '2026-09-16'
+reviewed: '2026-09-30'
 engine: llama_cpp b10999
 classes:
 - class: 4B
@@ -36,7 +36,7 @@ classes:
     downloads30d: 1764959
     repos: [unsloth/Qwen3.5-4B-GGUF, bartowski/Qwen_Qwen3.5-4B-GGUF, Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-GGUF,
       lmstudio-community/Qwen3.5-4B-GGUF]
-    consecutiveReviewsAtTop: 1
+    consecutiveReviewsAtTop: 2
   recommended: {file: Qwen3.5-4B-Q4_K_M.gguf, label: Q4_K_M, sizeBytes: 2740937888, bitsPerWeight: 5.21}
   shape: {blockCount: 32, attentionLayers: 8, headCountKv: 4, keyLength: 256, valueLength: 256, embeddingLength: 2560,
     headCount: 16}
@@ -53,7 +53,7 @@ classes:
     downloads30d: 4661836
     repos: [HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive, ggml-org/gemma-4-E4B-it-GGUF, lmstudio-community/gemma-4-E4B-it-GGUF,
       unsloth/gemma-4-E4B-it-GGUF]
-    consecutiveReviewsAtTop: 1
+    consecutiveReviewsAtTop: 2
   recommended: {file: gemma-4-E4B-it-Q4_K_M.gguf, label: Q4_K_M, sizeBytes: 5335291936, bitsPerWeight: 5.68}
   shape:
     blockCount: 42
@@ -92,7 +92,7 @@ classes:
     repos: [yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF, unsloth/gemma-4-12b-it-GGUF,
       HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced, yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF,
       lmstudio-community/gemma-4-12B-it-GGUF]
-    consecutiveReviewsAtTop: 1
+    consecutiveReviewsAtTop: 2
   recommended: {file: gemma-4-12b-it-Q4_K_M.gguf, label: Q4_K_M, sizeBytes: 7121861440, bitsPerWeight: 4.78}
   shape:
     blockCount: 48
@@ -132,7 +132,25 @@ classes:
     repos: [unsloth/Qwen3.8-27B-GGUF, huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF, JonathanColetti/Qwen3.8-27B-Uncensored-GGUF,
       HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF, lmstudio-community/Qwen3.8-27B-GGUF,
       0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF]
-    consecutiveReviewsAtTop: 1
+    consecutiveReviewsAtTop: 2
   recommended: {file: Qwen3.8-27B-UD-Q4_K_M.gguf, label: UD-Q4_K_M, sizeBytes: 16464440224, bitsPerWeight: 4.82}
   shape: {blockCount: 65, attentionLayers: 16, headCountKv: 4, keyLength: 256, valueLength: 256, embeddingLength: 5120,
     headCount: 24}
+- class: 30B MoE
+  baseModel: Qwen/Qwen3.6-35B-A3B
+  repo: unsloth/Qwen3.6-35B-A3B-GGUF
+  why: most-downloaded well-known instruct GGUF in its size class over the last 30 days (4,338,121 downloads
+    across 8 repos)
+  license: apache-2.0
+  parameters: 34660610688
+  architecture: qwen35moe
+  contextLength: 262144
+  evidence:
+    downloads30d: 4338121
+    repos: [unsloth/Qwen3.6-35B-A3B-GGUF, unsloth/Qwen3.6-35B-A3B-MTP-GGUF, HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive,
+      michaelw9999/Qwen3.6-35B-A3B-NVFP4-MTP-GGUF, bartowski/Qwen_Qwen3.6-35B-A3B-GGUF, mudler/Qwen3.6-35B-A3B-APEX-GGUF]
+    consecutiveReviewsAtTop: 1
+  recommended: {file: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf, label: UD-Q4_K_M, sizeBytes: 22134528992, bitsPerWeight: 5.11,
+    expertBytes: 19568525312}
+  shape: {blockCount: 40, attentionLayers: 10, headCountKv: 2, keyLength: 256, valueLength: 256, embeddingLength: 2048,
+    headCount: 16}
