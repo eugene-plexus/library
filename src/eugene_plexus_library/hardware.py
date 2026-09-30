@@ -27,9 +27,11 @@ added there too — a lesson this project has now learned four times.
 
 ## What is unverified, and says so
 
-Only NVIDIA-on-Windows detection has been run against real hardware.
-AMD, Intel, and Apple unified memory are written from their tools'
-documented output and are **untested**; each failure appends to
+Only NVIDIA-on-Windows detection has been run against real hardware,
+and Apple silicon against a virtual Mac: GitHub's macOS runners, where
+the budget is Metal's own working-set figure (A4, 2026-09-30). AMD and
+Intel are written from their tools' documented output and are
+**untested**; each failure appends to
 `warnings` rather than defaulting silently, because a fit verdict
 computed from a wrong budget is worse than no verdict.
 
@@ -51,6 +53,7 @@ import shutil
 import socket
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from . import gpu_probe
@@ -66,12 +69,15 @@ handler, so it is bounded."""
 MIB = 1024 * 1024
 GIB = 1024 * 1024 * 1024
 
-APPLE_WIRED_LIMIT_FRACTION = 0.75
-"""macOS reserves part of unified memory for the CPU side. The default
-wired limit is roughly 75% of RAM (`iogpu.wired_limit_pct`), which is
-what an engine can actually claim for weights. Reported as the GPU's
-"VRAM" on Apple silicon because that is the number that decides whether
-a model loads."""
+APPLE_WIRED_LIMIT_FRACTION = 2 / 3
+"""macOS reserves part of unified memory for the CPU side; what the GPU
+may hold is Metal's `recommendedMaxWorkingSetSize`, which
+`gpu_probe.metal_device()` reads from Metal itself and which is reported
+as the GPU's "VRAM" on Apple silicon, because that is the number that
+decides whether a model loads. This fraction is only the fallback when
+Metal cannot be asked. It was 0.75, from documentation; Metal reports two
+thirds on every GitHub macOS runner measured (A4, 2026-09-30), and the
+agent carries the same figure."""
 
 
 class _MemoryStatusEx(ctypes.Structure):
@@ -389,24 +395,40 @@ def _intel_gpus(warnings: list[str]) -> list[Gpu]:
     return gpus
 
 
-def _apple_gpu(ram_total: int | None, warnings: list[str]) -> list[Gpu]:
-    """UNVERIFIED — written from Apple's documented behaviour.
+def _apple_chip() -> str | None:
+    """`Apple M2 Pro`, where `platform.processor()` says only `arm`."""
+    return (_run(["sysctl", "-n", "machdep.cpu.brand_string"]) or "").strip() or None
 
-    On Apple silicon there is no separate VRAM pool: the GPU addresses
-    host RAM, capped by the wired limit. Reporting `vramTotalBytes: 0`
-    here would tell a 96 GB M-series Mac it has no GPU, which is the
-    single worst answer this component could give.
+
+def _apple_gpu(
+    ram_total: int | None,
+    warnings: list[str],
+    metal: Callable[[], gpu_probe.MetalDevice | None] | None = None,
+) -> list[Gpu]:
+    """On Apple silicon there is no separate VRAM pool: the GPU addresses
+    host RAM, up to the working set Metal allows. Reporting
+    `vramTotalBytes: 0` here would tell a 96 GB M-series Mac it has no
+    GPU, which is the single worst answer this component could give.
+
+    The budget is Metal's own `recommendedMaxWorkingSetSize`, read on this
+    host (A4, 2026-09-30: it matched MLX's figure on GitHub's macOS
+    runners). Only when Metal cannot be asked is it a fraction of RAM, and
+    then a warning says so.
     """
-    if ram_total is None:
+    device = (metal or gpu_probe.metal_device)()
+    if device is not None:
+        budget = device.working_set_bytes
+        name = device.name or _apple_chip() or "Apple silicon"
+    elif ram_total is None:
         warnings.append("could not read total memory, so the unified-memory budget is unknown")
         return []
-    budget = int(ram_total * APPLE_WIRED_LIMIT_FRACTION)
-    name = platform.processor() or "Apple silicon"
-    warnings.append(
-        f"unified memory: reporting {APPLE_WIRED_LIMIT_FRACTION:.0%} of RAM as the GPU budget, "
-        "which is the default iogpu.wired_limit_pct. Raise that limit and more is available. "
-        "This path is untested on real hardware."
-    )
+    else:
+        budget = int(ram_total * APPLE_WIRED_LIMIT_FRACTION)
+        name = _apple_chip() or "Apple silicon"
+        warnings.append(
+            f"unified memory: Metal could not be asked for its working-set limit, so "
+            f"{APPLE_WIRED_LIMIT_FRACTION:.0%} of RAM is reported as the GPU budget"
+        )
     return [
         Gpu(
             index=0,
