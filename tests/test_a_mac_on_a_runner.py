@@ -163,3 +163,15 @@ def test_the_chat_template_is_found_where_models_keep_it(
     [model] = Scanner().scan([models_dir]).models
     assert model.capabilities is not None
     assert model.capabilities.chatTemplate is expected
+
+
+def test_a_wired_limit_someone_set_is_the_working_set() -> None:
+    """After `sudo sysctl iogpu.wired_limit_mb=5973` a new process's Metal
+    device reported 6,263,144,448 bytes (5973 MiB exactly), and a running
+    one kept its old figure, so the sysctl is read on every call."""
+    assert gpu_probe.working_set_bytes(5_010_800_640, 5973) == 6_263_144_448
+
+
+def test_the_default_wired_limit_means_metals_own_figure() -> None:
+    assert gpu_probe.working_set_bytes(5_010_800_640, 0) == 5_010_800_640
+    assert gpu_probe.working_set_bytes(5_010_800_640, None) == 5_010_800_640
