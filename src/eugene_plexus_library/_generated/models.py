@@ -1740,7 +1740,7 @@ class StarterRecommendation(BaseModel):
     )
     reason: str = Field(
         ...,
-        description='Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n',
+        description='Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n\nA mixture-of-experts entry may be recommended where it runs\nwith its experts in system memory: the card holds the rest\nand the cache, and system memory holds the experts. It wins\nonly over a dense entry of a smaller size class; between two\nentries of one class that both fit, the dense one is\nrecommended. The prose names what goes where. No speed is\npredicted.\n',
     )
 
 
@@ -2899,7 +2899,7 @@ class StarterModel(BaseModel):
 
     sizeClass: str = Field(
         ...,
-        description='The bucket this entry fills, by total parameter count:\n`4B`, `8B`, `14B`, `30B`, `70B`. Total, not active -- a\nmixture-of-experts model holds every expert in memory, so\n30B-A3B is a 30B for the only purpose this number serves.\n',
+        description='The bucket this entry fills, by total parameter count:\n`4B`, `8B`, `14B`, `30B`, `70B`, and `30B MoE`. Total, not\nactive -- a mixture-of-experts model holds every expert in\nmemory, so 30B-A3B is a 30B. It has a class of its own\nbecause where those bytes can go differs: its experts can sit\nin system memory while the rest runs on the card, which is\nhow a small card reaches a 30B (`fit.offload` is `experts`).\n',
     )
     baseModel: str = Field(
         ...,
@@ -2935,6 +2935,11 @@ class StarterModel(BaseModel):
     maxContextLength: int | None = Field(
         None,
         description='The largest context this entry fits entirely in GPU memory\nat, on the scored machine. The number a profile takes, and\nthe reason a client can say *fits at 75,520* rather than\njust *fits*.\n',
+    )
+    maxContextExpertsInRam: int | None = Field(
+        None,
+        description='For a mixture-of-experts entry: the largest context with its\nexperts in system memory and everything else on the card,\nthe same number `ModelFit.maxContextExpertsInRam` gives for a\nmodel on disk. Null for a dense entry, or where the experts do\nnot fit in system memory.\n',
+        ge=0,
     )
     alreadyOwned: AlreadyOwned | None = None
 

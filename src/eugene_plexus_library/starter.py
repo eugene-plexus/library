@@ -40,6 +40,13 @@ is a decision someone should make knowingly rather than inherit from a
 default, and the first model a person ever runs is the worst possible
 place to hand them one that pages to host memory at three tokens a
 second.
+
+One exception, and it is measured rather than argued (moe-aware-fit
+§0): a mixture-of-experts entry may be recommended where it runs with
+its experts in system memory. llama.cpp keeps the rest on the card, and
+the 30B-A3B decodes at 46 tok/s on an 8 GB card where a dense 27B spilled
+by whole layers decodes at 4.9. It wins only over a dense entry of a
+smaller size class, so a card that holds the dense 30B still gets it.
 """
 
 from __future__ import annotations
@@ -55,6 +62,8 @@ import yaml
 from . import fit as fit_mod
 from ._generated.models import (
     AlreadyOwned,
+    FitOffload,
+    FitVerdict,
     KvCacheType,
     MatchedOn,
     MemoryBudget,
@@ -74,6 +83,58 @@ STALE_AFTER_DAYS = 30
 """What the release checklist calls stale. Repeated here rather than
 imported from the review, because this module is the one a person's
 browser reaches and the number has to be visible from the answer."""
+
+SIZE_CLASSES: list[tuple[str, int, int]] = [
+    # (name, min parameters inclusive, max exclusive). Total parameters,
+    # not active: every expert of a mixture-of-experts model is resident,
+    # so 30B-A3B occupies a 30B's worth of memory. Here rather than in
+    # the review because the recommendation compares classes too, and
+    # the review imports this module.
+    ("4B", 2_500_000_000, 6_000_000_000),
+    ("8B", 6_000_000_000, 11_000_000_000),
+    ("14B", 11_000_000_000, 20_000_000_000),
+    ("30B", 20_000_000_000, 40_000_000_000),
+    ("70B", 40_000_000_000, 90_000_000_000),
+]
+
+MOE_CLASSES: list[tuple[str, int, int]] = [
+    # One class, where a small card gains most: call B's "the difference
+    # between a 4-8B model and a 30B one". A 70B-class MoE is not a first
+    # model, because the download alone is 40 GB or more.
+    ("30B MoE", 20_000_000_000, 40_000_000_000),
+]
+
+
+def size_rank(parameters: int | None) -> int:
+    """How many size classes begin at or below this parameter count.
+
+    Comparable across dense and MoE entries, because both classes are cut
+    at total parameters. -1 when unknown, so an entry with no count never
+    outranks one that has one.
+    """
+    if parameters is None:
+        return -1
+    return sum(1 for _name, low, _high in SIZE_CLASSES if low <= parameters)
+
+
+def is_moe(model: StarterModel) -> bool:
+    """Measured, never read off a name: the fit's expert bytes."""
+    return bool(model.fit and model.fit.expertBytes)
+
+
+def _runs_here(model: StarterModel) -> bool:
+    """Entirely on the card, or a MoE entry with its experts in RAM.
+
+    `offload: experts` is set only on a `tight` or `split` verdict, which
+    already means the card and system memory together hold the model. So
+    `no` is never a candidate, and that is what "when RAM allows" (call B)
+    comes to.
+    """
+    if model.fit is None:
+        return False
+    if model.fit.verdict is FitVerdict.fits:
+        return True
+    return is_moe(model) and model.fit.offload is FitOffload.experts
 
 
 @dataclass(frozen=True)
@@ -96,6 +157,7 @@ class StarterEntry:
     context_length: int | None = None
     license: str | None = None
     downloads_30d: int | None = None
+    expert_bytes: int | None = None
     shape: fit_mod.ModelShape = field(default_factory=fit_mod.ModelShape)
 
 
@@ -193,6 +255,10 @@ def _entry(item: Any, *, index: int, notes: list[str]) -> StarterEntry | None:
         context_length=_as_int(item.get("contextLength")),
         license=_str_or_none(item.get("license")),
         downloads_30d=_as_int(evidence.get("downloads30d")),
+        # Measured from the file's tensor table by the review. Absent on
+        # every entry written before it was, which reads as unknown and
+        # so as dense for the pick: nothing is guessed from a name.
+        expert_bytes=_as_int(rec.get("expertBytes")),
         shape=fit_mod.ModelShape(
             block_count=_as_int(shape_raw.get("blockCount")),
             attention_layers=_as_int(shape_raw.get("attentionLayers")),
@@ -265,6 +331,7 @@ def _score(
         context_length=context_length,
         shape=entry.shape,
         kv_cache_type=kv,
+        expert_bytes=entry.expert_bytes,
     )
     return StarterModel(
         sizeClass=entry.size_class,
@@ -282,6 +349,13 @@ def _score(
         fit=fit,
         maxContextLength=fit_mod.max_context_that_fits(
             weights_bytes=entry.size_bytes,
+            budget=budget,
+            shape=entry.shape,
+            kv_cache_type=kv,
+        ),
+        maxContextExpertsInRam=fit_mod.max_context_experts_in_ram(
+            weights_bytes=entry.size_bytes,
+            expert_bytes=entry.expert_bytes,
             budget=budget,
             shape=entry.shape,
             kv_cache_type=kv,
@@ -337,8 +411,9 @@ def recommend(
             )
         )
 
-    fitting = [m for m in models if m.fit and m.fit.verdict.value == "fits"]
-    if not fitting:
+    fitting = [m for m in models if m.fit and m.fit.verdict is FitVerdict.fits]
+    candidates = [m for m in models if _runs_here(m)]
+    if not candidates:
         smallest = min(models, key=lambda m: m.sizeBytes)
         free = fit_mod.format_bytes(budget.vramFreeBytes or budget.ramAvailableBytes)
         return StarterRecommendation(
@@ -360,7 +435,9 @@ def recommend(
     # broken. The guidance record already has this mistake once, in the
     # other direction: a library measuring a NAS recommended a 57 GB
     # BF16 download for CPU inference to an operator holding a 5090.
-    if has_no_accelerator(budget):
+    # With no card nothing can sit "on the card", so a MoE entry is never
+    # an experts-in-RAM candidate here and `fitting` is every candidate.
+    if has_no_accelerator(budget) and fitting:
         best = min(fitting, key=lambda m: (m.sizeBytes, m.parameters or 0))
         assert best.fit is not None
         return StarterRecommendation(
@@ -375,8 +452,25 @@ def recommend(
             ),
         )
 
-    best = max(fitting, key=lambda m: (m.sizeBytes, m.parameters or 0))
+    def largest(rows: list[StarterModel]) -> StarterModel | None:
+        return max(rows, key=lambda m: (m.sizeBytes, m.parameters or 0)) if rows else None
+
+    dense = largest([m for m in candidates if not is_moe(m)])
+    moe = largest([m for m in candidates if is_moe(m)])
+    # The dense rule stands, and a MoE entry displaces its pick only from
+    # a larger size class. Between two entries of one class that both
+    # fit, the dense one is the recommendation.
+    pick = dense
+    if moe is not None and (
+        dense is None or size_rank(moe.parameters) > size_rank(dense.parameters)
+    ):
+        pick = moe
+    assert pick is not None
+    best = pick
     assert best.fit is not None
+    if best.fit.verdict is not FitVerdict.fits:
+        return _experts_in_ram(best, dense=dense, context_length=context_length, budget=budget)
+
     where = "GPU memory" if (budget.vramTotalBytes or 0) > 0 else "memory"
     reason = (
         f"{best.baseModel} is the largest of these that runs entirely in {where} with room "
@@ -388,6 +482,39 @@ def recommend(
     )
     if best.maxContextLength:
         reason += f" It fits up to {best.maxContextLength:,} tokens here."
+    return StarterRecommendation(sizeClass=best.sizeClass, reason=reason)
+
+
+def _experts_in_ram(
+    best: StarterModel,
+    *,
+    dense: StarterModel | None,
+    context_length: int,
+    budget: MemoryBudget,
+) -> StarterRecommendation:
+    """The words for a MoE pick that does not fit entirely.
+
+    They say what sits where, with the sizes, and predict no speed: the
+    profile builder is what measures one.
+    """
+    assert best.fit is not None
+    experts = best.fit.expertBytes or 0
+    on_card = best.fit.requiredBytes - experts
+    reason = (
+        f"{best.baseModel} runs here with its experts in system memory: {best.label}, "
+        f"{fit_mod.format_bytes(best.sizeBytes)} of weights, of which "
+        f"{fit_mod.format_bytes(experts)} are experts that llama.cpp keeps in system memory. "
+        f"The rest, with {fit_mod.format_bytes(best.fit.kvCacheBytes)} of KV cache for "
+        f"{context_length:,} tokens, takes {fit_mod.format_bytes(on_card)} "
+        f"of the {fit_mod.format_bytes(budget.vramFreeBytes)} free on the card."
+    )
+    if dense is not None:
+        reason += (
+            f" The largest of these that fits entirely on the card is {dense.baseModel}, a "
+            f"smaller model."
+        )
+    if best.maxContextExpertsInRam:
+        reason += f" This way it fits up to {best.maxContextExpertsInRam:,} tokens."
     return StarterRecommendation(sizeClass=best.sizeClass, reason=reason)
 
 

@@ -92,17 +92,22 @@ log = logging.getLogger(__name__)
 
 # --- policy, all of it in one place ------------------------------------
 
-SIZE_CLASSES: list[tuple[str, int, int]] = [
-    # (name, min parameters inclusive, max exclusive). Total parameters,
-    # not active: every expert of a mixture-of-experts model is resident,
-    # so 30B-A3B occupies a 30B's worth of memory, which is the only
-    # thing this bucket is used for.
-    ("4B", 2_500_000_000, 6_000_000_000),
-    ("8B", 6_000_000_000, 11_000_000_000),
-    ("14B", 11_000_000_000, 20_000_000_000),
-    ("30B", 20_000_000_000, 40_000_000_000),
-    ("70B", 40_000_000_000, 90_000_000_000),
-]
+SIZE_CLASSES = starter_mod.SIZE_CLASSES
+"""Dense classes by total parameters. Defined beside the recommendation,
+which compares classes too; see `starter.SIZE_CLASSES`."""
+
+MOE_CLASSES = starter_mod.MOE_CLASSES
+"""Mixture-of-experts classes (moe-aware-fit call B). A MoE model ranks
+here and never in a dense class, because where its bytes can go differs:
+its experts can sit in system memory while the rest runs on the card."""
+
+ALL_CLASSES = [*SIZE_CLASSES, *MOE_CLASSES]
+
+ACTIVE_SUFFIX = re.compile(r"-a\d+(?:\.\d+)?b(?![a-z0-9])")
+"""`-A3B`, `-A22B`: a name that states its active parameters. With an
+architecture id containing `moe`, this makes a MoE *candidate*. Neither is
+proof: `build_entry` refuses the class unless the file's own tensor table
+has expert tensors."""
 
 KNOWN_PUBLISHERS = frozenset(
     {
@@ -227,11 +232,17 @@ class Candidate:
         return self.parameters.most_common(1)[0][0] if self.parameters else None
 
     @property
+    def looks_moe(self) -> bool:
+        """A candidate for a MoE class, by name or architecture. Not proof."""
+        arch = str(_mode(self.architectures) or "").lower()
+        return "moe" in arch or bool(ACTIVE_SUFFIX.search(self.name.lower()))
+
+    @property
     def size_class(self) -> str | None:
         total = self.parameter_count
         if total is None:
             return None
-        for name, low, high in SIZE_CLASSES:
+        for name, low, high in MOE_CLASSES if self.looks_moe else SIZE_CLASSES:
             if low <= total < high:
                 return name
         return None
@@ -367,7 +378,7 @@ def eligible(candidates: dict[str, Candidate]) -> dict[str, list[Candidate]]:
     flag is that a human sees it -- but it does remove it from the
     ranking that produces a proposal.
     """
-    by_class: dict[str, list[Candidate]] = {name: [] for name, _, _ in SIZE_CLASSES}
+    by_class: dict[str, list[Candidate]] = {name: [] for name, _, _ in ALL_CLASSES}
     for candidate in candidates.values():
         size_class = candidate.size_class
         if size_class is None or candidate.flags:
@@ -575,6 +586,7 @@ async def build_entry(
     if picked is None:
         return None
     repo, chosen = picked
+    moe_class = size_class in {name for name, _, _ in MOE_CLASSES}
 
     entry: dict[str, Any] = {
         "class": size_class,
@@ -611,11 +623,28 @@ async def build_entry(
         )
     except HubError as exc:
         log.warning("%s: could not read %s (%s)", repo, chosen.files[0].path, exc)
+        if moe_class:
+            # A MoE entry is proved by its tensor table, and there is none.
+            return None
         entry["shapeUnavailable"] = str(exc)
         return entry
 
     if meta.is_embedding:
         log.warning("%s: %s is an embedding model; not shipping it", repo, chosen.label)
+        return None
+
+    # Measured from the tensor table. The recommendation reads it to tell
+    # a MoE entry from a dense one, so an unknown share is left out rather
+    # than written as zero.
+    if meta.expert_bytes is not None:
+        entry["recommended"]["expertBytes"] = meta.expert_bytes
+    if moe_class and not meta.expert_bytes:
+        log.warning(
+            "%s: %s has no expert tensors (%s); not a mixture-of-experts file",
+            repo,
+            chosen.label,
+            "unknown" if meta.expert_bytes is None else "0 bytes",
+        )
         return None
 
     shape = preflight_mod.shape_from_gguf(meta)
@@ -859,7 +888,7 @@ async def review(
                 architectures=architectures,
                 streak=streak,
             )
-            for name, _, _ in SIZE_CLASSES
+            for name, _, _ in ALL_CLASSES
         ]
 
         proposed: dict[str, Any] = {
