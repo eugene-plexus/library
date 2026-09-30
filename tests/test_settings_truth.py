@@ -65,7 +65,10 @@ def test_a_restart_is_pending_only_while_the_value_differs(tmp_path: Path) -> No
     assert field.pendingRestart is True and field.inEffect == "INFO"
     second = _patch(store, {"maxConcurrentDownloads": 2})
     assert second.requiresRestart is False and second.pendingRestart == []
-    _patch(store, {"logLevel": "INFO"})
+    # Put back to what the process runs on: the PATCH itself asks for no
+    # restart (the sabotage pass found this asserted only the schema's side).
+    back = _patch(store, {"logLevel": "INFO"})
+    assert back.requiresRestart is False and back.pendingRestart == []
     assert store.pending_restart() == {}
 
 
