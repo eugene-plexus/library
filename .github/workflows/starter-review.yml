@@ -77,7 +77,15 @@ jobs:
       - name: File the report
         env:
           GH_TOKEN: ${{ github.token }}
+        # The label is made here rather than by hand: the first scheduled
+        # run (2026-10-01) reviewed the set and then failed at this step
+        # because the label did not exist. --force makes it idempotent.
         run: |
+          gh label create starter-review \
+            --repo "${{ github.repository }}" \
+            --description "The monthly starter model review" \
+            --color 0e8a16 \
+            --force
           gh issue create \
             --repo "${{ github.repository }}" \
             --title "Starter model review — $(date -u +%Y-%m-%d)" \
@@ -85,6 +93,8 @@ jobs:
             --body-file issue.md
 
       - name: Upload the report and the proposal
+        # Kept when filing fails, so a review is never lost with it.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: starter-review-${{ github.run_id }}
