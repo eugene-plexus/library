@@ -3,12 +3,26 @@
   "source": "eugene-plexus/specs/platform",
   "version": "1.0.0",
   "files": {
-    "contracts/run-operations.json": "b00b9cefd6f2041540b7e59cd2f269845f31e4ec0571aa145b1c4c46b13e96eb",
-    "scripts/check-vendored.py": "af8695888c46b8581580dab9bf97226928ea623e5e03aa3f5a320071bdf05395",
-    "src/eugene_plexus_library/_build.py": "291d6e51414837e02dc776428d9952f1b181440c7f3b2a20ce88f0f6fcdbeb53",
-    "src/eugene_plexus_library/_http.py": "ee22be0f2447177409157db458f90df9f1f5db7330b2590c535918d12cfaaed6",
-    "src/eugene_plexus_library/gpu_probe.py": "868db4ca2e2cd86a4b4da4a9cd2f4df57d3110f07a0cf540c110f1ddf7b32ec8",
-    "src/eugene_plexus_library/security.py": "deda4bf520746046a6aab06a82e1b7e83b902cff748daf45c4d1df13299dd825",
-    "src/eugene_plexus_library/tokens.py": "5d90ce30119407730eb2b7d94dec63af17aefbf730575ab55031cd212fa8cfcc"
+    "contracts/run-operations.json": {
+      "sha256": "b00b9cefd6f2041540b7e59cd2f269845f31e4ec0571aa145b1c4c46b13e96eb"
+    },
+    "scripts/check-vendored.py": {
+      "sha256": "e9427b74fb4194ecd1df1abf1d510a3df18606e3c07a2a60043e74bba7422d11"
+    },
+    "src/eugene_plexus_library/_build.py": {
+      "sha256": "291d6e51414837e02dc776428d9952f1b181440c7f3b2a20ce88f0f6fcdbeb53"
+    },
+    "src/eugene_plexus_library/_http.py": {
+      "sha256": "ee22be0f2447177409157db458f90df9f1f5db7330b2590c535918d12cfaaed6"
+    },
+    "src/eugene_plexus_library/gpu_probe.py": {
+      "sha256": "868db4ca2e2cd86a4b4da4a9cd2f4df57d3110f07a0cf540c110f1ddf7b32ec8"
+    },
+    "src/eugene_plexus_library/security.py": {
+      "sha256": "deda4bf520746046a6aab06a82e1b7e83b902cff748daf45c4d1df13299dd825"
+    },
+    "src/eugene_plexus_library/tokens.py": {
+      "sha256": "5d90ce30119407730eb2b7d94dec63af17aefbf730575ab55031cd212fa8cfcc"
+    }
   }
 }

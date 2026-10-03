@@ -184,7 +184,7 @@ class Journal:
         self,
         id: str,
         intent: Intent,
-        model: dict[str, Any] | None | Callable[[], dict[str, Any] | None],
+        model: dict[str, Any] | Callable[[], dict[str, Any] | None] | None,
     ) -> dict[str, Any]:
         encoded = json.dumps(intent.model_dump(mode="json"), sort_keys=True)
         with self._transaction() as db:
