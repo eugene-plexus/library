@@ -14,6 +14,7 @@ from .._generated.models import (
 from ..dependencies import require_operator
 from ..downloads import DownloadError, DownloadManager
 from ..hub import HubError
+from .run_operations import set_download_pause
 
 router = APIRouter(tags=["downloads"])
 
@@ -167,7 +168,9 @@ async def pause_download(request: Request, download_id: str) -> Download:
     `incomplete_download`. `resume` continues from exactly those bytes.
     """
     try:
-        return await _manager(request).pause(download_id)
+        async with request.app.state.run_download_lock:
+            await set_download_pause(request, download_id, paused=True)
+            return await _manager(request).pause(download_id)
     except DownloadError as exc:
         raise _translate(exc) from exc
 
@@ -192,6 +195,9 @@ async def resume_download(request: Request, download_id: str) -> Download:
     right number of bytes and a corrupt model.
     """
     try:
-        return await _manager(request).resume(download_id)
+        async with request.app.state.run_download_lock:
+            result = await _manager(request).resume(download_id)
+            await set_download_pause(request, download_id, paused=False)
+            return result
     except DownloadError as exc:
         raise _translate(exc) from exc

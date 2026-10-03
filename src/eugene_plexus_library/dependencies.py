@@ -12,9 +12,10 @@ agent on a GPU node resolving a model it is about to launch, the
 gateway reading a model's profile. **No `service:*` wildcard**: a
 driver's token from another machine reads nothing here.
 
-Everything that writes is operator-only, including profile edits: a
-profile is the operator's tuning work, and a compromised peer should not
-be able to rewrite the flags a model launches with.
+General writes, including profile edits, are operator-only. The run-operation
+router separately grants the assigned agent a leased checkpoint and creation
+of a default profile for an existing operator intent. That grant cannot edit
+an existing profile, create arbitrary work, or act on another node's jobs.
 """
 
 from __future__ import annotations

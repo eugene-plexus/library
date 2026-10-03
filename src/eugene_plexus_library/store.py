@@ -1,11 +1,12 @@
-"""Persistent state: the model cache, the profile store, and downloads.
+"""Persistent state: separate user-owned profiles and a replaceable model cache.
 
 Three things live here and they are not equally important.
 
-**Profiles are the only thing this component owns.** They are the
+**Profiles are user-owned state.** They are the
 operator's tuning work — the flags that took an afternoon to get right —
-and nothing on disk can reproduce them. Everything else here is a cache
-of what a scan found and can be rebuilt by scanning again.
+and a scan cannot reproduce them. `*.profiles.json` stores their versioned
+records and model identities separately from the replaceable model cache.
+Run intents have a separate journal, managed by `run_operations.py`.
 
 **Download records are persisted for one reason:** a 40 GB transfer
 interrupted by a restart has to be resumable, and a record that only
@@ -32,22 +33,31 @@ model with nested metadata, and nobody hand-edits it. YAML would cost
 parse time and gain nothing. `config.yaml` — the part an operator does
 edit — stays YAML.
 
-Writes are atomic (temp file, then `os.replace`) so a crash mid-write
+Legacy combined state is preserved before the first migration. Unsupported
+versions and invalid profile documents make writes unavailable and appear on
+health; loading never silently discards them. Cache corruption can be rebuilt
+only once profiles have an independent, readable document.
+
+Writes are atomic (fsynced temp file, then `os.replace`) so a crash mid-write
 leaves the previous state rather than a truncated file. Losing a scan
 cache to a crash is free; losing the profiles is not.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import profile_storage
 from ._generated.models import (
     Download,
     DownloadState,
@@ -57,12 +67,14 @@ from ._generated.models import (
     ModelProfileSpec,
     ModelStatus,
 )
+from ._private_files import write_private_text
 from .paths import normalize
+from .profile_storage import StorageUnavailable
 from .scanner import CacheKey
 
 log = logging.getLogger(__name__)
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 
 def _now() -> datetime:
@@ -79,6 +91,8 @@ class StateStore:
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._profiles_path = path.with_suffix(".profiles.json")
+        self._storage_error: str | None = None
         self._lock = threading.RLock()
         self._models: dict[str, LibraryModel] = {}
         self._profiles: dict[str, list[ModelProfile]] = {}
@@ -88,65 +102,88 @@ class StateStore:
 
     # -- persistence -----------------------------------------------------
 
+    @property
+    def storage_error(self) -> str | None:
+        return self._storage_error
+
+    def _preserve(self, path: Path) -> None:
+        backup = path.with_name(path.name + ".preserved")
+        if path.exists() and not backup.exists():
+            data = path.read_bytes()
+            fd = os.open(
+                backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600
+            )
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+
     def load(self) -> None:
-        """Read the state file if it exists.
-
-        A corrupt or unreadable state file is logged and treated as
-        empty rather than raised. The component must start: its config
-        endpoints are how an operator fixes things, and refusing to boot
-        over a damaged *cache* would be the degraded-mode rule broken
-        for the least important data in the system. Profiles can be lost
-        this way, which is why the write is atomic in the first place.
-        """
+        """Load caches independently; refuse writes if user data is unreadable."""
         with self._lock:
-            if not self._path.exists():
-                return
-            try:
-                raw = json.loads(self._path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                log.error(
-                    "state file %s is unreadable (%s); starting empty. "
-                    "Saved profiles in it are not recoverable by this process — "
-                    "the file is left in place, not overwritten, until something is saved.",
-                    self._path,
-                    exc,
-                )
-                return
-            if not isinstance(raw, dict):
-                log.error("state file %s is not a JSON object; starting empty", self._path)
-                return
-
+            raw: dict[str, Any] = {}
+            if self._path.exists():
+                try:
+                    raw = json.loads(self._path.read_text(encoding="utf-8"))
+                    if not isinstance(raw, dict):
+                        raise ValueError("state must be an object")
+                    version = raw.get("version", 1)
+                    if type(version) is not int or version not in (1, STATE_VERSION):
+                        self._storage_error = (
+                            f"Unsupported library state version {version!r}; "
+                            "restore matching software and state."
+                        )
+                        return
+                except (OSError, ValueError) as exc:
+                    self._preserve(self._path)
+                    raw = {}
+                    if not self._profiles_path.exists():
+                        self._storage_error = (
+                            f"Legacy library state is unreadable: {exc}. "
+                            "Restore its preserved copy before saving."
+                        )
             self._models = {}
-            self._profiles = {}
             self._downloads = {}
             for entry in raw.get("models") or []:
                 try:
                     model = LibraryModel.model_validate(entry)
-                # One unreadable record must not cost the operator the rest.
                 except Exception as exc:
-                    log.warning("dropping unreadable model record: %s", exc)
+                    log.warning("dropping unreadable cached model: %s", exc)
                     continue
                 self._models[model.id] = model
-            for model_id, records in (raw.get("profiles") or {}).items():
-                profiles: list[ModelProfile] = []
-                for record in records:
-                    try:
-                        profiles.append(ModelProfile.model_validate(record))
-                    except Exception as exc:
-                        log.warning("dropping unreadable profile record: %s", exc)
-                if profiles:
-                    self._profiles[model_id] = profiles
-
+            try:
+                if self._profiles_path.exists():
+                    profiles, identities = profile_storage.read(self._profiles_path)
+                    for entry in identities:
+                        model = LibraryModel.model_validate(entry)
+                        if model.id not in self._models:
+                            self._models[model.id] = model.model_copy(
+                                update={"status": ModelStatus.missing}
+                            )
+                else:
+                    profiles = raw.get("profiles", {})
+                if not isinstance(profiles, dict):
+                    raise StorageUnavailable("Profile records must be an object")
+                # Validate all owned records before adopting any: never drop tuning work.
+                self._profiles = {
+                    model_id: [ModelProfile.model_validate(p) for p in records]
+                    for model_id, records in profiles.items()
+                }
+                if not self._profiles_path.exists() and self._storage_error is None:
+                    self._preserve(self._path)
+                    self._write_profiles_locked()
+            except (OSError, ValueError, KeyError, TypeError, StorageUnavailable) as exc:
+                self._preserve(self._profiles_path if self._profiles_path.exists() else self._path)
+                self._storage_error = (
+                    f"Saved profiles are unreadable: {exc}. Restore matching data before saving."
+                )
+                self._profiles = {}
             for entry in raw.get("downloads") or []:
                 try:
                     record = Download.model_validate(entry)
                 except Exception as exc:
                     log.warning("dropping unreadable download record: %s", exc)
                     continue
-                # Nothing is transferring: this process just started, so
-                # a record that claims to be in flight is describing a
-                # transfer that died with the last one. `paused` is the
-                # honest state, and it is the one `resume` accepts.
                 if record.state in (
                     DownloadState.queued,
                     DownloadState.resolving,
@@ -155,49 +192,66 @@ class StateStore:
                 ):
                     record.state = DownloadState.paused
                     record.message = (
-                        "paused: the process restarted while this was transferring. "
-                        "The bytes already fetched are still on disk; resume to continue."
+                        "paused: the process restarted while transferring; resume to continue."
                     )
                 self._downloads[record.id] = record
-
             stamp = raw.get("lastScanAt")
             if isinstance(stamp, str):
                 try:
                     self._last_scan_at = datetime.fromisoformat(stamp)
                 except ValueError:
                     self._last_scan_at = None
-
             self._reindex_locked()
-            log.info(
-                "loaded %d models and %d profile sets from %s",
-                len(self._models),
-                len(self._profiles),
-                self._path,
-            )
+            if self._storage_error:
+                log.error("%s", self._storage_error)
+
+    def _writable(self) -> None:
+        if self._storage_error is not None:
+            raise StorageUnavailable(self._storage_error)
+
+    def _write_profiles_locked(self) -> None:
+        self._writable()
+        profile_storage.write(
+            self._profiles_path,
+            {
+                mid: [p.model_dump(mode="json", exclude_none=True) for p in ps]
+                for mid, ps in self._profiles.items()
+            },
+            [
+                m.model_dump(mode="json", exclude_none=True)
+                for mid, m in self._models.items()
+                if mid in self._profiles
+            ],
+        )
+
+    @contextmanager
+    def _profile_transaction(self) -> Iterator[None]:
+        with self._lock:
+            self._writable()
+            previous = copy.deepcopy(self._profiles)
+            previous_models = dict(self._models)
+            try:
+                yield
+                self._write_locked()
+                self._write_profiles_locked()
+            except BaseException:
+                self._profiles = previous
+                self._models = previous_models
+                self._reindex_locked()
+                raise
 
     def _write_locked(self) -> None:
-        payload: dict[str, Any] = {
+        self._writable()
+        payload = {
             "version": STATE_VERSION,
             "lastScanAt": self._last_scan_at.isoformat() if self._last_scan_at else None,
             "models": [m.model_dump(mode="json", exclude_none=True) for m in self._models.values()],
-            "profiles": {
-                model_id: [p.model_dump(mode="json", exclude_none=True) for p in profiles]
-                for model_id, profiles in self._profiles.items()
-            },
             "downloads": [
                 d.model_dump(mode="json", exclude_none=True) for d in self._downloads.values()
             ],
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        # Same directory so `os.replace` stays on one filesystem and is
-        # therefore atomic; a temp dir elsewhere would silently degrade
-        # to a copy on some platforms.
-        temp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
-        try:
-            temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            os.replace(temp, self._path)
-        finally:
-            temp.unlink(missing_ok=True)
+        write_private_text(self._path, json.dumps(payload, indent=2))
 
     # -- the incremental-rescan cache -------------------------------------
 
@@ -272,6 +326,7 @@ class StateStore:
         is the whole point.
         """
         with self._lock:
+            self._writable()
             previous = dict(self._models)
             now = scanned_at
             added = updated = 0
@@ -312,13 +367,12 @@ class StateStore:
 
     def forget_model(self, model_id: str) -> bool:
         """Drop a missing entry and its profiles. No file is touched."""
-        with self._lock:
+        with self._profile_transaction():
             if model_id not in self._models and model_id not in self._profiles:
                 return False
             self._models.pop(model_id, None)
             self._profiles.pop(model_id, None)
             self._reindex_locked()
-            self._write_locked()
             return True
 
     @property
@@ -343,7 +397,7 @@ class StateStore:
 
     def create_profile(self, model_id: str, spec: ModelProfileSpec) -> ModelProfile:
         """Save a new profile. Raises `ValueError` if the name is taken."""
-        with self._lock:
+        with self._profile_transaction():
             existing = self._profiles.setdefault(model_id, [])
             if any(p.name == spec.name for p in existing):
                 raise ValueError(f"a profile named {spec.name!r} already exists for this model")
@@ -372,7 +426,6 @@ class StateStore:
             if is_default:
                 self._clear_defaults_locked(model_id, keep=profile.id)
             existing.append(profile)
-            self._write_locked()
             return profile
 
     def replace_profile(
@@ -380,7 +433,7 @@ class StateStore:
     ) -> ModelProfile | None:
         """Whole-document replace. `None` if the profile does not exist,
         `ValueError` if the new name collides with a sibling."""
-        with self._lock:
+        with self._profile_transaction():
             profiles = self._profiles.get(model_id)
             if not profiles:
                 return None
@@ -422,11 +475,10 @@ class StateStore:
             profiles[index] = updated
             if is_default:
                 self._clear_defaults_locked(model_id, keep=updated.id)
-            self._write_locked()
             return updated
 
     def delete_profile(self, model_id: str, profile_id: str) -> bool:
-        with self._lock:
+        with self._profile_transaction():
             profiles = self._profiles.get(model_id)
             if not profiles:
                 return False
@@ -444,7 +496,6 @@ class StateStore:
                 self._profiles[model_id] = remaining
             else:
                 self._profiles.pop(model_id, None)
-            self._write_locked()
             return True
 
     def _clear_defaults_locked(self, model_id: str, *, keep: str) -> None:
@@ -478,11 +529,13 @@ class StateStore:
         thousand rewrites of a file whose other contents did not change.
         """
         with self._lock:
+            self._writable()
             self._downloads[record.id] = record
             self._write_locked()
 
     def delete_download(self, download_id: str) -> bool:
         with self._lock:
+            self._writable()
             if self._downloads.pop(download_id, None) is None:
                 return False
             self._write_locked()

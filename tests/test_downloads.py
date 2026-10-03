@@ -8,6 +8,7 @@ right length and a corrupt model.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from pathlib import Path
 
@@ -107,6 +108,20 @@ def build_manager(tmp_path: Path, fake: FakeHub) -> tuple[downloads.DownloadMana
         concurrency=lambda: 1,
     )
     return manager, store
+
+
+@pytest.mark.asyncio
+async def test_replayed_operation_download_has_one_record(tmp_path: Path) -> None:
+    manager, _store = build_manager(tmp_path, FakeHub())
+    try:
+        spec = DownloadSpec(repo="org/model", files=["model.gguf"])
+        records = await asyncio.gather(
+            *(manager.start(spec, download_id="operation-1") for _ in range(4))
+        )
+        assert {r.id for r in records} == {"operation-1"}
+        assert len(manager.records()) == 1
+    finally:
+        await manager.shutdown()
 
 
 # -- destinations -------------------------------------------------------

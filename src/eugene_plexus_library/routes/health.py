@@ -58,7 +58,9 @@ async def healthz(request: Request) -> Health:
     if scan.state == ScanState.failed and scan.error:
         details["scanError"] = scan.error
 
-    degraded = safe_mode or bool(unreadable)
+    if state.storage_error:
+        details["storageError"] = state.storage_error
+    degraded = safe_mode or bool(unreadable) or state.storage_error is not None
     return Health(
         status=Status.degraded if degraded else Status.ok,
         version=__version__,

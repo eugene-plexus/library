@@ -732,13 +732,15 @@ class DownloadManager:
 
     # -- starting -----------------------------------------------------------
 
-    async def start(self, spec: DownloadSpec) -> Download:
+    async def start(self, spec: DownloadSpec, *, download_id: str | None = None) -> Download:
         """Create a record, resolve its destination, and queue it.
 
         The destination is resolved and reported **before a byte
         moves** — the operator can see where their model is going while
         there is still time to change it.
         """
+        if download_id is not None and (existing := self.get(download_id)) is not None:
+            return existing
         if not spec.files:
             raise DownloadError("A download needs at least one file to fetch.")
 
@@ -786,10 +788,9 @@ class DownloadManager:
 
         total = sum(e.sizeBytes or 0 for e in entries)
         self._check_disk(directory, total)
-        self._check_conflicts(entries)
 
         record = Download(
-            id=uuid.uuid4().hex[:12],
+            id=download_id or uuid.uuid4().hex[:12],
             state=DownloadState.queued,
             repo=spec.repo,
             revision=revision,
@@ -813,6 +814,9 @@ class DownloadManager:
             scan_manager=self._scan_manager,
         )
         async with self._lock:
+            if download_id is not None and (existing := self.get(download_id)) is not None:
+                return existing
+            self._check_conflicts(entries)
             self._jobs[record.id] = job
             self._persist(record)
             self._maybe_start_locked()

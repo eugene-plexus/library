@@ -46,6 +46,19 @@ def store(tmp_path: Path) -> StateStore:
     return StateStore(tmp_path / "state.json")
 
 
+def test_invalid_legacy_profile_collection_is_preserved_and_refuses_writes(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    before = b'{"version":1,"profiles":["unreadable tuning work"]}'
+    path.write_bytes(before)
+    state = StateStore(path)
+    state.load()
+    assert state.storage_error is not None
+    assert path.read_bytes() == before
+    assert path.with_name("state.json.preserved").read_bytes() == before
+    with pytest.raises(RuntimeError):
+        state.replace_models([], scanned_at=datetime.now(UTC))
+
+
 # --- the incremental-rescan cache ----------------------------------------
 
 
@@ -297,7 +310,72 @@ def test_writes_are_atomic(tmp_path: Path) -> None:
 
     leftovers = list(tmp_path.glob("*.tmp"))
     assert leftovers == []
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 1
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
+
+
+def test_future_state_refuses_writes_without_changing_bytes(tmp_path: Path) -> None:
+    from eugene_plexus_library.profile_storage import StorageUnavailable
+
+    path = tmp_path / "future.json"
+    original = '{"version": 999, "futureData": "keep"}'
+    path.write_text(original, encoding="utf-8")
+    store = StateStore(path)
+    store.load()
+    with pytest.raises(StorageUnavailable):
+        store.create_profile("model", _spec("one"))
+    assert path.read_text(encoding="utf-8") == original
+    assert store.list_profiles("model") == []
+
+
+def test_profiles_survive_corruption_and_replacement_of_cache(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    profile = store.create_profile("model", _spec("one"))
+    owned = path.with_suffix(".profiles.json")
+    before = owned.read_bytes()
+    path.write_bytes(b"broken cache")
+    recovered = StateStore(path)
+    recovered.load()
+    assert recovered.get_profile("model", profile.id) is not None
+    recovered.replace_models([], scanned_at=datetime.now(UTC))
+    assert owned.read_bytes() == before
+    assert path.with_name(path.name + ".preserved").read_bytes() == b"broken cache"
+
+
+def test_legacy_profiles_migrate_before_cache_rewrite(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    profile = store.create_profile("model", _spec("one"))
+    path.with_suffix(".profiles.json").unlink()
+    original = json.dumps(
+        {"version": 1, "models": [], "profiles": {"model": [profile.model_dump(mode="json")]}}
+    )
+    path.write_text(original, encoding="utf-8")
+    migrated = StateStore(path)
+    migrated.load()
+    assert migrated.get_profile("model", profile.id) is not None
+    migrated.replace_models([], scanned_at=datetime.now(UTC))
+    assert "profiles" not in json.loads(path.read_text(encoding="utf-8"))
+    assert path.with_name(path.name + ".preserved").read_text(encoding="utf-8") == original
+    again = StateStore(path)
+    again.load()
+    assert again.get_profile("model", profile.id) is not None
+
+
+def test_unreadable_owned_profile_is_preserved_and_read_only(tmp_path: Path) -> None:
+    from eugene_plexus_library.profile_storage import StorageUnavailable
+
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.create_profile("model", _spec("one"))
+    owned = path.with_suffix(".profiles.json")
+    owned.write_bytes(b"broken owned data")
+    recovered = StateStore(path)
+    recovered.load()
+    with pytest.raises(StorageUnavailable):
+        recovered.create_profile("model", _spec("two"))
+    assert owned.read_bytes() == b"broken owned data"
+    assert owned.with_name(owned.name + ".preserved").read_bytes() == b"broken owned data"
 
 
 # --- forgetting --------------------------------------------------------------------

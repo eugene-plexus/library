@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from . import __version__
 from .auth_state import load_auth_state
@@ -15,6 +17,7 @@ from .config import DEFAULT_ROOTS_VARIABLE, ConfigStore
 from .dependencies import require_authorized, require_operator
 from .downloads import DownloadManager
 from .hub import HubClient
+from .profile_storage import StorageUnavailable
 from .routes import admin as admin_routes
 from .routes import catalogue as catalogue_routes
 from .routes import config as config_routes
@@ -24,7 +27,9 @@ from .routes import guidance as guidance_routes
 from .routes import health as health_routes
 from .routes import models as model_routes
 from .routes import profiles as profile_routes
+from .routes import run_operations as run_routes
 from .routes import scan as scan_routes
+from .run_operations import Journal
 from .scan_manager import ScanManager
 from .settings import Settings, load_settings
 from .store import StateStore
@@ -109,6 +114,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         layout=config_store.download_layout,
         concurrency=config_store.max_concurrent_downloads,
     )
+    app.state.run_operations = Journal(settings.state_file.with_suffix(".runs.sqlite3"))
+    app.state.run_download_lock = asyncio.Lock()
+    run_task = (
+        None if settings.safe_mode else asyncio.create_task(run_routes.advance_downloads(app))
+    )
 
     # A startup scan is fire-and-forget: the API is up and answering
     # while it runs, which is the whole reason scanning is a background
@@ -124,6 +134,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if run_task is not None:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
         # Downloads first: a transfer in flight is parked as `paused`
         # with its partial file intact, and that has to be written to
         # the state file before anything else stops.
@@ -178,6 +191,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
 
+    @app.exception_handler(StorageUnavailable)
+    async def storage_unavailable(request: Request, exc: StorageUnavailable) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
     # Health stays unauthenticated — supervisors probe it without
     # holding credentials.
     app.include_router(health_routes.router)
@@ -211,6 +228,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # their own routes, so the router keeps the baseline level and the
     # bar is visible next to each handler.
     app.include_router(download_routes.router, dependencies=authorized)
+    app.include_router(run_routes.router)
 
     # Wholly operator-only: config carries the roots, and restart is a
     # process-lifecycle action. The directory listing (M11) sits with
