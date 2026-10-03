@@ -538,14 +538,25 @@ class HubClient:
     ) -> list[dict[str, Any]]:
         """A ranked listing with the metadata a review needs, expanded.
 
-        **`full=true` and `expand[]` are mutually destructive**, which
-        `search()` above cannot use and this needs. Measured against the
-        live hub: `full=true` returns neither `gguf` nor `cardData`, and
-        passing both leaves a projection of three keys -- `_id`, `id`
-        and `trendingScore` -- with the sort and filter silently
-        ignored. So the ranking call is its own method rather than a
-        flag on the search one; sharing them would mean one of the two
-        callers gets a body it cannot read and no error saying so.
+        **`full=true` and `expand[]` do not combine**, and `search()`
+        above needs the one while this needs the other. `full=true`
+        alone returns `siblings` (the file list) but neither `gguf` nor
+        `cardData`; with any `expand[]` present, `full=true` is ignored
+        and each row is `_id`, `id` and exactly the expanded keys. No
+        single call carries both a repo's files and its `gguf` block, so
+        the ranking call is its own method rather than a flag on the
+        search one; sharing them would mean one of the two callers gets
+        a body it cannot read and no error saying so. Neither method
+        sends both.
+
+        Re-measured 2026-10-03, anonymous GETs to `/api/models` with
+        `sort=downloads&direction=-1&filter=gguf`: with `full=true`
+        alone, rows carried `siblings` and no `gguf`; with `full=true`
+        plus `expand[]=gguf&expand[]=downloads`, rows were `_id, id,
+        downloads, gguf`, sorted by downloads, every one a GGUF repo.
+        (Measured 2026-09-16, this note said the combination left `_id`,
+        `id` and `trendingScore` with the sort and filter silently
+        ignored; the hub no longer does that.)
 
         `downloads` here is upstream's **30-day** figure;
         `downloadsAllTime` is a separate field. That is the window the
