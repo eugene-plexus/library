@@ -62,7 +62,7 @@ classes:
     expertBytes: 0}
   shape:
     blockCount: 42
-    attentionLayers: 42
+    attentionLayers: 24
     headCountKv: 2
     keyLength: 512
     valueLength: 512
@@ -77,12 +77,7 @@ classes:
     - [1, 2, 512, 512, null]
     - [5, 2, 256, 256, 512]
     - [1, 2, 512, 512, null]
-    - [5, 2, 256, 256, 512]
-    - [1, 2, 512, 512, null]
-    - [5, 2, 256, 256, 512]
-    - [1, 2, 512, 512, null]
-    - [5, 2, 256, 256, 512]
-    - [1, 2, 512, 512, null]
+    - [18, 0, 512, 512, null]
 - class: 14B
   baseModel: google/gemma-4-12B-it
   repo: unsloth/gemma-4-12b-it-GGUF
