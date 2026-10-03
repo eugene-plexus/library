@@ -95,6 +95,9 @@ def attention_layers(meta: gguf.GgufMetadata) -> int | None:
     — at that model's own trained context, the difference between "fits
     on a 5090" and "no candidate in this repo is runnable".
 
+    Nor on a model whose later layers reuse an earlier layer's cache
+    (`kv_layers_from_start`): those hold none of their own.
+
     Only the conventions actually seen are honoured, and a model using a
     different one falls through to the block count. That errs
     pessimistic, which is the right direction: an over-estimate costs an
@@ -104,6 +107,10 @@ def attention_layers(meta: gguf.GgufMetadata) -> int | None:
     blocks = meta.arch_key("block_count")
     if not isinstance(blocks, int) or blocks <= 0:
         return None
+
+    own = kv_layers_from_start(meta)
+    if own is not None:
+        return own
 
     interval = meta.arch_key("full_attention_interval")
     if isinstance(interval, int) and interval > 1:
@@ -115,6 +122,163 @@ def attention_layers(meta: gguf.GgufMetadata) -> int | None:
         return len(indices)
 
     return blocks
+
+
+# Three conventions llama.cpp reads and this module once did not, each
+# making the estimate too large (upstream drift audit, 2026-10-03). Every
+# rule below is llama.cpp's own at tag b11375, read in its source, and is
+# applied only where that source applies it: an architecture outside a
+# table keeps the plain reading, which errs pessimistic.
+
+_SWA_PERIOD_DENSE_FIRST: dict[str, bool] = {
+    "afmoe": False,
+    "cohere2": False,
+    "cohere2moe": True,
+    "exaone-moe": False,
+    "gemma2": False,
+    "gemma3": False,
+    "gemma3n": False,
+    "gpt-oss": False,
+    "laguna": True,
+    "mellum": False,
+    "muse-glimmer": False,
+    "olmo2": False,
+    "plamo3": False,
+}
+"""Architectures whose loader reads a scalar `sliding_window_pattern` as
+a period, mapped to that loader's `dense_first`.
+
+`llama_model_base::load_swa_pattern` takes the per-layer array when there
+is one, else reads the scalar into `n_pattern` and calls
+`llama_hparams::set_swa_pattern(n_pattern, dense_first)` (ggml-org/
+llama.cpp#29042: "the loaders read a scalar as a period"). Each name here
+is a `general.architecture` whose `src/models/*.cpp` calls it with the
+window taken from the file's own `attention.sliding_window`.
+
+Left out on purpose, so a scalar there keeps the plain reading: `llama4`
+and `smallthinker` (their loaders overwrite the window with 8192 and 4096,
+so the file's window is not the one in effect), `exaone4` (it slides only
+when the model has 64 layers), and `gemma-embedding` and `modern-bert`
+(encoders with symmetric windows). The architectures that read only the
+array (`gemma4`, `step35`, `mimo2` and others) are not here either: the
+array is already read below.
+
+A file of a listed architecture with **no** pattern key gets the period
+its loader defaults to (6 for `gemma3`, 2 for `gpt-oss`) from llama.cpp,
+and the plain reading here; reading that default is a separate change."""
+
+
+def swa_period(meta: gguf.GgufMetadata) -> list[bool] | None:
+    """Which layers slide, from a scalar `sliding_window_pattern`.
+
+    `set_swa_pattern`: with `dense_first` every `n`-th layer starting at 0
+    is full, else every `n`-th layer ending a period is; 0 is every layer
+    sliding and 1 none; and the layers past `n_layer()`, which is
+    `block_count` less `nextn_predict_layers`, are full. `None` when the
+    file has no scalar, the architecture does not read one as a period,
+    or there is no window to slide over (most of those loaders turn
+    sliding off without one).
+    """
+    raw = meta.arch_key("attention.sliding_window_pattern")
+    # A GGUF bool is a Python bool, which is also an int.
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    pattern: int = raw
+    dense_first = _SWA_PERIOD_DENSE_FIRST.get(meta.architecture or "")
+    blocks = meta.arch_key("block_count")
+    window = meta.arch_key("attention.sliding_window")
+    if dense_first is None or not isinstance(blocks, int) or blocks <= 0:
+        return None
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        return None
+    nextn = meta.arch_key("nextn_predict_layers")
+    layers = blocks - (nextn if isinstance(nextn, int) and 0 < nextn <= blocks else 0)
+
+    def slides(index: int) -> bool:
+        if index >= layers:
+            return False
+        if pattern == 0:
+            return True
+        if dense_first:
+            return index % pattern != 0
+        return index % pattern < pattern - 1
+
+    return [slides(index) for index in range(blocks)]
+
+
+def kv_layers_from_start(meta: gguf.GgufMetadata) -> int | None:
+    """How many leading layers hold a cache of their own, when the rest
+    reuse one; `None` when every layer holds its own.
+
+    llama.cpp's `n_layer_kv_from_start`: `llama_hparams::has_kv` gives a
+    layer before it a cache and none to a layer at or after it, which
+    `create_memory`'s `reuse` callback points at the layer two before the
+    boundary if it slides and one before if not. Set by two loaders only:
+
+    * `gemma4`: `block_count - attention.shared_kv_layers` (the key
+      optional, 0 when absent);
+    * `gemma3n`: 20, written into the loader. It does not read
+      `shared_kv_layers` at all, and both published E-models agree
+      (30 - 10 and 35 - 15).
+
+    A boundary at or past the last layer shares nothing. One below 2 is
+    a file llama.cpp refuses to load (it asserts `>= 2`), so nothing is
+    assumed shared for it either.
+    """
+    blocks = meta.arch_key("block_count")
+    if isinstance(blocks, bool) or not isinstance(blocks, int) or blocks <= 0:
+        return None
+    arch = meta.architecture
+    if arch == "gemma3n":
+        start = 20
+    elif arch == "gemma4":
+        shared = meta.arch_key("attention.shared_kv_layers")
+        start = blocks - (shared if isinstance(shared, int) and not isinstance(shared, bool) else 0)
+    else:
+        return None
+    if start < 2 or start >= blocks:
+        return None
+    return start
+
+
+_MLA_ARCHITECTURES = frozenset(
+    {
+        "bailingmoe3",
+        "deepseek2",
+        "deepseek32",
+        "dots3note",
+        "glm-dsa",
+        "glm5-next",
+        "hy_v4",
+        "kimi-k3",
+        "kimi-linear",
+    }
+)
+"""The architectures whose loader reads `attention.key_length_mla` and
+`attention.value_length_mla` (`src/models/*.cpp` at b11375)."""
+
+
+def caches_values(meta: gguf.GgufMetadata) -> bool:
+    """False for multi-head latent attention, whose cache holds K alone.
+
+    `llama_hparams::is_mla` is both `_mla` lengths set, and `llama_kv_cache`
+    then allocates K and no V for every layer (`has_v = !is_mla`). K is
+    the compressed latent already: the converter writes `key_length` as
+    `kv_lora_rank + qk_rope_head_dim` (576 on DeepSeek-V3), `value_length`
+    as `kv_lora_rank` and `head_count_kv` as 1, so the plain reading of K
+    plus V counted the latent twice (1,088 elements a token a layer where
+    llama.cpp stores 576). A file converted before MLA has neither `_mla`
+    key, 128 full heads, and both caches, which the plain reading gets
+    right.
+    """
+    if meta.architecture not in _MLA_ARCHITECTURES:
+        return True
+
+    def positive(suffix: str) -> bool:
+        value = meta.arch_key(suffix)
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    return not (positive("attention.key_length_mla") and positive("attention.value_length_mla"))
 
 
 def per_layer_kv(meta: gguf.GgufMetadata) -> tuple[fit_mod.LayerKV, ...] | None:
@@ -130,10 +294,17 @@ def per_layer_kv(meta: gguf.GgufMetadata) -> tuple[fit_mod.LayerKV, ...] | None:
 
     `attention.sliding_window_pattern` is a bool array, `True` where the
     layer slides; `key_length_swa` / `value_length_swa` are that layer's
-    own dimensions, which are shorter. Absent the pattern, a declared
-    `sliding_window` with no per-layer mask is not applied at all --
-    guessing which layers slide would be inventing the number this
-    module exists to stop inventing.
+    own dimensions, which are shorter. A **scalar** pattern is a period,
+    read the way llama.cpp's loader for that architecture reads it
+    (`swa_period`). Absent either, a declared `sliding_window` with no
+    per-layer mask is not applied at all -- guessing which layers slide
+    would be inventing the number this module exists to stop inventing.
+
+    Two more conventions make layers unlike each other: later layers that
+    reuse an earlier layer's cache hold none of their own
+    (`kv_layers_from_start`; a `LayerKV` with no heads), and a multi-head
+    latent attention cache holds K and no V (`caches_values`; a value
+    length of 0).
 
     `None` means "use the scalars", which is most files and every older
     one.
@@ -149,7 +320,11 @@ def per_layer_kv(meta: gguf.GgufMetadata) -> tuple[fit_mod.LayerKV, ...] | None:
 
     heads_kv = meta.arch_key("attention.head_count_kv")
     pattern = meta.arch_key("attention.sliding_window_pattern")
-    if not isinstance(heads_kv, list) and not isinstance(pattern, list):
+    if not isinstance(pattern, list):
+        pattern = swa_period(meta)
+    own_cache = kv_layers_from_start(meta)
+    values_cached = caches_values(meta)
+    if not isinstance(heads_kv, list) and pattern is None and own_cache is None and values_cached:
         # Nothing per-layer to say. The scalars describe this file.
         return None
 
@@ -177,6 +352,10 @@ def per_layer_kv(meta: gguf.GgufMetadata) -> tuple[fit_mod.LayerKV, ...] | None:
 
     layers: list[fit_mod.LayerKV] = []
     for index in range(blocks):
+        if own_cache is not None and index >= own_cache:
+            # Reuses an earlier layer's cache and allocates none.
+            layers.append(fit_mod.LayerKV(0, key_length, value_length, None))
+            continue
         heads = head_at(index)
         if not heads:
             return None
@@ -188,11 +367,12 @@ def per_layer_kv(meta: gguf.GgufMetadata) -> tuple[fit_mod.LayerKV, ...] | None:
             # full context is the pessimistic read, and pessimistic is
             # the direction this module errs in.
             slides = False
+        value = value_swa if slides else value_length
         layers.append(
             fit_mod.LayerKV(
                 head_count_kv=heads,
                 key_length=key_swa if slides else key_length,
-                value_length=value_swa if slides else value_length,
+                value_length=value if values_cached else 0,
                 window=window if slides else None,
             )
         )

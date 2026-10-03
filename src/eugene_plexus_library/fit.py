@@ -113,6 +113,10 @@ class LayerKV:
     full-attention layer. A sliding layer never caches more than its
     window however long the prompt is, which is the whole point of the
     design and the term the scalar arithmetic below cannot express.
+
+    `head_count_kv` of 0 is a layer that reuses an earlier layer's cache
+    and holds none of its own, and `value_length` of 0 is a cache of K
+    alone (multi-head latent attention); see `preflight.per_layer_kv`.
     """
 
     head_count_kv: int
