@@ -340,6 +340,15 @@ def configured_client(settings: Settings, models_dir: Path) -> Iterator[TestClie
         yield c
 
 
+def mock_hubs(app: FastAPI, http: Any) -> None:
+    """Point every hub source of a running app at `http` (a client over a
+    mock transport): the catalogue's calls and the download manager's alike,
+    since both resolve their hub through `app.state.hub_clients` (LS4)."""
+    hubs = app.state.hub_clients
+    hubs._http = http
+    hubs._clients.clear()
+
+
 # --------------------------------------------------------------------------- #
 # Trust (per-node token keys, 2026-09-25)
 # --------------------------------------------------------------------------- #

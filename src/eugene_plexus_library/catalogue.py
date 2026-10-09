@@ -52,6 +52,8 @@ from ._generated.models import (
     CatalogueRecommendation,
     CatalogueSearchResult,
     EligibilityCandidate,
+    EngineKind,
+    EngineModelList,
     Fit,
     FitVerdict,
     GateKind,
@@ -412,6 +414,7 @@ def candidate_facts(
             format=ModelFormat.gguf,
             architecture=_gguf_architecture(info),
             quantization=gguf.quant_from_filename(PurePosixPath(first).name),
+            file=PurePosixPath(first).name or None,
         )
     path = config_path(group)
     config = configs.get(path) if path else None
@@ -423,9 +426,15 @@ def candidate_facts(
     )
 
 
-def search_facts(repo: str, formats: list[ModelFormat], entry: dict) -> list[EligibilityCandidate]:
+def search_facts(
+    repo: str, formats: list[ModelFormat], entry: dict, *, source: str | None = None
+) -> list[EligibilityCandidate]:
     """A search row's facts, one per format it appears to serve: guesses from
-    its tags and the hub's repo-level GGUF block, so always approximate."""
+    its tags and the hub's repo-level GGUF block, so always approximate.
+
+    `source` (LS4) is in each id, so one repo on two hubs is two rows the
+    judge answers apart."""
+    where = f"{source}:{repo}" if source else repo
     tags = [t for t in (entry.get("tags") or []) if isinstance(t, str)]
     block = entry.get("gguf")
     gguf_arch = block.get("architecture") if isinstance(block, dict) else None
@@ -437,7 +446,7 @@ def search_facts(repo: str, formats: list[ModelFormat], entry: dict) -> list[Eli
         if fmt is ModelFormat.gguf:
             out.append(
                 EligibilityCandidate(
-                    id=f"search:{repo}:gguf",
+                    id=f"search:{where}:gguf",
                     format=fmt,
                     architecture=gguf_arch if isinstance(gguf_arch, str) else None,
                     approximate=True,
@@ -446,7 +455,7 @@ def search_facts(repo: str, formats: list[ModelFormat], entry: dict) -> list[Eli
         else:
             out.append(
                 EligibilityCandidate(
-                    id=f"search:{repo}:{fmt.value}",
+                    id=f"search:{where}:{fmt.value}",
                     format=fmt,
                     architecture=st_arch,
                     mlxQuantized="mlx" in tags or entry.get("library_name") == "mlx",
@@ -622,14 +631,15 @@ def build_model(
             0,
             "This model is gated and needs manual approval from its publisher, which can "
             "take days. Browsing and sizing work now; the download will fail with a 403 "
-            "until access is granted and `hfToken` is set.",
+            "until access is granted and this hub has a token (the Library's settings, "
+            "Where to find models).",
         )
     elif info.gated is GateKind.auto:
         warnings.insert(
             0,
-            "This model is gated. Accept its licence on the model's own page and set "
-            "`hfToken` in this component's config; the download will fail with a 403 "
-            "until both are done.",
+            "This model is gated. Accept its licence on the model's own page and give "
+            "this hub a token in the Library's settings (Where to find models); the "
+            "download will fail with a 403 until both are done.",
         )
 
     if projectors:
@@ -679,8 +689,12 @@ def build_model(
     )
 
 
-def build_search_result(entry: dict) -> CatalogueSearchResult:
+def build_search_result(
+    entry: dict, *, source: str | None = None, hub_source: str | None = None
+) -> CatalogueSearchResult:
     """One search row. No sizes, and deliberately so.
+
+    `source` and `hub_source` name the hub it came from (`POST` search, LS4).
 
     Upstream's search response carries filenames without sizes, so a fit
     verdict on a row would cost one extra call per row — fifty API
@@ -720,8 +734,10 @@ def build_search_result(entry: dict) -> CatalogueSearchResult:
         repo=repo,
         owner=entry.get("author") or (repo.split("/")[0] if "/" in repo else None),
         name=repo.split("/")[-1] if repo else None,
+        source=source,
+        hubSource=hub_source,
         formats=formats,
-        facts=search_facts(repo, formats, entry),
+        facts=search_facts(repo, formats, entry, source=source),
         gated=gated,
         private=bool(entry.get("private")),
         downloads=entry.get("downloads"),
@@ -734,6 +750,81 @@ def build_search_result(entry: dict) -> CatalogueSearchResult:
         createdAt=entry.get("createdAt"),
         lastModified=entry.get("lastModified"),
     )
+
+
+def _words_match(query: str | None, haystack: Iterable[str | None]) -> bool:
+    """Every word of the query is somewhere in the haystack, ignoring case."""
+    words = (query or "").casefold().split()
+    text = " ".join(h for h in haystack if h).casefold()
+    return all(word in text for word in words)
+
+
+def supported_rows(
+    lists: Iterable[EngineModelList],
+    *,
+    source: str,
+    hub_source: str | None,
+    engine: EngineKind | None = None,
+    query: str | None = None,
+    fmt: ModelFormat | None = None,
+    author: str | None = None,
+) -> list[CatalogueSearchResult]:
+    """An `engine_list` source's results (LS4): the models the engines say
+    they support, in each engine's own order, filtered as a hub's are.
+
+    Exact, not approximate: an entry names one file at a pinned revision, so
+    its facts are that file's. The quantization follows the scan's filename
+    rule, as every other candidate's does (B12); the engine's own name for
+    the size is in `supported.quantization`."""
+    rows: list[CatalogueSearchResult] = []
+    for listed in lists:
+        if engine is not None and listed.engine != engine:
+            continue
+        for model in listed.models:
+            repo = model.source.repoId or ""
+            owner = repo.split("/")[0] if "/" in repo else None
+            if fmt is not None and model.format != fmt:
+                continue
+            if author and (owner or "").casefold() != author.casefold():
+                continue
+            haystack = [
+                model.title,
+                model.about,
+                model.publisher,
+                repo,
+                model.quantization,
+                model.id,
+                listed.engine.value,
+            ]
+            if not _words_match(query, haystack):
+                continue
+            file = PurePosixPath(model.source.file).name if model.source.file else None
+            rows.append(
+                CatalogueSearchResult(
+                    repo=repo,
+                    owner=owner,
+                    name=model.title,
+                    source=source,
+                    hubSource=hub_source,
+                    engine=listed.engine,
+                    supported=model,
+                    formats=[model.format],
+                    facts=[
+                        EligibilityCandidate(
+                            id=f"list:{source}:{listed.engine.value}:{model.id}",
+                            format=model.format,
+                            architecture=model.architecture,
+                            quantization=(
+                                gguf.quant_from_filename(file)
+                                if file and model.format is ModelFormat.gguf
+                                else None
+                            ),
+                            file=file,
+                        )
+                    ],
+                )
+            )
+    return rows
 
 
 def candidate_size(files: list[FileMetadata], path: str) -> int | None:

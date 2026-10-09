@@ -307,3 +307,69 @@ def test_the_route_judges_candidates_after_models_and_alone_judges_only_them(
         "/v1/eligibility", json={"models": ids, "candidates": rows[:1], "engines": engines}
     ).json()["models"]
     assert [m["modelId"] for m in both] == [*ids, "row:1"]
+
+
+# -- LS4: an engine that runs only the files it names ---------------------------
+
+LISTED = "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"
+OTHER_LISTED = "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf"
+STRATA_LISTED = {
+    "engine": "strata",
+    "experimental": True,
+    "accepts": [
+        {
+            "format": "gguf",
+            "architectures": ["qwen4exp"],
+            "files": [LISTED, OTHER_LISTED],
+            "preparation": {"recipe": "strata-prepare", "note": "an expert pack and MTP helper"},
+            "preference": 50,
+        }
+    ],
+}
+
+
+def test_a_file_on_the_engines_list_is_prepared_and_another_is_not() -> None:
+    on = judged(candidate("gguf", architecture="qwen4exp", file=LISTED), engine(STRATA_LISTED))
+    assert by_engine(on)["strata"][0] == "after_preparation"
+    assert on.approximate is False
+    unsloth = "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf"
+    off = judged(candidate("gguf", architecture="qwen4exp", file=unsloth), engine(STRATA_LISTED))
+    assert by_engine(off)["strata"] == (
+        "no",
+        f"runs only {LISTED} or {OTHER_LISTED}, and this one is {unsloth}",
+    )
+    assert off.level == EligibilityLevel.not_here
+
+
+def test_a_name_is_matched_whatever_its_case() -> None:
+    answer = judged(
+        candidate("gguf", architecture="qwen4exp", file=LISTED.lower()), engine(STRATA_LISTED)
+    )
+    assert by_engine(answer)["strata"][0] == "after_preparation"
+
+
+def test_a_search_row_names_no_file_so_the_list_is_assumed_and_said() -> None:
+    answer = judged(candidate("gguf", architecture="qwen4exp"), engine(STRATA_LISTED))
+    verdict, reason = by_engine(answer)["strata"]
+    assert verdict == "after_preparation" and answer.approximate is True
+    assert reason.endswith(f"if it is {LISTED} or {OTHER_LISTED}, which is not known yet")
+
+
+def test_a_long_list_of_files_is_counted_not_read_out() -> None:
+    names = [f"m-{i}-00001-of-00002.gguf" for i in range(9)]
+    spec = {**STRATA_LISTED, "accepts": [{**STRATA_LISTED["accepts"][0], "files": names}]}
+    answer = judged(candidate("gguf", architecture="qwen4exp", file="other.gguf"), engine(spec))
+    assert by_engine(answer)["strata"] == (
+        "no",
+        "runs only the 9 files on its own list, and other.gguf is not one",
+    )
+
+
+def test_a_library_model_is_named_by_its_path_whichever_the_separator() -> None:
+    windows = model("gguf", architecture="qwen4exp", path=f"D:\\models\\flash\\{LISTED}")
+    posix = model("gguf", architecture="qwen4exp", path=f"/models/flash/{LISTED}")
+    other = model("gguf", architecture="qwen4exp", path="/models/flash/other-Q4_K_M.gguf")
+    for listed in (windows, posix):
+        verdict = by_engine(eligibility.judge(listed, [engine(STRATA_LISTED)]))["strata"][0]
+        assert verdict == "after_preparation"
+    assert by_engine(eligibility.judge(other, [engine(STRATA_LISTED)]))["strata"][0] == "no"

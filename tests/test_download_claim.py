@@ -13,7 +13,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_library import hub
+from .conftest import mock_hubs
 
 TREE = [
     {
@@ -42,16 +42,13 @@ def upstream(request: httpx.Request) -> httpx.Response:
 def downloads_client(configured_client: TestClient) -> Iterator[TestClient]:
     """A client whose DOWNLOAD MANAGER speaks to the mock.
 
-    Not `app.state.hub_client`, which is the catalogue's: the manager
-    holds its own client, captured when the app was built. Patching the
-    other one leaves the manager talking to the real hub, which is how
-    the first version of this file got a 401 from huggingface.co.
+    Since LS4 the manager resolves its hub through the same sources as the
+    catalogue, so pointing those at the mock covers both. (The first
+    version of this file patched the catalogue's client alone and got a 401
+    from huggingface.co.)
     """
     inner = httpx.AsyncClient(transport=httpx.MockTransport(upstream), follow_redirects=False)
-    client = hub.HubClient(client=inner)
-    client.configure(base_url="https://hub.example", token=None, enabled=True)
-    configured_client.app.state.hub_client = client
-    configured_client.app.state.download_manager._client = client
+    mock_hubs(configured_client.app, inner)
     yield configured_client
 
 

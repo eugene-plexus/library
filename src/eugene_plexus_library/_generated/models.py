@@ -601,6 +601,82 @@ class PreparedSource(BaseModel):
     revision: str | None = Field(None, description='The repo commit.')
 
 
+class SupportedModel(BaseModel):
+    """
+    One model an engine's adapter publishes as supported
+    (library-sources-and-engines.md §4.4, LS4): which files on a hub,
+    and what the engine does with them. Read off the engine's own
+    documentation and setup at the version the adapter pins, never
+    written from memory. The list ships with the adapter in the agent
+    (Troy's L7, `EngineDescriptor.supportedModels`), so a new engine
+    brings its own and a node's list is the one its adapter would
+    prepare and run. A caller hands it to the library's search
+    (`EngineModelList`), which shows it as one source among the others
+    (`CatalogueSourceKind` `engine_list`).
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Unique within the engine's list and stable across versions of\nit, e.g. Strata's own name for the choice (`coder-IQ1_M`).\n",
+        min_length=1,
+    )
+    title: str = Field(
+        ..., description='What to call it, e.g. `Qwen3.8-Flash-Next IQ2_XS`.'
+    )
+    about: str | None = Field(
+        None, description="The engine's own words for it, from its documentation."
+    )
+    publisher: str | None = Field(
+        None,
+        description='Who made the files, e.g. `Qwen; GSQ-RCO quants by ISTA-DASLab`.',
+    )
+    license: str | None = Field(
+        None,
+        description="When the files carry a licence of their own the person should\nread before downloading, the engine's words for it.\n",
+    )
+    format: ModelFormat
+    architecture: str | None = Field(
+        None,
+        description='As the hub reads the files (`general.architecture` for a GGUF).',
+    )
+    quantization: str | None = Field(
+        None, description="The engine's name for the size, e.g. `IQ2_XS`."
+    )
+    source: PreparedSource = Field(
+        ...,
+        description="Where the files are, all three named: `repoId`, `file` (a\nGGUF's first shard, repo-relative) and the `revision` the engine\npins. What a preparation records as its source (LS5).\n",
+    )
+    sizeBytes: int | None = Field(
+        None,
+        description='Every file of it summed, as the hub lists them at `source.revision`.',
+        ge=0,
+    )
+    preparation: ModelPreparation | None = Field(
+        None,
+        description='What the engine does to the files before it runs them, if anything.',
+    )
+    recommended: bool | None = Field(
+        False, description="The engine's own documentation recommends it."
+    )
+    experimental: bool | None = Field(
+        False, description="The engine's own documentation calls it experimental."
+    )
+
+
+class EngineModelList(BaseModel):
+    """
+    One engine's `supportedModels`, as a caller sends it to the
+    library's search (`CatalogueSearchRequest.engines`): the console the
+    picked node's, as it sends that node's `accepts` to the judge, so the
+    library calls no agent.
+
+    """
+
+    engine: EngineKind
+    models: list[SupportedModel]
+
+
 class EligibilityCandidate(BaseModel):
     """
     A model not in the library yet, judged by its facts
@@ -631,6 +707,10 @@ class EligibilityCandidate(BaseModel):
     quantization: str | None = Field(
         None,
         description="The GGUF quantization, from the file's name (the scan's own fallback).",
+    )
+    file: str | None = Field(
+        None,
+        description="The file's name without its folder: a GGUF's first shard\n(`ModelRequirement.files`, LS4). Absent: not known yet, as on a\nsearch row, which names a repo rather than a file.\n",
     )
     mlxQuantized: bool | None = Field(
         None,
@@ -901,6 +981,19 @@ class ConfigValueType(StrEnum):
     to open a directory picker or an address field. UIs render it as
     an add/remove list of text fields.
 
+    `catalogue_sources` (LS4, 2026-10-09) is an ordered JSON array of
+    the library's `CatalogueSource` — `{"id", "kind", "label",
+    "enabled", "address", "token", "engine"}`: where Discover finds
+    models (library-sources-and-engines.md §4.4). Its one user is the
+    library's `catalogueSources`, which replaced the single hub
+    address and token. Like `share_credentials`, entries hold a
+    secret: an `hf_hub` entry's `token` is redacted in `GET` (as
+    `null`, with `hasToken` saying whether one is stored), accepted in
+    `PATCH`, and an entry that omits it keeps the token stored under
+    the same `id`; `""` clears it. UIs render it as rows of a source,
+    with the token a password input, and must not display a redacted
+    token as though none were stored.
+
     """
 
     string = 'string'
@@ -921,6 +1014,7 @@ class ConfigValueType(StrEnum):
     library_folders = 'library_folders'
     share_credentials = 'share_credentials'
     string_list = 'string_list'
+    catalogue_sources = 'catalogue_sources'
 
 
 class ConfigFieldStatusLevel(StrEnum):
@@ -1790,6 +1884,129 @@ class InterpretedAs(StrEnum):
     repo = 'repo'
 
 
+class CatalogueSourceKind(StrEnum):
+    """
+    Where a catalogue source's models come from (LS4,
+    library-sources-and-engines.md §4.4).
+
+    * `hf_hub`: a Hugging Face-compatible hub — the public one, a
+      regional mirror or an enterprise instance — at its own address,
+      with its own token.
+    * `engine_list`: the models engines publish as supported
+      (`SupportedModel`), each pointing at hub files and the
+      preparation it needs. The list ships with the engine's adapter
+      in the agent; the caller of a search sends the picked node's.
+
+    The Library folders are a source too in the design's words, and
+    stay `modelRoots`: they are scanned, not searched. ModelScope,
+    the Ollama registry or a direct address would be further kinds;
+    none is in v0.2.
+
+    """
+
+    hf_hub = 'hf_hub'
+    engine_list = 'engine_list'
+
+
+class CatalogueSource(BaseModel):
+    """
+    One entry of the library's `catalogueSources` config (a
+    `catalogue_sources` value, LS4). The default list is the public
+    hub (`huggingface`) and every engine's list (`engines`).
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Stable: results, downloads and a later page name their source\nby it, and an entry's stored token is kept under it.\n",
+        pattern='^[a-z0-9][a-z0-9-]{0,39}$',
+    )
+    kind: CatalogueSourceKind
+    label: str | None = Field(
+        None, description='What the person calls it. Absent: the id.'
+    )
+    enabled: bool | None = Field(
+        True,
+        description='Off: not searched, and a call naming it answers 409. Distinct\nfrom `catalogueEnabled`, which stops every outbound request.\n',
+    )
+    address: str | None = Field(
+        None,
+        description="`hf_hub` only: the hub's address. Absent:\n`https://huggingface.co`.\n",
+    )
+    token: str | None = Field(
+        None,
+        description='`hf_hub` only: a token from the person\'s account on that hub,\nfor gated and private repos and higher rate limits. Sealed at\nrest; `GET` answers `null` and says whether one is stored in\n`hasToken`. A `PATCH` entry without it keeps the token stored\nunder the same `id`; `""` clears it.\n',
+    )
+    hasToken: bool | None = Field(
+        None,
+        description='Read-only, in `GET`: whether a token is stored for this entry.',
+    )
+    engine: EngineKind | None = Field(
+        None,
+        description='`engine_list` only: whose list. Absent: every engine that\npublishes one, including engines added later.\n',
+    )
+
+
+class CatalogueSourceStatus(BaseModel):
+    id: str
+    kind: CatalogueSourceKind
+    label: str | None = None
+    searched: bool = Field(
+        ...,
+        description='Whether it was asked. False for one switched off, or not named.',
+    )
+    results: int | None = Field(
+        None, description='How many results it gave, after filters.', ge=0
+    )
+    problem: str | None = Field(
+        None,
+        description='Why it gave none, in words naming the observed cause: the hub\nrefused, could not be reached, or is switched off; no engine\nlist came with the search (a node older than LS4).\n',
+    )
+
+
+class CatalogueSortDirection(StrEnum):
+    """
+    Hub order, highest first (`desc`) or lowest first.
+    """
+
+    asc = 'asc'
+    desc = 'desc'
+
+
+class CatalogueSearchRequest(BaseModel):
+    """
+    `POST /v1/catalogue/search` (LS4). The filters mean what they
+    mean on `GET`, for every source.
+
+    """
+
+    q: str | None = Field(
+        None,
+        description="Free text, or a pasted repo link (looked up, as on `GET`).\nAbsent: every source's listing by `sort`.\n",
+    )
+    format: ModelFormat | None = None
+    author: str | None = None
+    sort: CatalogueSort | None = None
+    direction: CatalogueSortDirection | None = 'desc'
+    limit: int | None = Field(
+        25,
+        description="Rows per hub source. An engine's list is never cut short.",
+        ge=1,
+        le=100,
+    )
+    cursor: str | None = Field(
+        None,
+        description="A previous answer's `nextCursor`: this library's own token,\nnaming each hub's continuation, never a hub's raw cursor.\n",
+    )
+    sources: list[str] | None = Field(
+        None, description='Which sources to search, by id. Absent: every enabled one.'
+    )
+    engines: list[EngineModelList] | None = Field(
+        None,
+        description="The engines' lists for the `engine_list` sources: the picked\nnode's `EngineDescriptor.supportedModels`, as its agent reports\nthem. Absent: those sources list nothing, and say so.\n",
+    )
+
+
 class GateKind(StrEnum):
     """
     Whether upstream restricts the *bytes*. `open` is unrestricted;
@@ -1975,6 +2192,10 @@ class DownloadSpec(BaseModel):
     """
 
     repo: str = Field(..., description='Upstream repo id.')
+    source: str | None = Field(
+        None,
+        description="The `hf_hub` source to fetch from (`CatalogueSource.id`, a\nsearch result's `hubSource`, LS4). Absent: the first enabled\n`hf_hub` source. Kept on the record, so a resume asks the same\nhub with the same token.\n",
+    )
     revision: str | None = Field(
         'main',
         description='Resolved to a commit at start and pinned for the life of\nthe download, so a resume days later fetches the same bytes\nit began with.\n',
@@ -2397,6 +2618,10 @@ class ModelRequirement(BaseModel):
         None,
         description='The GGUF quantization must be one of these. Absent means any.',
     )
+    files: list[str] | None = Field(
+        None,
+        description="The model's file must have one of these names: a GGUF's first\nshard, as the hub and the disk both name it, without its\nfolder. Absent means any. For an engine that runs only the files\nit names (LS4): Strata's own setup accepts a GGUF by its name\nand refuses every other one of the same architecture, so its\nadapter fills this from its `supportedModels`, and a Flash-Next\nK-quant from another publisher is `no`, naming the list.\n",
+    )
     mlxQuantization: MlxQuantizationRule | None = None
     preparedFor: EngineKind | None = Field(
         None,
@@ -2745,6 +2970,21 @@ class CatalogueSearchResult(BaseModel):
     """
 
     repo: str = Field(..., description='Full repo id, e.g. `unsloth/Qwen3.8-27B-GGUF`.')
+    source: str | None = Field(
+        None,
+        description='The `CatalogueSource.id` this result came from (`POST`, LS4).\nAbsent on `GET`: the first enabled `hf_hub` source.\n',
+    )
+    hubSource: str | None = Field(
+        None,
+        description="The `hf_hub` source to ask about this repo (detail, card,\npreflight, download, as `source`): the result's own source for\na hub's result; the first enabled `hf_hub` source for an\nengine's list. Absent when no `hf_hub` source is enabled.\n",
+    )
+    engine: EngineKind | None = Field(
+        None, description="An `engine_list` result's engine."
+    )
+    supported: SupportedModel | None = Field(
+        None,
+        description="An `engine_list` result: the engine's entry, naming the one\nversion of `repo` it is (`supported.source.file`) at its\nrevision. `name` is its title and `facts` its exact facts.\n",
+    )
     owner: str | None = Field(
         None,
         description='The publisher. Prominent on purpose — "which quant publisher\ndo I trust" is how people navigate this catalogue, and it is\nthe fastest signal that separates an official release from a\nreupload.\n',
@@ -3343,6 +3583,10 @@ class CatalogueSearchPage(BaseModel):
         None,
         description='When this answer was fetched upstream. Present because\nresults are cached for a short window to stay inside the\n500-request/300-second API budget, and a client showing\npopularity numbers should know they are minutes old.\n',
     )
+    sources: list[CatalogueSourceStatus] | None = Field(
+        None,
+        description="What each source asked answered (`POST` only, LS4), in\n`catalogueSources` order. A source that failed says why here,\nwhile the others' results stand.\n",
+    )
 
 
 class CatalogueCandidate(BaseModel):
@@ -3520,6 +3764,10 @@ class Download(BaseModel):
     id: str
     state: DownloadState
     repo: str
+    source: str | None = Field(
+        None,
+        description='The `hf_hub` source it fetches from (LS4). Absent on a record\nfrom before LS4, or when none was named: the first enabled\n`hf_hub` source.\n',
+    )
     revision: str | None = None
     resolvedCommit: str | None = Field(
         None,

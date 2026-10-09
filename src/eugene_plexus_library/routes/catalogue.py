@@ -11,11 +11,16 @@ single-segment canonical repos that also exist.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import json
 import logging
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from .. import catalogue as catalogue_mod
+from .. import catalogue_sources as sources_mod
 from .. import fit as fit_mod
 from .. import hardware, repo_ref
 from .. import preflight as preflight_mod
@@ -25,7 +30,13 @@ from .._generated.models import (
     CatalogueModel,
     CataloguePreflight,
     CatalogueSearchPage,
+    CatalogueSearchRequest,
+    CatalogueSearchResult,
     CatalogueSort,
+    CatalogueSortDirection,
+    CatalogueSource,
+    CatalogueSourceKind,
+    CatalogueSourceStatus,
     InterpretedAs,
     KvCacheType,
     MemoryBudget,
@@ -33,6 +44,7 @@ from .._generated.models import (
     Problem,
     StarterSet,
 )
+from ..catalogue_sources import HubClients, SourceProblem
 from ..config import ConfigStore
 from ..formats import safetensors
 from ..hub import HubClient, HubError, gather_limited
@@ -108,21 +120,29 @@ def _from_hub_error(exc: HubError) -> HTTPException:
     return _problem(exc.status, titles.get(exc.status, "Catalogue error"), str(exc), code=exc.code)
 
 
-def _client(request: Request) -> HubClient:
-    """The shared client, reconfigured from live config on every call.
+SOURCE_DESCRIPTION = (
+    "The `hf_hub` source the repo is on (`CatalogueSource.id`, a search result's "
+    "`hubSource`, LS4). Absent: the first enabled hub, which is what a console older "
+    "than the sources list meant."
+)
 
-    Base URL, token and the enabled flag are read here rather than
-    captured at construction so a `PATCH /v1/config` takes effect
-    without a restart — which is the whole point of the config trio.
+
+def _hub(request: Request, source: str | None) -> tuple[CatalogueSource, HubClient]:
+    """The hub a call names, or the default, with its client.
+
+    Address, token and the enabled flags are read from live config on every
+    call rather than captured at construction, so a `PATCH /v1/config` takes
+    effect without a restart — which is the whole point of the config trio.
     """
-    client: HubClient = request.app.state.hub_client
-    config: ConfigStore = request.app.state.config_store
-    client.configure(
-        base_url=config.catalogue_base_url(),
-        token=config.hf_token(),
-        enabled=config.catalogue_enabled(),
-    )
-    return client
+    hubs: HubClients = request.app.state.hub_clients
+    try:
+        return hubs.resolve(source)
+    except SourceProblem as exc:
+        raise _problem(exc.status, exc.title, exc.detail, code=exc.code) from exc
+
+
+def _client(request: Request, source: str | None = None) -> HubClient:
+    return _hub(request, source)[1]
 
 
 async def _budget(
@@ -235,8 +255,181 @@ async def search_catalogue(
     )
 
 
+_CURSOR_VERSION = 1
+
+
+def _encode_cursor(hubs: dict[str, str]) -> str:
+    """This library's continuation: each hub's own cursor, by source id."""
+    raw = json.dumps({"v": _CURSOR_VERSION, "hubs": hubs}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> dict[str, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        data: Any = json.loads(base64.urlsafe_b64decode(padded.encode()))
+        hubs = data["hubs"]
+        if data.get("v") != _CURSOR_VERSION or not isinstance(hubs, dict):
+            raise ValueError("not this library's cursor")
+        if not all(isinstance(k, str) and isinstance(v, str) for k, v in hubs.items()):
+            raise ValueError("not this library's cursor")
+        return hubs
+    except (ValueError, KeyError, TypeError, binascii.Error, UnicodeDecodeError) as exc:
+        raise _problem(
+            400,
+            "Not a cursor this library made",
+            "`cursor` must be the `nextCursor` of an earlier answer from this endpoint. A "
+            "hub's own cursor belongs on `GET /v1/catalogue/search`.",
+            code="bad-cursor",
+        ) from exc
+
+
+def _status(source: CatalogueSource) -> CatalogueSourceStatus:
+    return CatalogueSourceStatus(
+        id=source.id, kind=source.kind, label=sources_mod.label_of(source), searched=False
+    )
+
+
+@router.post("/v1/catalogue/search", response_model=CatalogueSearchPage)
+async def search_catalogue_sources(
+    request: Request, body: CatalogueSearchRequest
+) -> CatalogueSearchPage:
+    """Search the chosen sources together (LS4, design §4.4).
+
+    Every enabled source in `catalogueSources`, or the ones named. A hub is
+    searched as `GET` searches one; an engine's list from the lists the
+    caller sent (the picked node's, as it sends that node's `accepts` to the
+    judge, so this calls no agent). Every result names its source, and
+    `sources` says what each answered: one hub down is not an empty search.
+    """
+    hubs: HubClients = request.app.state.hub_clients
+    sources = hubs.sources()
+    if body.sources is not None:
+        unknown = sorted(set(body.sources) - {s.id for s in sources})
+        if unknown:
+            raise _problem(
+                400,
+                "No such source",
+                f"This library has no catalogue source {', '.join(map(repr, unknown))}. It may "
+                "have been removed in the Library's settings since the page was loaded.",
+                code="source-not-found",
+            )
+    named = set(body.sources) if body.sources is not None else None
+    chosen = [s for s in sources if named is None or s.id in named]
+    default = sources_mod.default_hub(sources)
+    cursors = _decode_cursor(body.cursor) if body.cursor else None
+
+    # A pasted link names one repo, on the hub at its host (or the default).
+    reference = repo_ref.parse(body.q) if cursors is None else None
+    if reference is not None:
+        hub = sources_mod.hub_for_host(
+            [s for s in chosen if sources_mod.enabled(s)], reference.host
+        )
+        if hub is not None:
+            resolved = await _resolve_reference(hubs.client_for(hub), reference, source=hub.id)
+            if resolved is not None:
+                looked = _status(hub)
+                looked.searched, looked.results = True, len(resolved.results)
+                resolved.sources = [looked]
+                return resolved
+
+    statuses: list[CatalogueSourceStatus] = []
+    listed: list[CatalogueSearchResult] = []
+    asked: list[tuple[CatalogueSource, CatalogueSourceStatus]] = []
+    for source in sources:
+        status = _status(source)
+        statuses.append(status)
+        if named is not None and source.id not in named:
+            continue
+        if not sources_mod.enabled(source):
+            status.problem = "switched off in the Library's settings (Where to find models)"
+            continue
+        if cursors is not None and source.id not in cursors:
+            continue  # a later page: only the hubs that had more
+        status.searched = True
+        if source.kind is CatalogueSourceKind.engine_list:
+            if body.engines is None:
+                status.results = 0
+                status.problem = (
+                    "no engine's list came with the search: the node's agent is older than "
+                    "the sources list, or the console did not send it"
+                )
+                continue
+            if not any(
+                source.engine is None or listed_by.engine == source.engine
+                for listed_by in body.engines
+            ):
+                status.results = 0
+                who = (
+                    f"{source.engine.value} on the node publishes"
+                    if source.engine
+                    else "none of the node's engines publishes"
+                )
+                status.problem = (
+                    f"{who} a list of its own (an agent older than the sources list publishes none)"
+                )
+                continue
+            rows = catalogue_mod.supported_rows(
+                body.engines,
+                source=source.id,
+                hub_source=default.id if default else None,
+                engine=source.engine,
+                query=body.q,
+                fmt=body.format,
+                author=body.author,
+            )
+            status.results = len(rows)
+            listed.extend(rows)
+            continue
+        asked.append((source, status))
+
+    descending = (body.direction or CatalogueSortDirection.desc) is CatalogueSortDirection.desc
+
+    async def one_hub(source: CatalogueSource) -> tuple[list[Any], str | None, Any]:
+        return await hubs.client_for(source).search(
+            query=body.q,
+            author=body.author,
+            gguf_only=body.format is ModelFormat.gguf,
+            sort=body.sort or CatalogueSort.downloads,
+            descending=descending,
+            limit=body.limit or 25,
+            cursor=cursors.get(source.id) if cursors else None,
+        )
+
+    answers = await asyncio.gather(*(one_hub(s) for s, _ in asked), return_exceptions=True)
+    found: list[CatalogueSearchResult] = []
+    more: dict[str, str] = {}
+    for (source, status), answer in zip(asked, answers, strict=True):
+        if isinstance(answer, HubError):
+            status.results = 0
+            status.problem = str(answer)
+            continue
+        if isinstance(answer, BaseException):
+            raise answer
+        results, next_cursor, _cached_at = answer
+        rows = [
+            catalogue_mod.build_search_result(entry, source=source.id, hub_source=source.id)
+            for entry in results
+            if isinstance(entry, dict)
+        ]
+        if body.format is ModelFormat.safetensors:
+            rows = [r for r in rows if ModelFormat.safetensors in (r.formats or [])]
+        status.results = len(rows)
+        found.extend(rows)
+        if next_cursor:
+            more[source.id] = next_cursor
+
+    return CatalogueSearchPage(
+        results=[*listed, *found],
+        nextCursor=_encode_cursor(more) if more else None,
+        cachedAt=None,
+        interpretedAs=InterpretedAs.search,
+        sources=statuses,
+    )
+
+
 async def _resolve_reference(
-    client: HubClient, reference: repo_ref.RepoReference
+    client: HubClient, reference: repo_ref.RepoReference, *, source: str | None = None
 ) -> CatalogueSearchPage | None:
     """One repo lookup for a pasted reference.
 
@@ -270,14 +463,19 @@ async def _resolve_reference(
             "No such model",
             f"{client.base_url} has no repository {reference.repo!r} that this install can "
             "see. It may not exist, it may have been renamed, or it may be private -- "
-            "upstream answers the same way for all three. If it is private, set `hfToken` "
-            "in the library's config to a token with access. A link to a dataset or a "
-            "space will land here too; only model repos can be opened from this screen.",
+            "upstream answers the same way for all three. If it is private, give this hub "
+            "a token with access in the Library's settings (Where to find models). A link "
+            "to a dataset or a space will land here too; only model repos can be opened "
+            "from this screen.",
             code="repo-not-found",
         ) from exc
 
     return CatalogueSearchPage(
-        results=[catalogue_mod.build_search_result({"id": reference.repo, **info.raw})],
+        results=[
+            catalogue_mod.build_search_result(
+                {"id": reference.repo, **info.raw}, source=source, hub_source=source
+            )
+        ],
         cachedAt=None,
         interpretedAs=InterpretedAs.repo,
         interpretedFrom=reference.repo,
@@ -291,6 +489,7 @@ async def get_catalogue_model(
         default=...,
         description="Upstream repo id, e.g. `unsloth/Qwen3.8-27B-GGUF`.",
     ),
+    source: str | None = Query(default=None, description=SOURCE_DESCRIPTION),
     revision: str = Query(
         default="main",
         description=(
@@ -334,7 +533,7 @@ async def get_catalogue_model(
     (cached like the rest), so its facts carry the MLX marker and the
     architecture before anything is downloaded.
     """
-    client = _client(request)
+    client = _client(request, source)
     config: ConfigStore = request.app.state.config_store
     store: StateStore = request.app.state.state_store
 
@@ -430,6 +629,7 @@ async def get_starter_models(
 async def get_catalogue_card(
     request: Request,
     repo: str = Query(default=..., description="Upstream repo id."),
+    source: str | None = Query(default=None, description=SOURCE_DESCRIPTION),
     revision: str = Query(default="main", description="Branch, tag or commit."),
 ) -> CatalogueCard:
     """The model card prose, as Markdown.
@@ -442,7 +642,7 @@ async def get_catalogue_card(
     **Untrusted content.** It is written by whoever uploaded the model,
     so a renderer must not execute anything in it.
     """
-    client = _client(request)
+    client = _client(request, source)
     try:
         markdown = await client.card(repo, revision=revision)
         info = await client.repo_info(repo, revision=revision)
@@ -464,6 +664,7 @@ async def get_catalogue_card(
 async def preflight_catalogue_file(
     request: Request,
     repo: str = Query(default=..., description="Upstream repo id."),
+    source: str | None = Query(default=None, description=SOURCE_DESCRIPTION),
     file: str = Query(
         default=...,
         description=(
@@ -505,7 +706,7 @@ async def preflight_catalogue_file(
     UI that fires it on hover would pull ~270 MB across one repo's
     candidates.
     """
-    client = _client(request)
+    client = _client(request, source)
     config: ConfigStore = request.app.state.config_store
 
     # The candidate's whole size, so a split model is not scored as its

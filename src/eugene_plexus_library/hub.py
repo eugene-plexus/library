@@ -430,15 +430,16 @@ class HubClient:
             if code == "GatedRepo" or "restricted" in message.lower():
                 raise HubError(
                     f"{what} is gated upstream. {message or 'Access is restricted.'} "
-                    "Accept the licence on the model's own page, then set `hfToken` in "
-                    "this component's config to a token from an account that has access.",
+                    "Accept the licence on the model's own page, then give this hub a "
+                    "token from an account that has access, in the Library's settings "
+                    "under Where to find models.",
                     status=403,
                     code=code or "GatedRepo",
                 )
             raise HubError(
                 f"{what} requires authentication upstream"
-                f"{f': {message}' if message else ''}. Set `hfToken` in this component's "
-                "config.",
+                f"{f': {message}' if message else ''}. Give this hub a token in the "
+                "Library's settings, under Where to find models.",
                 status=403,
                 code=code or "Unauthorized",
             )
@@ -453,8 +454,8 @@ class HubClient:
             retry = response.headers.get("Retry-After")
             raise HubError(
                 "Upstream rate limit reached. The hub allows 500 API requests per 300 "
-                "seconds unauthenticated; setting `hfToken` raises that. Try again "
-                "shortly.",
+                "seconds unauthenticated; giving this hub a token (the Library's "
+                "settings, Where to find models) raises that. Try again shortly.",
                 status=429,
                 code="RateLimited",
                 retry_after=int(retry) if retry and retry.isdigit() else None,

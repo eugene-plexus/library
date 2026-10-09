@@ -13,8 +13,10 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_library import hardware, hub
+from eugene_plexus_library import hardware
 from eugene_plexus_library._generated.models import Arch, Gpu, HostHardware, Os, Vendor
+
+from .conftest import mock_hubs
 
 TREE = [
     {
@@ -128,7 +130,7 @@ def catalogue_client(
     """A client whose hub is a mock transport rather than the internet,
     and whose hardware is `HOST` rather than this machine."""
     inner = httpx.AsyncClient(transport=httpx.MockTransport(upstream), follow_redirects=False)
-    configured_client.app.state.hub_client = hub.HubClient(client=inner)
+    mock_hubs(configured_client.app, inner)
     monkeypatch.setattr(hardware, "detect", lambda: HOST)
     yield configured_client
 
@@ -204,7 +206,7 @@ def test_an_upstream_404_is_a_404_with_an_explanation(catalogue_client: TestClie
         return httpx.Response(404, headers={"X-Error-Code": "RepoNotFound"})
 
     inner = httpx.AsyncClient(transport=httpx.MockTransport(missing), follow_redirects=False)
-    catalogue_client.app.state.hub_client = hub.HubClient(client=inner)
+    mock_hubs(catalogue_client.app, inner)
 
     response = catalogue_client.get("/v1/catalogue/model", params={"repo": "org/nope"})
     assert response.status_code == 404
@@ -226,13 +228,13 @@ def test_a_gated_download_says_what_to_do(catalogue_client: TestClient) -> None:
         )
 
     inner = httpx.AsyncClient(transport=httpx.MockTransport(gated), follow_redirects=False)
-    catalogue_client.app.state.hub_client = hub.HubClient(client=inner)
+    mock_hubs(catalogue_client.app, inner)
 
     response = catalogue_client.post(
         "/v1/downloads", json={"repo": "org/gated", "files": ["model-Q4_K_M.gguf"]}
     )
     assert response.status_code == 403
-    assert "hfToken" in response.json()["detail"]["detail"]
+    assert "Where to find models" in response.json()["detail"]["detail"]
 
 
 def test_the_catalogue_switch_refuses_every_endpoint(catalogue_client: TestClient) -> None:

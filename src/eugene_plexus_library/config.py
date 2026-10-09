@@ -17,10 +17,13 @@ instead of each node's agent carrying a row per folder. A bare string
 is still accepted and means a folder with no mounts; `folders.py` holds
 the coercion and the validation.
 
-`hfToken` is the one `sensitive` field: redacted in `GET`, accepted in
-`PATCH`, and sealed at rest with the master key. That machinery was
-wired in at M2 with nothing using it, precisely so adding this field
-needed no plumbing work.
+`catalogueSources` (LS4) is where Discover finds models, and holds the
+one secret: each hub's token, redacted in `GET`, accepted in `PATCH`, and
+sealed at rest with the master key, per entry (`catalogue_sources.py`). It
+replaced `catalogueBaseUrl` and `hfToken`, the single hub's address and
+token: a file with only those migrates on load, and the file keeps both
+beside the list, mirroring the first hub, so an older library reading it
+still has its hub and token. `PATCH` still takes either old key.
 
 `modelRoots` can take its **default** from the process environment
 (`Settings.default_model_roots`), for a host whose layout is fixed
@@ -36,6 +39,7 @@ environment keeps supplying the rest.
 
 from __future__ import annotations
 
+import copy
 import logging
 import re
 import threading
@@ -46,7 +50,9 @@ from typing import Any
 import yaml
 
 from . import _private_files, security
+from . import catalogue_sources as sources_mod
 from ._generated.models import (
+    CatalogueSource,
     ConfigDocument,
     ConfigField,
     ConfigFieldError,
@@ -143,32 +149,27 @@ FIELDS: list[ConfigField] = [
         default=True,
     ),
     ConfigField(
-        key="catalogueBaseUrl",
-        label="Catalogue address",
+        key=sources_mod.SOURCES_KEY,
+        label="Where to find models",
         description=(
-            "Where the catalogue lives. Change this only for a private "
-            "or mirrored hub that speaks the same API — a regional "
-            "mirror, or an enterprise instance. Hardcoding the public "
-            "hub would make this component useless behind either."
+            "The places Discover searches, together; every result says "
+            "which one it came from. A hub is Hugging Face or anything "
+            "that speaks its API — a regional mirror, or an enterprise "
+            "instance — at its own address, with its own access token: "
+            "needed for gated models (the ones whose licence you accept "
+            "on their own page) and private repositories, and worth "
+            "setting even without either, because the hub serves a "
+            "signed-in client faster and allows it more requests. Tokens "
+            "are stored encrypted and never shown again. An engine's list "
+            "is the models an engine says it supports (Strata's sizes of "
+            "Qwen3.8-Flash-Next, for one), as the node picked in Discover "
+            "reports them; leave its engine empty for every engine's. "
+            "Switching a source off stops searching it; turning off "
+            "Search and download models stops everything."
         ),
         category="catalogue",
-        valueType=ConfigValueType.url,
-        default="https://huggingface.co",
-    ),
-    ConfigField(
-        key="hfToken",
-        label="Catalogue access token",
-        description=(
-            "A token from your account on the catalogue. Needed for "
-            "gated models — the ones whose licence you have to accept on "
-            "their own page — and for private repositories. Worth "
-            "setting even without either: the hub's own response tells "
-            "unauthenticated clients that a token raises the request "
-            "limit and speeds up transfers. Stored encrypted."
-        ),
-        category="catalogue",
-        valueType=ConfigValueType.secret,
-        sensitive=True,
+        valueType=ConfigValueType.catalogue_sources,
+        default=sources_mod.default_sources(),
     ),
     ConfigField(
         key="downloadLayout",
@@ -268,7 +269,6 @@ DEFAULT_ROOTS_VARIABLE = "EUGENE_PLEXUS_LIBRARY_DEFAULT_MODEL_ROOTS"
 #: What an unset value does, shown where the control would otherwise be
 #: blank (settings never lie, 2026-09-30).
 UNSET_MEANS: dict[str, str] = {
-    "hfToken": "Not set: the hub is asked anonymously, which reaches every public model.",
     "starterModelsFile": "Not set: uses the starter list shipped with this version.",
     ROOTS_KEY: "No folders: nothing is scanned, and a download has nowhere to go.",
 }
@@ -319,7 +319,8 @@ def _is_unset(field: ConfigField, value: Any) -> bool:
 
 
 def _defaults(*, default_roots: Sequence[str] = ()) -> dict[str, Any]:
-    values = {f.key: f.default for f in FIELDS if f.default is not None}
+    # Copies: a default list held as a value must not be the schema's own.
+    values = {f.key: copy.deepcopy(f.default) for f in FIELDS if f.default is not None}
     if default_roots:
         values[ROOTS_KEY] = coerce_folders(list(default_roots))
     return values
@@ -341,6 +342,9 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
 
     if vt == ConfigValueType.library_folders:
         return validate_folders(value)
+
+    if vt == ConfigValueType.catalogue_sources:
+        return sources_mod.validate(value)
 
     if vt == ConfigValueType.path_list:
         if not isinstance(value, list):
@@ -441,9 +445,10 @@ class ConfigStore:
                 if not isinstance(raw, dict):
                     raise ValueError(f"config file {self._path} must be a YAML mapping at the root")
                 merged = self._field_defaults()
+                merged[sources_mod.SOURCES_KEY] = self._sources_loaded(raw)
                 for key, value in raw.items():
                     field = _FIELDS_BY_KEY.get(key)
-                    if field is None:
+                    if field is None or key == sources_mod.SOURCES_KEY:
                         continue
                     value = self._decrypt_loaded(key, value)
                     # A `null` (or, for a secret or an address, an empty
@@ -473,6 +478,33 @@ class ConfigStore:
                 self._write_locked()
             self._started = dict(self._values)
 
+    def _sources_loaded(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
+        """`catalogueSources` as the file has it, its tokens opened; or, in a
+        file written before LS4, the list its hub address and token mean."""
+        listed = raw.get(sources_mod.SOURCES_KEY)
+        if not isinstance(listed, list):
+            return sources_mod.migrate(
+                self._decrypt_loaded(
+                    sources_mod.OLD_ADDRESS_KEY, raw.get(sources_mod.OLD_ADDRESS_KEY)
+                ),
+                self._decrypt_loaded(sources_mod.OLD_TOKEN_KEY, raw.get(sources_mod.OLD_TOKEN_KEY)),
+            )
+        out: list[dict[str, Any]] = []
+        for entry in listed:
+            if not isinstance(entry, dict):
+                continue
+            held = dict(entry)
+            held.pop("hasToken", None)
+            if "token" in held:
+                where = f"{sources_mod.SOURCES_KEY}[{held.get('id')}].token"
+                token = self._decrypt_loaded(where, held["token"])
+                if isinstance(token, str) and token.strip():
+                    held["token"] = token.strip()
+                else:
+                    held.pop("token")
+            out.append(held)
+        return out
+
     def _decrypt_loaded(self, key: str, value: Any) -> Any:
         if not security.is_envelope(value):
             return value
@@ -494,6 +526,9 @@ class ConfigStore:
             out: dict[str, Any] = {}
             for key, value in self._values.items():
                 field = _FIELDS_BY_KEY.get(key)
+                if key == sources_mod.SOURCES_KEY:
+                    out[key] = sources_mod.redact(value)
+                    continue
                 out[key] = REDACTED if (field and field.sensitive and value is not None) else value
             return ConfigDocument.model_validate(out)
 
@@ -529,6 +564,18 @@ class ConfigStore:
 
         with self._lock:
             for key, new_value in patch.items():
+                if key in (sources_mod.OLD_ADDRESS_KEY, sources_mod.OLD_TOKEN_KEY):
+                    # Replaced by `catalogueSources` (LS4); still accepted, as
+                    # the first hub's address or token, for an older caller.
+                    listed, error = sources_mod.apply_old_key(
+                        self._values.get(sources_mod.SOURCES_KEY), key, new_value
+                    )
+                    if error is not None:
+                        rejected.append(ConfigFieldError(key=key, message=error))
+                        continue
+                    self._values[sources_mod.SOURCES_KEY] = listed
+                    applied.append(key)
+                    continue
                 field = _FIELDS_BY_KEY.get(key)
                 if field is None:
                     rejected.append(ConfigFieldError(key=key, message="unknown field"))
@@ -536,6 +583,15 @@ class ConfigStore:
                 error = _validate_value(field, new_value)
                 if error is not None:
                     rejected.append(ConfigFieldError(key=key, message=error))
+                    continue
+                if key == sources_mod.SOURCES_KEY:
+                    # Tokens are kept per id across a round trip that was shown
+                    # none; null is the default list, keeping them the same way.
+                    self._values[key] = sources_mod.merge(
+                        new_value if new_value is not None else sources_mod.default_sources(),
+                        self._values.get(key),
+                    )
+                    applied.append(key)
                     continue
 
                 defaults = self._field_defaults()
@@ -596,21 +652,11 @@ class ConfigStore:
     def catalogue_enabled(self) -> bool:
         return bool(self.get("catalogueEnabled"))
 
-    def catalogue_base_url(self) -> str:
-        value = self.get("catalogueBaseUrl")
-        return value if isinstance(value, str) and value.strip() else "https://huggingface.co"
-
-    def hf_token(self) -> str | None:
-        """The real token, never the redaction.
-
-        `as_document` replaces a sensitive value with the redacted
-        marker for the wire; this reads through to what is actually
-        stored, and is the only path that should.
-        """
-        value = self.get("hfToken")
-        if not isinstance(value, str) or not value.strip() or value == REDACTED:
-            return None
-        return value.strip()
+    def catalogue_sources(self) -> list[CatalogueSource]:
+        """The sources with their real tokens, never the redaction:
+        `as_document` hides them for the wire, and this is the only path
+        that reads them."""
+        return sources_mod.as_models(self.get(sources_mod.SOURCES_KEY) or [])
 
     def download_layout(self) -> str:
         value = self.get("downloadLayout")
@@ -629,11 +675,30 @@ class ConfigStore:
         value = self.get("guidanceContextLength")
         return value if isinstance(value, int) and value > 0 else 8192
 
+    def _sealed(self, value: str | None) -> Any:
+        """A secret as the file holds it: sealed when there is a master key."""
+        if value and self._master_key is not None:
+            return security.seal(value, self._master_key).to_dict()
+        return value or None
+
+    def _sealed_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        out = {k: v for k, v in entry.items() if k != "token"}
+        if entry.get("token"):
+            out["token"] = self._sealed(entry["token"])
+        return out
+
     def _write_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         on_disk: dict[str, Any] = {}
         for key, value in self._values.items():
             field = _FIELDS_BY_KEY.get(key)
+            if key == sources_mod.SOURCES_KEY:
+                on_disk[key] = [self._sealed_entry(e) for e in value or [] if isinstance(e, dict)]
+                # What a library older than LS4 reads: the first hub.
+                address, token = sources_mod.mirror(value)
+                on_disk[sources_mod.OLD_ADDRESS_KEY] = address
+                on_disk[sources_mod.OLD_TOKEN_KEY] = self._sealed(token)
+                continue
             if key == ROOTS_KEY and self._roots_defaulted:
                 # The environment's default is not the operator's choice,
                 # so it is not written down as one. `[]` here reads back

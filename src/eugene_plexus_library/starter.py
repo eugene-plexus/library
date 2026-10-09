@@ -371,6 +371,7 @@ def _score(
             format=ModelFormat.gguf,
             architecture=entry.architecture,
             quantization=gguf.quant_from_filename(PurePosixPath(entry.file).name),
+            file=PurePosixPath(entry.file).name,
         ),
     )
 

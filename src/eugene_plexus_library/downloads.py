@@ -66,6 +66,7 @@ from ._generated.models import (
     DownloadState,
     ModelFileRole,
 )
+from .catalogue_sources import HubClients
 from .hub import FileMetadata, HubClient, HubError, git_blob_sha1
 from .scan_manager import ScanManager
 from .store import StateStore
@@ -283,17 +284,24 @@ class DownloadJob:
         *,
         record: Download,
         files: list[FileMetadata],
-        client: HubClient,
+        client: HubClient | Callable[[], HubClient],
         store: StateStore,
         scan_manager: ScanManager | None,
     ) -> None:
         self.record = record
         self.metadata = {f.path: f for f in files}
-        self._client = client
+        # A callable since LS4: the hub this record names, resolved from live
+        # config at each use, so a token saved mid-download reaches the next
+        # file and a source removed since says so rather than using another.
+        self._get_client = client if callable(client) else (lambda: client)
         self._store = store
         self._scan_manager = scan_manager
         self.task: asyncio.Task[None] | None = None
         self._samples: list[tuple[float, int]] = []
+
+    @property
+    def _client(self) -> HubClient:
+        return self._get_client()
 
     # -- progress ---------------------------------------------------------
 
@@ -657,14 +665,18 @@ class DownloadManager:
     def __init__(
         self,
         *,
-        client: HubClient,
+        client: HubClient | None = None,
+        clients: HubClients | None = None,
         store: StateStore,
         scan_manager: ScanManager | None,
         roots: Callable[[], list[Path]],
         layout: Callable[[], str],
         concurrency: Callable[[], int],
     ) -> None:
-        self._client = client
+        if clients is None and client is None:
+            raise ValueError("a download manager needs a hub client or the hub sources")
+        self._clients = clients
+        self._single = client
         self._store = store
         self._scan_manager = scan_manager
         self._roots = roots
@@ -677,10 +689,22 @@ class DownloadManager:
             self._jobs[record.id] = DownloadJob(
                 record=record,
                 files=[],
-                client=client,
+                client=self._client_of(record.source),
                 store=store,
                 scan_manager=scan_manager,
             )
+
+    def _resolve(self, source: str | None) -> tuple[str | None, HubClient]:
+        """The hub a download names (LS4), or the default, and its id; raises
+        `SourceProblem` (a `HubError`) naming why it cannot be used."""
+        if self._clients is None:
+            assert self._single is not None
+            return source, self._single
+        hub, client = self._clients.resolve(source)
+        return hub.id, client
+
+    def _client_of(self, source: str | None) -> Callable[[], HubClient]:
+        return lambda: self._resolve(source)[1]
 
     # -- reporting ----------------------------------------------------------
 
@@ -767,8 +791,11 @@ class DownloadManager:
             resolve_file(directory=directory, root=root, name=spec.filename)
 
         revision = spec.revision or "main"
-        metadata = await self._file_metadata(spec.repo, revision, list(spec.files))
-        commit = await self._pin_commit(spec.repo, revision, list(spec.files))
+        # The hub, resolved once and recorded, so a resume asks the same one
+        # even after the sources are reordered.
+        source, client = self._resolve(spec.source)
+        metadata = await self._file_metadata(client, spec.repo, revision, list(spec.files))
+        commit = await self._pin_commit(client, spec.repo, revision, list(spec.files))
 
         entries: list[DownloadFile] = []
         for index, repo_path in enumerate(spec.files):
@@ -793,6 +820,7 @@ class DownloadManager:
             id=download_id or uuid.uuid4().hex[:12],
             state=DownloadState.queued,
             repo=spec.repo,
+            source=source,
             revision=revision,
             resolvedCommit=commit,
             root=str(root),
@@ -809,7 +837,7 @@ class DownloadManager:
         job = DownloadJob(
             record=record,
             files=list(metadata.values()),
-            client=self._client,
+            client=self._client_of(source),
             store=self._store,
             scan_manager=self._scan_manager,
         )
@@ -823,7 +851,7 @@ class DownloadManager:
         return record
 
     async def _file_metadata(
-        self, repo: str, revision: str, wanted: list[str]
+        self, client: HubClient, repo: str, revision: str, wanted: list[str]
     ) -> dict[str, FileMetadata]:
         """Sizes and digests for the requested files, from the tree API.
 
@@ -831,7 +859,7 @@ class DownloadManager:
         tree is where sizes and `lfs.oid` live, and a 30-file repo would
         otherwise cost 30 requests against the resolver budget.
         """
-        tree = await self._client.tree(repo, revision=revision)
+        tree = await client.tree(repo, revision=revision)
         by_path = {f.path: f for f in tree}
         missing = [p for p in wanted if p not in by_path]
         if missing:
@@ -844,7 +872,9 @@ class DownloadManager:
             )
         return {p: by_path[p] for p in wanted}
 
-    async def _pin_commit(self, repo: str, revision: str, files: list[str]) -> str | None:
+    async def _pin_commit(
+        self, client: HubClient, repo: str, revision: str, files: list[str]
+    ) -> str | None:
         """Resolve `main` to a commit and hold it for the whole download.
 
         `main` moves — repos are requantized and re-uploaded under the
@@ -854,7 +884,7 @@ class DownloadManager:
         impossible rather than merely detectable.
         """
         try:
-            resolved = await self._client.head_file(repo=repo, revision=revision, path=files[0])
+            resolved = await client.head_file(repo=repo, revision=revision, path=files[0])
         except HubError as exc:
             if exc.status in (403, 404):
                 raise
@@ -969,6 +999,7 @@ class DownloadManager:
         if not job.metadata:
             with contextlib.suppress(HubError, DownloadError):
                 job.metadata = await self._file_metadata(
+                    self._resolve(job.record.source)[1],
                     job.record.repo,
                     job.record.resolvedCommit or job.record.revision or "main",
                     [f.path for f in job.record.files],

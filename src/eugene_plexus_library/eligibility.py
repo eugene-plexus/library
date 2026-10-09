@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import PureWindowsPath
 
 from ._generated.models import (
     EligibilityCandidate,
@@ -66,6 +67,9 @@ class Facts:
     #: The engine a `prepared` model was prepared for (its provenance file);
     #: None for every other format, and for a provenance nobody could read.
     prepared_for: str | None = None
+    #: The file's name without its folder: a GGUF's first shard (LS4). None
+    #: on a candidate that names a repo rather than a file.
+    file: str | None = None
 
 
 def facts_of_model(model: LibraryModel) -> Facts:
@@ -77,6 +81,8 @@ def facts_of_model(model: LibraryModel) -> Facts:
         mlx_quantized=bool(model.safetensors and model.safetensors.mlxQuantization is not None),
         read=True,
         prepared_for=_value(model.prepared.engine) if model.prepared else None,
+        # Either separator: a path as the library's own host spells it.
+        file=PureWindowsPath(model.path).name if model.path else None,
     )
 
 
@@ -89,6 +95,7 @@ def facts_of_candidate(candidate: EligibilityCandidate) -> Facts:
         mlx_quantized=candidate.mlxQuantized,
         read=False,
         approximate=bool(candidate.approximate),
+        file=candidate.file,
     )
 
 
@@ -116,6 +123,26 @@ def _arch_assumed(names: Sequence[str]) -> str:
     if len(names) > _NAMES_READ_OUT:
         return f"its architecture is one of the {len(names)} it loads"
     return f"its architecture is {_either(names)}"
+
+
+def _named(file: str | None, names: Sequence[str]) -> bool:
+    """A file name against a list, ignoring case: Windows and the hub both
+    keep a name's case, and a person's copy may not."""
+    return file is not None and file.casefold() in {n.casefold() for n in names}
+
+
+def _files_failure(names: Sequence[str], it: str | None) -> str:
+    if len(names) > _NAMES_READ_OUT:
+        return (
+            f"runs only the {len(names)} files on its own list, and {it or 'this one'} is not one"
+        )
+    return f"runs only {_either(names)}, and this one is {it or 'not named'}"
+
+
+def _files_assumed(names: Sequence[str]) -> str:
+    if len(names) > _NAMES_READ_OUT:
+        return f"it is one of the {len(names)} files on its own list"
+    return f"it is {_either(names)}"
 
 
 def _check(facts: Facts, need: ModelRequirement, engine: str) -> tuple[str | None, list[str]]:
@@ -148,6 +175,11 @@ def _check(facts: Facts, need: ModelRequirement, engine: str) -> tuple[str | Non
         elif facts.quantization not in need.quantizations:
             it = facts.quantization or "of a quantization this library could not read"
             return f"loads only {_either(need.quantizations)}, and this one is {it}", []
+    if need.files:
+        if facts.file is None and not facts.read:
+            assumed.append(_files_assumed(need.files))
+        elif not _named(facts.file, need.files):
+            return _files_failure(need.files, facts.file), []
     if need.mlxQuantization == MlxQuantizationRule.required:
         if facts.mlx_quantized is None:
             assumed.append("it is MLX-quantized")

@@ -47,20 +47,11 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
     scans they didn't ask for.
     """
     store: ConfigStore = request.app.state.config_store
-    result = store.apply_patch(body)
-    # The hub client is reconfigured by every catalogue route, and a
-    # download is not one: a token saved here reached the next search but
-    # not the next download, which used the old one. Now, for everything.
-    client = getattr(request.app.state, "hub_client", None)
-    if client is not None and {"hfToken", "catalogueBaseUrl", "catalogueEnabled"} & set(
-        result.applied
-    ):
-        client.configure(
-            base_url=store.catalogue_base_url(),
-            token=store.hf_token(),
-            enabled=store.catalogue_enabled(),
-        )
-    return result
+    # Nothing to reconfigure here: every hub call, a download's transfer
+    # included, asks `HubClients.resolve` for its hub, which reads the
+    # address, token and on/off from this store each time (LS4). A token
+    # saved here once reached the next search but not the next download.
+    return store.apply_patch(body)
 
 
 @router.post("/v1/config/test", response_model=ConfigTestResult)

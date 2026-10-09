@@ -13,10 +13,10 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .auth_state import load_auth_state
+from .catalogue_sources import HubClients
 from .config import DEFAULT_ROOTS_VARIABLE, ConfigStore
 from .dependencies import require_authorized, require_operator
 from .downloads import DownloadManager
-from .hub import HubClient
 from .profile_storage import StorageUnavailable
 from .routes import admin as admin_routes
 from .routes import catalogue as catalogue_routes
@@ -95,19 +95,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.scan_manager = manager
 
-    # One client for the process, so the connection pool is reused;
-    # base URL, token and the enabled flag are re-read from config on
-    # every call, so a PATCH takes effect without a restart.
-    hub_client = HubClient()
-    hub_client.configure(
-        base_url=config_store.catalogue_base_url(),
-        token=config_store.hf_token(),
-        enabled=config_store.catalogue_enabled(),
-    )
-    app.state.hub_client = hub_client
+    # One HTTP client for the process, so the connection pool is reused,
+    # and one hub client per hub source over it (LS4); address, token and
+    # the enabled flags are re-read from config on every call, so a PATCH
+    # takes effect without a restart.
+    hub_clients = HubClients(config_store.catalogue_sources, config_store.catalogue_enabled)
+    app.state.hub_clients = hub_clients
 
     app.state.download_manager = DownloadManager(
-        client=hub_client,
+        clients=hub_clients,
         store=state_store,
         scan_manager=manager,
         roots=config_store.model_roots,
@@ -142,7 +138,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # the state file before anything else stops.
         await app.state.download_manager.shutdown()
         await manager.shutdown()
-        await hub_client.aclose()
+        await hub_clients.aclose()
 
 
 def _announce_default_roots(config_store: ConfigStore) -> None:

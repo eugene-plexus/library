@@ -14,8 +14,10 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_library import hardware, hub
+from eugene_plexus_library import hardware
 from eugene_plexus_library._generated.models import Arch, Gpu, HostHardware, Os, Vendor
+
+from .conftest import mock_hubs
 
 GIB = 1024**3
 
@@ -74,7 +76,7 @@ def catalogue_client(
     configured_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[TestClient]:
     inner = httpx.AsyncClient(transport=httpx.MockTransport(upstream), follow_redirects=False)
-    configured_client.app.state.hub_client = hub.HubClient(client=inner)
+    mock_hubs(configured_client.app, inner)
     monkeypatch.setattr(hardware, "detect", lambda: HOST)
     yield configured_client
 
@@ -89,7 +91,7 @@ def offline_client(
         raise httpx.ConnectError("no route to host", request=request)
 
     inner = httpx.AsyncClient(transport=httpx.MockTransport(dead), follow_redirects=False)
-    configured_client.app.state.hub_client = hub.HubClient(client=inner)
+    mock_hubs(configured_client.app, inner)
     monkeypatch.setattr(hardware, "detect", lambda: HOST)
     yield configured_client
 
@@ -194,7 +196,7 @@ def test_a_url_that_does_not_resolve_is_a_404_naming_the_repo(
     assert response.status_code == 404
     detail = response.json()["detail"]["detail"]
     assert "nobody/nothing" in detail
-    assert "private" in detail and "hfToken" in detail
+    assert "private" in detail and "Where to find models" in detail
 
 
 def test_a_bare_name_that_does_not_resolve_falls_through_to_a_search(

@@ -63,15 +63,20 @@ _NON_REPO_PREFIXES = frozenset(
 class RepoReference:
     """A parsed reference. `certain` is what decides a 404 from a search."""
 
-    __slots__ = ("certain", "repo", "revision")
+    __slots__ = ("certain", "host", "repo", "revision")
 
-    def __init__(self, repo: str, *, revision: str | None, certain: bool) -> None:
+    def __init__(
+        self, repo: str, *, revision: str | None, certain: bool, host: str | None = None
+    ) -> None:
         self.repo = repo
         self.revision = revision
         self.certain = certain
         """True when it came from a URL. A URL names one repo, so a miss
         is an error; a bare `owner/name` is a guess, so a miss is a
         search."""
+        self.host = host
+        """A URL's host, which picks the hub it is looked up on when more
+        than one is a source (LS4). None for a bare `owner/name`."""
 
     def __repr__(self) -> str:  # pragma: no cover - debugging only
         return f"RepoReference({self.repo!r}, revision={self.revision!r}, certain={self.certain})"
@@ -130,4 +135,4 @@ def _from_url(text: str) -> RepoReference | None:
     # when they copy it.
     if len(segments) >= 4 and segments[2] in {"tree", "blob", "resolve"}:
         revision = segments[3]
-    return RepoReference(repo, revision=revision, certain=True)
+    return RepoReference(repo, revision=revision, certain=True, host=split.netloc.lower())

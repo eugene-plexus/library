@@ -28,6 +28,7 @@ from eugene_plexus_library.formats import safetensors
 from eugene_plexus_library.hub import FileMetadata, RepoInfo
 from eugene_plexus_library.store import StateStore
 
+from .conftest import mock_hubs
 from .test_catalogue_routes import HOST
 from .test_starter import budget as starter_budget
 from .test_starter import entry, write
@@ -159,6 +160,8 @@ def test_a_gguf_version_carries_the_hubs_architecture_and_its_quant(tmp_path: Pa
     assert facts["IQ2_XS"].format == ModelFormat.gguf
     assert facts["IQ2_XS"].id == "catalogue:org/repo-GGUF:IQ2_XS"
     assert not facts["IQ2_XS"].approximate
+    # The file's own name (LS4), which an engine that runs only named files reads.
+    assert facts["IQ2_XS"].file == "Repo-IQ2_XS.gguf"
 
 
 def test_a_folder_carries_what_its_remote_config_says(tmp_path: Path) -> None:
@@ -255,6 +258,7 @@ def test_a_starter_entry_carries_what_the_review_recorded(tmp_path: Path) -> Non
     assert facts.format == ModelFormat.gguf
     assert facts.architecture == built.models[0].architecture
     assert facts.id.startswith("starter:")
+    assert facts.file and facts.file.endswith(".gguf") and "/" not in facts.file
 
 
 # --- the detail route -----------------------------------------------------------
@@ -289,7 +293,7 @@ def test_the_detail_reads_a_folders_config_before_download(
         return httpx.Response(404)
 
     inner = httpx.AsyncClient(transport=httpx.MockTransport(upstream), follow_redirects=False)
-    configured_client.app.state.hub_client = hub.HubClient(client=inner)
+    mock_hubs(configured_client.app, inner)
     monkeypatch.setattr(hardware, "detect", lambda: HOST)
     body = configured_client.get(
         "/v1/catalogue/model", params={"repo": "mlx-community/M-4bit"}

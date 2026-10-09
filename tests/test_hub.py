@@ -170,7 +170,7 @@ async def test_a_gated_repo_is_a_403_that_says_what_to_do() -> None:
         )
     assert raised.value.status == 403
     assert raised.value.code == "GatedRepo"
-    assert "hfToken" in str(raised.value)
+    assert "Where to find models" in str(raised.value)
     assert "licence" in str(raised.value)
 
 
