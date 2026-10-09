@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from .. import eligibility
 from .._generated.models import (
+    EligibilityList,
+    EligibilityRequest,
     LibraryFolderList,
     LibraryModel,
     LibraryModelList,
@@ -73,6 +76,22 @@ async def list_models(
         models = sorted(store.list_models(), key=lambda m: m.name.lower())
 
     return LibraryModelList(models=models, lastScanAt=store.last_scan_at)
+
+
+@router.post("/v1/eligibility", response_model=EligibilityList)
+async def judge_eligibility(request: Request, body: EligibilityRequest) -> EligibilityList:
+    """Which engines can run each model, and the one dot it carries (LS1).
+
+    A read, so a service token may ask: the agent's Run does, with its
+    own engines. An id the library does not know is left out rather than
+    failing the rest.
+    """
+    store: StateStore = request.app.state.state_store
+    if body.models is None:
+        models = sorted(store.list_models(), key=lambda m: m.name.lower())
+    else:
+        models = [m for m in (store.get_model(i) for i in body.models) if m is not None]
+    return EligibilityList(models=[eligibility.judge(m, body.engines) for m in models])
 
 
 @router.get("/v1/models/{model_id}", response_model=LibraryModel)
