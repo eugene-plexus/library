@@ -396,6 +396,9 @@ def test_scan_with_no_roots_fails_with_a_reason(client: TestClient) -> None:
 
 def test_full_scan_is_accepted(configured_client: TestClient, models_dir: Path) -> None:
     write_gguf(models_dir / "a.gguf", qwen_like_kv())
+    # The fixture scans on startup; a second scan while it runs is a 409
+    # (seen on CI, library eb6b553), so wait for it to finish first.
+    _wait_for_scan(configured_client)
     response = configured_client.post("/v1/scan", json={"full": True})
     _wait_for_scan(configured_client)
 
