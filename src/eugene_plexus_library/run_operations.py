@@ -21,10 +21,31 @@ from typing import Any, Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ._generated.models import Download, DownloadSpec, LibraryModel, ModelProfile
+from ._generated.models import (
+    Download,
+    DownloadSpec,
+    EngineKind,
+    LibraryModel,
+    ModelProfile,
+    PreparedProvenance,
+)
 
 TERMINAL = {"ready", "skipped", "failed", "cancelled"}
 LEASE_SECONDS = 120
+
+
+class PreparationIntent(BaseModel):
+    """Prepare the model for an engine before running it (LS5). Asked for,
+    never implied: Run without it picks an engine that runs the model as it is."""
+
+    model_config = ConfigDict(extra="forbid")
+    engine: EngineKind
+    contextSize: int | None = Field(
+        default=None,
+        gt=0,
+        description="The context the engine prepares for. Absent: the engine's own "
+        "recommendation for the node.",
+    )
 
 
 class Intent(BaseModel):
@@ -33,6 +54,7 @@ class Intent(BaseModel):
     modelId: str | None = None
     download: DownloadSpec | None = None
     downloadId: str | None = None
+    preparation: PreparationIntent | None = None
 
     @model_validator(mode="after")
     def one_source(self) -> Intent:
@@ -43,19 +65,54 @@ class Intent(BaseModel):
         return self
 
 
+class PreparationStatus(BaseModel):
+    """Where a preparation is, as the engine's node reports it (LS5)."""
+
+    state: Literal["waiting", "running", "done", "failed", "cancelled"]
+    step: str | None = Field(default=None, description="The recipe's own words for where it is.")
+    message: str | None = Field(default=None, description="Its last line of output.")
+    bytesWritten: int | None = Field(
+        default=None, ge=0, description="What it has written beside the model so far."
+    )
+    bytesNeeded: int | None = Field(
+        default=None, ge=0, description="What it expects to write in all, when known."
+    )
+    warnings: list[str] = Field(
+        default_factory=list, description="What the engine's own tools warned about."
+    )
+
+
 class Checkpoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
     lease: str
     step: str = Field(
-        pattern="^(checking|awaiting-install|installing|settings|launching|loading|ready|skipped|failed)$"
+        pattern=(
+            "^(checking|awaiting-install|installing|preparing|settings|launching|loading"
+            "|ready|skipped|failed)$"
+        )
     )
     engine: str | None = None
     runtime: str | None = None
     runtimeStatus: str | None = None
     install: dict[str, Any] | None = None
+    preparation: PreparationStatus | None = None
     error: str | None = None
     failedStep: str | None = None
     loadingSince: int | None = None
+
+
+class PreparedRequest(BaseModel):
+    """The engine's node has prepared the model: list it (LS5). The library
+    writes the provenance file beside the entry, as *Add a prepared model*
+    does, and the operation goes on with the prepared model."""
+
+    model_config = ConfigDict(extra="forbid")
+    lease: str
+    name: str = Field(pattern="^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+    provenance: PreparedProvenance = Field(
+        description="`entry` is the engine's entry file as this library spells it, "
+        "inside a Library folder."
+    )
 
 
 class ProfileRequest(BaseModel):
@@ -77,6 +134,7 @@ class Operation(BaseModel):
         "checking",
         "awaiting-install",
         "installing",
+        "preparing",
         "settings",
         "launching",
         "loading",
@@ -90,6 +148,11 @@ class Operation(BaseModel):
     runtimeStatus: str | None = None
     download: Download | None = None
     install: dict[str, Any] | None = None
+    preparation: PreparationStatus | None = None
+    preparedFrom: LibraryModel | None = Field(
+        default=None,
+        description="The model a preparation started from; `model` is then the prepared one.",
+    )
     profile: ModelProfile | None = None
     error: str | None = None
     failedStep: str | None = None
@@ -240,6 +303,8 @@ class Journal:
                 "runtimeStatus": None,
                 "download": None,
                 "install": None,
+                "preparation": None,
+                "preparedFrom": None,
                 "profile": None,
                 "error": None,
                 "failedStep": None,
@@ -290,8 +355,18 @@ class Journal:
     def checkpoint(self, id: str, node: str | None, patch: Checkpoint) -> dict[str, Any]:
         def update(record: dict[str, Any]) -> None:
             self.verify_lease(record, node, patch.lease)
-            if patch.step in {"installing", "loading", "ready"} and record["answer"] == "skip":
+            if (
+                patch.step in {"installing", "preparing", "loading", "ready"}
+                and record["answer"] == "skip"
+            ):
                 raise HTTPException(409, "Operator skipped installation and launch")
+            if (
+                record["intent"].get("preparation")
+                and patch.step in {"settings", "launching", "loading", "ready"}
+                and record.get("preparedFrom") is None
+            ):
+                # The run goes on with the prepared model, never the original.
+                raise HTTPException(409, "The prepared model is not listed yet")
             record.update(patch.model_dump(exclude={"lease"}, exclude_unset=True))
             record.update(lease=None, leaseUntil=0)
 

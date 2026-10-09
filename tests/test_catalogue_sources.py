@@ -185,6 +185,7 @@ class Hubs:
     def __init__(self) -> None:
         self.seen: list[tuple[str, str, str | None]] = []
         self.down: set[str] = set()
+        self.searches: list[dict[str, str]] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
@@ -197,6 +198,19 @@ class Hubs:
             # Never actually transfer: these tests are about which hub is asked.
             return httpx.Response(500)
         if path == "/api/models":
+            self.searches.append(dict(request.url.params))
+            if (
+                request.url.params.get("sort") == "downloads"
+                and request.url.params.get("direction") != "-1"
+            ):
+                # As Hugging Face answers since 2026-10 (seen on the live install).
+                return httpx.Response(
+                    400,
+                    json={
+                        "error": "Invalid sort direction, only descending sort is supported "
+                        "for downloads"
+                    },
+                )
             headers = {}
             if "cursor" not in request.url.params:
                 headers["Link"] = f'<https://{host}/api/models?cursor=next-{host}>; rel="next"'
@@ -287,6 +301,22 @@ def test_every_source_is_searched_together_and_each_result_says_where_from(
         ("corp", True, 1),
         ("engines", True, 2),
     ]
+
+
+def test_a_search_asks_for_the_most_downloaded_first(
+    configured_client: TestClient, two_hubs: Hubs
+) -> None:
+    """The live install, 2026-10-09: the request's default direction is the
+    string "desc", which the route compared with the enum member by identity,
+    so every search asked for ascending order, and Hugging Face refused it."""
+    page = _search(configured_client, sort="downloads")
+    hubs = [s for s in page["sources"] if s["kind"] == "hf_hub"]
+    assert [s.get("problem") for s in hubs] == [None, None]
+    assert {s.get("direction") for s in two_hubs.searches} == {"-1"}
+    two_hubs.searches.clear()
+    # Its own words, so the 60 s search cache does not answer it.
+    _search(configured_client, sort="downloads", direction="desc", q="small")
+    assert {s.get("direction") for s in two_hubs.searches} == {"-1"}
 
 
 def test_each_hub_gets_its_own_token_and_no_other(

@@ -323,6 +323,16 @@ class Scanner:
                 continue
             ancestors = ancestors | {identity}
             yield current
+            if (current / prepared.ENGINE_FILES_MARKER).is_file():
+                # An engine's own folder: nothing below it is a model (B44).
+                result.skipped.append(
+                    SkippedPath(
+                        path=str(current),
+                        reason=SkipReason.not_a_model,
+                        detail="an engine's own prepared files; only provenance files are listed",
+                    )
+                )
+                continue
 
             try:
                 with os.scandir(current) as it:
@@ -404,6 +414,8 @@ class Scanner:
                     seen.add(model.id)
                     result.models.append(model)
                     self.counters.models_found += 1
+        if prepared.ENGINE_FILES_MARKER in names:
+            return  # the engine's own files (B44)
 
         # A safetensors model *is* the directory, so that is decided
         # before any file in it is considered on its own.

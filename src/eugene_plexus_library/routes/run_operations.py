@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import suppress
+from datetime import UTC, datetime
+from pathlib import Path as FilePath
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from pydantic import BaseModel
 
-from .. import tokens
+from .. import prepared, tokens
 from .._generated.models import DownloadSpec, LibraryModel, ModelProfileSpec
 from ..dependencies import require_authorized, require_operator
+from ..paths import is_within
 from ..run_operations import (
     TERMINAL,
     Checkpoint,
@@ -21,6 +25,7 @@ from ..run_operations import (
     Journal,
     Operation,
     OperationList,
+    PreparedRequest,
     ProfileRequest,
     public,
 )
@@ -111,6 +116,11 @@ def answer(request: Request, id: str, body: Answer) -> dict[str, Any]:
             if record["answer"] == body.answer:
                 return
             raise HTTPException(409, "Run is not waiting for an install decision")
+        if body.answer == "skip" and record["intent"].get("preparation"):
+            # Without the engine nothing can be prepared (LS5, B54).
+            raise HTTPException(
+                409, "A preparation needs its engine: install it, or cancel the preparation"
+            )
         record.update(
             answer=body.answer,
             step="installing" if body.answer == "install" else "settings",
@@ -188,6 +198,79 @@ def profile(
         record["profile"] = chosen.model_dump(mode="json")
 
     return public(journal(request).change(id, ensure))
+
+
+def _adopt(roots: list[FilePath], body: PreparedRequest) -> tuple[FilePath, FilePath]:
+    """Write the provenance file beside the prepared entry: `(file, its Library
+    folder)`. Blocking, so the route runs it in a thread."""
+    entry = body.provenance.entry
+    root = next((r for r in roots if prepared.is_absolute(entry) and is_within(entry, r)), None)
+    if root is None:
+        raise HTTPException(
+            400,
+            f"The prepared entry {entry} is not inside a Library folder "
+            f"({', '.join(str(r) for r in roots) or 'none configured'}).",
+        )
+    folder = FilePath(entry).parent
+    target = folder / f"{body.name}{prepared.SUFFIX}"
+    written = prepared.written_entry(entry, folder)
+    if not os.path.isfile(prepared.entry_path(target, written)):
+        raise HTTPException(400, f"The prepared entry {entry} is not there. Nothing was written.")
+    provenance = body.provenance.model_copy(
+        update={
+            "formatVersion": body.provenance.formatVersion or prepared.FORMAT_VERSION,
+            "entry": written,
+            "preparedAt": body.provenance.preparedAt or datetime.now(tz=UTC),
+        }
+    )
+    replace = target.exists()
+    if replace and not prepared.replaces(target, provenance, written):
+        raise HTTPException(
+            409,
+            f"{target} already exists and was not made by this preparation. Nothing was written.",
+        )
+    try:
+        prepared.write(target, provenance, replace=replace)
+    except FileExistsError:
+        raise HTTPException(409, f"{target} appeared while it was written.") from None
+    except OSError as exc:
+        raise HTTPException(400, f"Could not write {target}: {exc}") from exc
+    return target, root
+
+
+@router.post("/{id}/prepared", response_model=Operation)
+async def prepared_model(
+    request: Request, id: str, body: PreparedRequest, node: str | None = Depends(assigned_agent)
+) -> dict[str, Any]:
+    """The node prepared the model (LS5): list it and go on with it."""
+    jobs = journal(request)
+    record = await asyncio.to_thread(jobs.get, id)
+    jobs.verify_lease(record, node, body.lease)
+    preparation = record["intent"].get("preparation")
+    if record["step"] != "preparing" or not preparation:
+        raise HTTPException(409, "Run is not preparing a model")
+    if body.provenance.engine.value != preparation["engine"]:
+        raise HTTPException(409, "Run prepares for another engine")
+    roots = request.app.state.config_store.model_roots()
+    target, root = await asyncio.to_thread(_adopt, roots, body)
+    store = request.app.state.state_store
+    scans = getattr(request.app.state, "scan_manager", None)
+    if scans is not None:
+        await scans.wait()
+    found = await asyncio.to_thread(prepared.model_from, target, root)
+    model = prepared.link_sources([*store.list_models(), found])[-1]
+    model = store.add_model(model, seen_at=datetime.now(tz=UTC))
+    listed = model.model_dump(mode="json")
+
+    def update(record: dict[str, Any]) -> None:
+        jobs.verify_lease(record, node, body.lease)
+        if record["step"] != "preparing":
+            raise HTTPException(409, "Run is not preparing a model")
+        if record.get("preparedFrom") is None:
+            record["preparedFrom"] = record["model"]
+        record["model"] = listed
+
+    return public(await asyncio.to_thread(jobs.change, id, update))
 
 
 async def advance_downloads(app: Any) -> None:

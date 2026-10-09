@@ -35,6 +35,11 @@ from ._generated.models import (
 from .paths import is_within, model_id
 
 SUFFIX = ".eugene-prepared.json"
+#: A folder holding this file is an engine's own (LS5, B44): a preparation
+#: writes it before the engine's tools start. The scan lists the provenance
+#: files in that folder and reads nothing else there, nor below it: Strata's
+#: MTP helper is itself a GGUF, and is not a model.
+ENGINE_FILES_MARKER = ".eugene-engine-files"
 #: The provenance layout this library reads and writes.
 FORMAT_VERSION = 1
 
@@ -192,10 +197,34 @@ def written_entry(entry: str, folder: Path) -> str:
     return entry
 
 
-def write(path: Path, provenance: PreparedProvenance) -> None:
+def write(path: Path, provenance: PreparedProvenance, *, replace: bool = False) -> None:
     """Create the file, refusing to replace one: `x` mode, so two adoptions
-    racing for one name cannot both win."""
+    racing for one name cannot both win. `replace` is for a preparation
+    making its own file again (`replaces`), written whole or not at all."""
     body = provenance.model_dump(mode="json", exclude_none=True)
     text = json.dumps(body, indent=2) + "\n"
-    with path.open("x", encoding="utf-8", newline="\n") as handle:
+    if not replace:
+        with path.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        return
+    partial = path.with_name(path.name + ".partial")
+    with partial.open("w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
+    os.replace(partial, path)
+
+
+def replaces(existing: Path, provenance: PreparedProvenance, written: str) -> bool:
+    """A preparation may write over a provenance file only when it is its own:
+    the same engine and recipe, for the same entry (LS5, B55). Preparing a
+    model again is how its configuration changes; anything else of that name
+    is someone else's and stays."""
+    try:
+        found = read(existing)
+    except PreparedError:
+        return False
+    return (
+        provenance.recipe is not None
+        and found.recipe == provenance.recipe
+        and found.engine == provenance.engine
+        and found.entry == written
+    )

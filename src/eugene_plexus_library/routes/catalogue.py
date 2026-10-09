@@ -383,7 +383,10 @@ async def search_catalogue_sources(
             continue
         asked.append((source, status))
 
-    descending = (body.direction or CatalogueSortDirection.desc) is CatalogueSortDirection.desc
+    # By value: the generated default is the plain string "desc", which is
+    # never the enum member, so `is` asked every hub for ascending order
+    # (the least-downloaded first; Hugging Face now refuses it with a 400).
+    descending = CatalogueSortDirection(body.direction or "desc") is CatalogueSortDirection.desc
 
     async def one_hub(source: CatalogueSource) -> tuple[list[Any], str | None, Any]:
         return await hubs.client_for(source).search(
