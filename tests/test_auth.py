@@ -174,6 +174,14 @@ def test_a_service_token_cannot_start_a_scan(authed_client: TestClient, service_
     assert authed_client.post("/v1/scan", headers=_auth(service_token)).status_code == 401
 
 
+def test_a_service_token_cannot_adopt_a_prepared_model(
+    authed_client: TestClient, service_token: str
+) -> None:
+    body = {"name": "x", "provenance": {"engine": "strata", "entry": "/nowhere/x.json"}}
+    answer = authed_client.post("/v1/models/prepared", json=body, headers=_auth(service_token))
+    assert answer.status_code == 401
+
+
 def test_a_service_token_cannot_forget_a_model(
     authed_client: TestClient, service_token: str
 ) -> None:

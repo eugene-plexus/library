@@ -365,6 +365,21 @@ class StateStore:
             self._write_locked()
             return {"added": added, "updated": updated, "missing": missing}
 
+    def add_model(self, model: LibraryModel, *, seen_at: datetime) -> LibraryModel:
+        """List one model the library just wrote (a prepared model's
+        provenance file) without waiting for the next walk, which will
+        find the same file and keep it."""
+        with self._lock:
+            self._writable()
+            existing = self._models.get(model.id)
+            first = existing.firstSeenAt if existing and existing.firstSeenAt else seen_at
+            self._models[model.id] = model.model_copy(
+                update={"firstSeenAt": first, "lastSeenAt": seen_at}
+            )
+            self._reindex_locked()
+            self._write_locked()
+            return self._with_profile_count(self._models[model.id])
+
     def forget_model(self, model_id: str) -> bool:
         """Drop a missing entry and its profiles. No file is touched."""
         with self._profile_transaction():

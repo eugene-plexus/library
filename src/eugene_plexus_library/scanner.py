@@ -12,6 +12,7 @@ earns trust or quietly loses a model somebody downloaded.
 | GGUF | one `.gguf` file | the `mmproj-*` projector; shards 2..N |
 | GGUF, split | the **first** shard | the other shards individually |
 | safetensors | the **directory** | `blobs/`, `refs/`, `.no_exist/`, adapters |
+| prepared | its `<name>.eugene-prepared.json` | nothing: the engine's files are not read |
 
 ## Everything skipped is reported
 
@@ -49,6 +50,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from . import prepared
 from ._generated.models import (
     GgufDetail,
     KevCheckpointDetail,
@@ -249,6 +251,7 @@ class Scanner:
             if self._should_cancel():
                 break
             result.roots.append(self._scan_root(root, result, seen))
+        result.models = prepared.link_sources(result.models)
         return result
 
     def _scan_root(self, root: Path, result: ScanResult, seen: set[str]) -> RootResult:
@@ -387,6 +390,20 @@ class Scanner:
 
         entries.sort(key=lambda entry: entry.name)
         names = {e.name for e in entries}
+
+        # A prepared model is its provenance file, wherever it sits: beside a
+        # GGUF, inside a safetensors folder, or alone. The engine's own files
+        # are not read (`prepared`), so this comes before any format's rules.
+        for entry in entries:
+            if prepared.is_provenance(entry.name):
+                result.files_scanned += 1
+                self.counters.files_scanned += 1
+                self.counters.current_path = entry.path
+                model = prepared.model_from(Path(entry.path), root)
+                if model.id not in seen:
+                    seen.add(model.id)
+                    result.models.append(model)
+                    self.counters.models_found += 1
 
         # A safetensors model *is* the directory, so that is decided
         # before any file in it is considered on its own.

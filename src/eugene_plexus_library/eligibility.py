@@ -63,6 +63,9 @@ class Facts:
     #: unreadable. False for a candidate: an absent fact is not known yet.
     read: bool
     approximate: bool = False
+    #: The engine a `prepared` model was prepared for (its provenance file);
+    #: None for every other format, and for a provenance nobody could read.
+    prepared_for: str | None = None
 
 
 def facts_of_model(model: LibraryModel) -> Facts:
@@ -73,6 +76,7 @@ def facts_of_model(model: LibraryModel) -> Facts:
         quantization=model.gguf.quantization if model.gguf else None,
         mlx_quantized=bool(model.safetensors and model.safetensors.mlxQuantization is not None),
         read=True,
+        prepared_for=_value(model.prepared.engine) if model.prepared else None,
     )
 
 
@@ -114,11 +118,25 @@ def _arch_assumed(names: Sequence[str]) -> str:
     return f"its architecture is {_either(names)}"
 
 
-def _check(facts: Facts, need: ModelRequirement) -> tuple[str | None, list[str]]:
-    """`(why not, naming the term; the terms assumed for want of a fact)`."""
+def _check(facts: Facts, need: ModelRequirement, engine: str) -> tuple[str | None, list[str]]:
+    """`(why not, naming the term; the terms assumed for want of a fact)`.
+
+    `engine` is the kind declaring `need`: a `prepared` requirement with no
+    `preparedFor` means models prepared for that engine itself (LS3)."""
     if facts.format != _value(need.format):
         return f"loads {_value(need.format)} models, and this one is {facts.format}", []
     assumed: list[str] = []
+    if facts.format == "prepared":
+        wanted = _value(need.preparedFor) if need.preparedFor is not None else engine
+        if facts.prepared_for is None and not facts.read:
+            assumed.append(f"it was prepared for {wanted}")
+        elif facts.prepared_for is None:
+            return "loads prepared models, and this one's provenance file could not be read", []
+        elif facts.prepared_for != wanted:
+            return (
+                f"loads only models prepared for {wanted}, and this one was prepared for "
+                f"{facts.prepared_for}"
+            ), []
     if need.architectures:
         if facts.architecture is None and not facts.read:
             assumed.append(_arch_assumed(need.architectures))
@@ -172,7 +190,7 @@ def _judge_engine(facts: Facts, engine: EligibilityEngine) -> tuple[EngineVerdic
     """One model against one engine, and whether the verdict rests on a guess."""
     met: list[tuple[ModelRequirement, list[str]]] = []
     for need in engine.accepts:
-        failure, assumed = _check(facts, need)
+        failure, assumed = _check(facts, need, _value(engine.engine))
         if failure is None:
             met.append((need, assumed))
     best = (
@@ -213,7 +231,7 @@ def _why_not(facts: Facts, engine: EligibilityEngine) -> str:
         return "loads no model from the library"
     same_format = [n for n in engine.accepts if _value(n.format) == facts.format]
     if same_format:
-        return _check(facts, same_format[0])[0] or "does not load this model"
+        return _check(facts, same_format[0], _value(engine.engine))[0] or "does not load this model"
     formats = sorted({_value(n.format) for n in engine.accepts})
     return f"loads {_either(formats)} models, and this one is {facts.format}"
 

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+from datetime import UTC, datetime
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from .. import eligibility
+from .. import eligibility, prepared
 from .._generated.models import (
     EligibilityList,
     EligibilityRequest,
@@ -12,10 +17,13 @@ from .._generated.models import (
     LibraryModel,
     LibraryModelList,
     ModelStatus,
+    PreparedModelRequest,
     Problem,
 )
 from ..config import ConfigStore
 from ..dependencies import require_operator
+from ..paths import is_within, same_path
+from ..scan_manager import ScanManager
 from ..store import StateStore
 
 router = APIRouter(tags=["models"])
@@ -100,6 +108,108 @@ async def judge_eligibility(request: Request, body: EligibilityRequest) -> Eligi
             *(eligibility.judge_candidate(c, body.engines) for c in candidates),
         ]
     )
+
+
+def _write_provenance(body: PreparedModelRequest, roots: list[Path]) -> tuple[Path, Path]:
+    """Choose the folder, check the entry where it can be checked, and
+    create the file: `(provenance file, its Library folder)`. Blocking,
+    so the route runs it in a thread: a folder can be on a dead share."""
+    entry = body.provenance.entry
+    if body.root is None and body.subdirectory is None:
+        # Beside what it describes, when that is in a Library folder.
+        holder = next(
+            (r for r in roots if prepared.is_absolute(entry) and is_within(entry, r)), None
+        )
+        root = holder or roots[0]
+        folder = Path(entry).parent if holder is not None else root
+    else:
+        if body.root is None:
+            root = roots[0]
+        else:
+            match = next((r for r in roots if same_path(r, body.root)), None)
+            if match is None:
+                raise _problem(
+                    status.HTTP_400_BAD_REQUEST,
+                    "Not a Library folder",
+                    f"{body.root!r} is not one of this library's folders "
+                    f"({', '.join(str(r) for r in roots)}).",
+                )
+            root = match
+        folder = (root / body.subdirectory).expanduser() if body.subdirectory else root
+        if not is_within(folder, root):
+            raise _problem(
+                status.HTTP_400_BAD_REQUEST,
+                "Outside the Library folder",
+                f"{body.subdirectory!r} resolves outside {root}.",
+            )
+    target = folder / f"{body.name}{prepared.SUFFIX}"
+    written = prepared.written_entry(entry, folder)
+    resolved = prepared.entry_path(target, written)
+    # An entry in a Library folder is on this host, so it can be checked
+    # now. Any other absolute entry is a path on the node that runs it.
+    here = not prepared.is_absolute(written) or any(is_within(written, r) for r in roots)
+    if here and not os.path.isfile(resolved):
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Entry file not found",
+            f"The entry file {resolved} is not there. Nothing was written.",
+        )
+    provenance = body.provenance.model_copy(
+        update={
+            "formatVersion": body.provenance.formatVersion or prepared.FORMAT_VERSION,
+            "entry": written,
+            "preparedAt": body.provenance.preparedAt or datetime.now(tz=UTC),
+        }
+    )
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        prepared.write(target, provenance)
+    except FileExistsError:
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "Already there",
+            f"{target} already exists. Nothing was written; choose another name.",
+        ) from None
+    except OSError as exc:
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Cannot write there",
+            f"Could not write {target}: {exc}. Nothing was written.",
+        ) from exc
+    return target, root
+
+
+@router.post(
+    "/v1/models/prepared",
+    response_model=LibraryModel,
+    status_code=201,
+    dependencies=[Depends(require_operator)],
+)
+async def add_prepared_model(request: Request, body: PreparedModelRequest) -> LibraryModel:
+    """Adopt a model an engine prepared, by writing its provenance file (LS3).
+
+    One small file in a Library folder; the engine's own files are never
+    read, copied or moved. Listed at once rather than at the next walk,
+    after any walk in flight, which could otherwise drop it from the list
+    it installs.
+    """
+    config: ConfigStore = request.app.state.config_store
+    store: StateStore = request.app.state.state_store
+    roots = config.model_roots()
+    if not roots:
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST,
+            "No Library folder",
+            "No Library folders are configured, so there is nowhere to keep the provenance "
+            "file. Add one under Library → Folders.",
+        )
+    target, root = await asyncio.to_thread(_write_provenance, body, roots)
+    scans: ScanManager | None = getattr(request.app.state, "scan_manager", None)
+    if scans is not None:
+        await scans.wait()
+    found = await asyncio.to_thread(prepared.model_from, target, root)
+    model = prepared.link_sources([*store.list_models(), found])[-1]
+    return store.add_model(model, seen_at=datetime.now(tz=UTC))
 
 
 @router.get("/v1/models/{model_id}", response_model=LibraryModel)

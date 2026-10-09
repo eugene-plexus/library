@@ -154,6 +154,19 @@ async def get_model_fit(
         raise _problem(
             status.HTTP_404_NOT_FOUND, "Unknown model", f"No model with id {model_id!r}."
         )
+    if model.format is ModelFormat.prepared:
+        # This arithmetic is llama.cpp's; a prepared model is in its engine's
+        # own format, which nothing here reads (library-sources-and-engines §6.1).
+        engine = model.prepared.engine.value if model.prepared else "an engine"
+        raise _problem(
+            422,
+            "Fit not estimated",
+            (
+                f"{model.name} was prepared for {engine}, in that engine's own format, "
+                "which the library does not read. No engine has its own fit estimate yet, "
+                "so none is given rather than llama.cpp's."
+            ),
+        )
     if model.status is ModelStatus.missing:
         raise _problem(
             status.HTTP_409_CONFLICT,
