@@ -534,8 +534,8 @@ class MlxQuantizationRule(StrEnum):
 
 class ModelRequirementAuthority(StrEnum):
     """
-    Who can say a match will load. `eugene`: the fields above are the
-    whole rule, so a match is `runs`. `engine`: the engine decides
+    Who can say a match will load. Absent means `eugene`. `eugene`:
+    the fields above are the whole rule, so a match is `runs`. `engine`: the engine decides
     when it loads (vLLM's model registry, for one), so a match is
     only `may_run` (Troy's L4).
 
@@ -2269,7 +2269,7 @@ class ModelRequirement(BaseModel):
     )
     mlxQuantization: MlxQuantizationRule | None = None
     preparation: ModelPreparation | None = None
-    authority: ModelRequirementAuthority | None = 'eugene'
+    authority: ModelRequirementAuthority | None = None
     preference: int | None = Field(
         100,
         description="Among the engines that run a model, lower is offered first and\nis what Run picks, unless the person has chosen a default\nengine for the format (Troy's L10).\n",
