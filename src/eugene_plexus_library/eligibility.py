@@ -5,6 +5,14 @@ this matches a model's own facts against it. The console's Library page
 and the agent's Run both ask here, so no rule is written twice: the MLX
 rule used to be, once in the console and once in the agent.
 
+Since LS2 it judges models not downloaded yet too (`EligibilityCandidate`):
+Discover's search rows, a repo's versions and the starter set, by the
+facts the catalogue answers carry. The rules are the same; what differs is
+what an absent fact means. On a library model the library read the files,
+so an absent fact is *unreadable* and fails a term that needs it. On a
+candidate nobody has read them yet, so an absent fact is *not known* and
+the term is assumed, at best `may_run`, and said.
+
 Pure: the facts are the library's own, the engines are the caller's, and
 nothing is fetched. Engines are named by kind only; how an engine is
 called in words is the console's business, not the library's.
@@ -13,8 +21,10 @@ called in words is the console's business, not the library's.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 
 from ._generated.models import (
+    EligibilityCandidate,
     EligibilityEngine,
     EligibilityLevel,
     EngineVerdict,
@@ -34,6 +44,49 @@ _RANK = {
 }
 _LAST = 1_000_000
 
+# Past this many names a list is counted, not read out: llama.cpp declares
+# every architecture its build knows, well over a hundred.
+_NAMES_READ_OUT = 4
+
+
+@dataclass(frozen=True)
+class Facts:
+    """What the judge reads of a model, wherever the model is."""
+
+    id: str
+    format: str
+    architecture: str | None
+    quantization: str | None
+    #: None only on a candidate: not known yet.
+    mlx_quantized: bool | None
+    #: True for a library model: the files were read, so an absent fact is
+    #: unreadable. False for a candidate: an absent fact is not known yet.
+    read: bool
+    approximate: bool = False
+
+
+def facts_of_model(model: LibraryModel) -> Facts:
+    return Facts(
+        id=model.id,
+        format=_value(model.format),
+        architecture=model.architecture,
+        quantization=model.gguf.quantization if model.gguf else None,
+        mlx_quantized=bool(model.safetensors and model.safetensors.mlxQuantization is not None),
+        read=True,
+    )
+
+
+def facts_of_candidate(candidate: EligibilityCandidate) -> Facts:
+    return Facts(
+        id=candidate.id,
+        format=_value(candidate.format),
+        architecture=candidate.architecture,
+        quantization=candidate.quantization,
+        mlx_quantized=candidate.mlxQuantized,
+        read=False,
+        approximate=bool(candidate.approximate),
+    )
+
 
 def _value(item: object) -> str:
     return str(getattr(item, "value", item))
@@ -43,79 +96,126 @@ def _either(items: Sequence[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " or " + items[-1]
 
 
-def _quantization(model: LibraryModel) -> str | None:
-    return model.gguf.quantization if model.gguf else None
+def _arch_failure(names: Sequence[str], it: str | None) -> str:
+    if len(names) > _NAMES_READ_OUT:
+        count = f"loads {len(names)} named architectures"
+        if it is None:
+            return f"{count}, and this library could not read this one's"
+        return f"{count}, and {it} is not one of them"
+    return (
+        f"loads only the {_either(names)} architecture, and this one is "
+        f"{it or 'of an architecture this library could not read'}"
+    )
 
 
-def _mlx_marked(model: LibraryModel) -> bool:
-    return bool(model.safetensors and model.safetensors.mlxQuantization is not None)
+def _arch_assumed(names: Sequence[str]) -> str:
+    if len(names) > _NAMES_READ_OUT:
+        return f"its architecture is one of the {len(names)} it loads"
+    return f"its architecture is {_either(names)}"
 
 
-def _failed_term(model: LibraryModel, need: ModelRequirement) -> str | None:
-    """Why `model` does not meet `need`, naming the term; None when it does."""
-    if _value(model.format) != _value(need.format):
-        return f"loads {_value(need.format)} models, and this one is {_value(model.format)}"
-    if need.architectures and model.architecture not in need.architectures:
-        it = model.architecture or "of an architecture this library could not read"
-        return f"loads only the {_either(need.architectures)} architecture, and this one is {it}"
-    if need.quantizations and _quantization(model) not in need.quantizations:
-        it = _quantization(model) or "of a quantization this library could not read"
-        return f"loads only {_either(need.quantizations)}, and this one is {it}"
-    if need.mlxQuantization == MlxQuantizationRule.required and not _mlx_marked(model):
-        return "loads only MLX-quantized folders, and this one is not"
-    if need.mlxQuantization == MlxQuantizationRule.forbidden and _mlx_marked(model):
-        return "cannot load MLX-quantized weights; only MLX reads them"
-    return None
+def _check(facts: Facts, need: ModelRequirement) -> tuple[str | None, list[str]]:
+    """`(why not, naming the term; the terms assumed for want of a fact)`."""
+    if facts.format != _value(need.format):
+        return f"loads {_value(need.format)} models, and this one is {facts.format}", []
+    assumed: list[str] = []
+    if need.architectures:
+        if facts.architecture is None and not facts.read:
+            assumed.append(_arch_assumed(need.architectures))
+        elif facts.architecture not in need.architectures:
+            return _arch_failure(need.architectures, facts.architecture), []
+    if need.quantizations:
+        if facts.quantization is None and not facts.read:
+            assumed.append(f"it is {_either(need.quantizations)}")
+        elif facts.quantization not in need.quantizations:
+            it = facts.quantization or "of a quantization this library could not read"
+            return f"loads only {_either(need.quantizations)}, and this one is {it}", []
+    if need.mlxQuantization == MlxQuantizationRule.required:
+        if facts.mlx_quantized is None:
+            assumed.append("it is MLX-quantized")
+        elif not facts.mlx_quantized:
+            return "loads only MLX-quantized folders, and this one is not", []
+    if need.mlxQuantization == MlxQuantizationRule.forbidden:
+        if facts.mlx_quantized is None:
+            assumed.append("it is not MLX-quantized")
+        elif facts.mlx_quantized:
+            return "cannot load MLX-quantized weights; only MLX reads them", []
+    return None, assumed
 
 
-def _verdict_of(need: ModelRequirement) -> EngineVerdictKind:
+def _verdict_of(need: ModelRequirement, assumed: Sequence[str]) -> EngineVerdictKind:
     if need.preparation is not None:
         return EngineVerdictKind.after_preparation
-    if need.authority == ModelRequirementAuthority.engine:
+    if need.authority == ModelRequirementAuthority.engine or assumed:
         return EngineVerdictKind.may_run
     return EngineVerdictKind.runs
 
 
-def _words(verdict: EngineVerdictKind, need: ModelRequirement) -> str:
+def _words(verdict: EngineVerdictKind, need: ModelRequirement, assumed: Sequence[str]) -> str:
+    unless = f" if {' and '.join(assumed)}, which is not known yet" if assumed else ""
     if verdict == EngineVerdictKind.after_preparation:
         made = need.preparation.note if need.preparation and need.preparation.note else None
-        return "runs it after preparing it" + (f" ({made})" if made else "")
-    if verdict == EngineVerdictKind.may_run:
-        return need.note or "may run it; only the engine can tell, when it loads"
+        return "runs it after preparing it" + (f" ({made})" if made else "") + unless
+    if need.authority == ModelRequirementAuthority.engine:
+        said = need.note or "may run it; only the engine can tell, when it loads"
+        return said + (f"; and only{unless}" if assumed else "")
+    if assumed:
+        return "runs it" + unless + (f"; {need.note}" if need.note else "")
     return "runs it as it is" + (f"; {need.note}" if need.note else "")
-
-
-def judge_engine(model: LibraryModel, engine: EligibilityEngine) -> EngineVerdict:
-    """One model against one engine: the best requirement it meets, or why none."""
-    met = [need for need in engine.accepts if _failed_term(model, need) is None]
-    best = min(met, key=lambda n: (_RANK[_verdict_of(n)], _preference(n))) if met else None
-    verdict = _verdict_of(best) if best else EngineVerdictKind.no
-    return EngineVerdict(
-        engine=engine.engine,
-        available=engine.available,
-        installable=bool(engine.installable),
-        experimental=bool(engine.experimental),
-        verdict=verdict,
-        reason=_words(verdict, best) if best else _why_not(model, engine),
-        preparation=best.preparation if best else None,
-        preference=_preference(best) if best else None,
-    )
 
 
 def _preference(need: ModelRequirement) -> int:
     return need.preference if need.preference is not None else 100
 
 
-def _why_not(model: LibraryModel, engine: EligibilityEngine) -> str:
+def _judge_engine(facts: Facts, engine: EligibilityEngine) -> tuple[EngineVerdict, bool]:
+    """One model against one engine, and whether the verdict rests on a guess."""
+    met: list[tuple[ModelRequirement, list[str]]] = []
+    for need in engine.accepts:
+        failure, assumed = _check(facts, need)
+        if failure is None:
+            met.append((need, assumed))
+    best = (
+        min(met, key=lambda m: (_RANK[_verdict_of(*m)], len(m[1]), _preference(m[0])))
+        if met
+        else None
+    )
+    if best is None:
+        verdict, reason, assumed = EngineVerdictKind.no, _why_not(facts, engine), []
+    else:
+        need, assumed = best
+        verdict = _verdict_of(need, assumed)
+        reason = _words(verdict, need, assumed)
+    return (
+        EngineVerdict(
+            engine=engine.engine,
+            available=engine.available,
+            installable=bool(engine.installable),
+            experimental=bool(engine.experimental),
+            verdict=verdict,
+            reason=reason,
+            preparation=best[0].preparation if best else None,
+            preference=_preference(best[0]) if best else None,
+        ),
+        bool(assumed),
+    )
+
+
+def judge_engine(model: LibraryModel, engine: EligibilityEngine) -> EngineVerdict:
+    """One library model against one engine: the best requirement it meets, or why none."""
+    return _judge_engine(facts_of_model(model), engine)[0]
+
+
+def _why_not(facts: Facts, engine: EligibilityEngine) -> str:
     """The most telling reason: a requirement of this model's own format
     fails on a finer term, which says more than "wrong format" does."""
     if not engine.accepts:
         return "loads no model from the library"
-    same_format = [n for n in engine.accepts if _value(n.format) == _value(model.format)]
+    same_format = [n for n in engine.accepts if _value(n.format) == facts.format]
     if same_format:
-        return _failed_term(model, same_format[0]) or "does not load this model"
+        return _check(facts, same_format[0])[0] or "does not load this model"
     formats = sorted({_value(n.format) for n in engine.accepts})
-    return f"loads {_either(formats)} models, and this one is {_value(model.format)}"
+    return f"loads {_either(formats)} models, and this one is {facts.format}"
 
 
 def level_of(verdicts: Iterable[EngineVerdict]) -> EligibilityLevel:
@@ -142,7 +242,23 @@ def _order(verdict: EngineVerdict) -> tuple[bool, int, int, str]:
     )
 
 
-def judge(model: LibraryModel, engines: Sequence[EligibilityEngine]) -> ModelEligibility:
+def judge_facts(facts: Facts, engines: Sequence[EligibilityEngine]) -> ModelEligibility:
     """Every engine against one model, best first, and the model's level."""
-    verdicts = sorted((judge_engine(model, e) for e in engines), key=_order)
-    return ModelEligibility(modelId=model.id, level=level_of(verdicts), engines=verdicts)
+    judged = [_judge_engine(facts, e) for e in engines]
+    verdicts = sorted((v for v, _ in judged), key=_order)
+    return ModelEligibility(
+        modelId=facts.id,
+        level=level_of(verdicts),
+        engines=verdicts,
+        approximate=facts.approximate or any(guessed for _, guessed in judged),
+    )
+
+
+def judge(model: LibraryModel, engines: Sequence[EligibilityEngine]) -> ModelEligibility:
+    return judge_facts(facts_of_model(model), engines)
+
+
+def judge_candidate(
+    candidate: EligibilityCandidate, engines: Sequence[EligibilityEngine]
+) -> ModelEligibility:
+    return judge_facts(facts_of_candidate(candidate), engines)

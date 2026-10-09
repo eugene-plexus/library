@@ -34,7 +34,8 @@ from .._generated.models import (
     StarterSet,
 )
 from ..config import ConfigStore
-from ..hub import HubClient, HubError
+from ..formats import safetensors
+from ..hub import HubClient, HubError, gather_limited
 from ..store import StateStore
 
 log = logging.getLogger(__name__)
@@ -328,7 +329,10 @@ async def get_catalogue_model(
 
     Two upstream calls: the repo's metadata and its file list. The file
     list is where sizes live, which is why this is a per-repo call and
-    not something the search screen can do for every row.
+    not something the search screen can do for every row. Plus, since
+    LS2, one small ranged read of each safetensors folder's `config.json`
+    (cached like the rest), so its facts carry the MLX marker and the
+    architecture before anything is downloaded.
     """
     client = _client(request)
     config: ConfigStore = request.app.state.config_store
@@ -345,6 +349,10 @@ async def get_catalogue_model(
     budget = await _budget(
         request, vram=vramBytes, ram=ramBytes, unified=unifiedMemory, gpu_count=gpuCount
     )
+    paths = catalogue_mod.config_paths(files, repo=repo)
+    read = await gather_limited(
+        [_remote_config(client, repo, revision, path) for path in paths], limit=4
+    )
     return catalogue_mod.build_model(
         info=info,
         files=files,
@@ -353,7 +361,24 @@ async def get_catalogue_model(
         budget=budget,
         context_length=contextLength or config.guidance_context_length(),
         kv_cache_type=kvCacheType,
+        configs=dict(zip(paths, read, strict=True)),
     )
+
+
+async def _remote_config(
+    client: HubClient, repo: str, revision: str, path: str
+) -> safetensors.ModelConfig | None:
+    """One folder's `config.json`, read before download (LS2), or None.
+
+    A failure costs one fact, not the answer: the folder is judged with its
+    MLX marker and architecture not known, which the verdict says."""
+    try:
+        return safetensors.parse_config(
+            await client.read_small(repo, revision=revision, path=path), name=path
+        )
+    except (HubError, safetensors.SafetensorsError) as exc:
+        log.info("catalogue %s: could not read %s (%s)", repo, path, exc)
+        return None
 
 
 @router.get("/v1/catalogue/starter", response_model=StarterSet)

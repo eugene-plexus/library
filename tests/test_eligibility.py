@@ -10,10 +10,12 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_library import eligibility
 from eugene_plexus_library._generated.models import (
+    EligibilityCandidate,
     EligibilityEngine,
     EligibilityLevel,
     EngineVerdictKind,
     LibraryModel,
+    ModelEligibility,
 )
 
 from .conftest import qwen_like_kv, write_gguf, write_hf_model
@@ -187,3 +189,121 @@ def test_the_route_judges_scanned_models_and_leaves_out_unknown_ids(
 
     every = configured_client.post("/v1/eligibility", json={"engines": engines}).json()
     assert len(every["models"]) == 2
+
+
+# --- candidates not downloaded yet (LS2) ------------------------------------
+
+# llama.cpp as an installed build declares it: every architecture it knows.
+BUILD = ["llama", "qwen2", "qwen3", "gemma3", "mistral3", "phi3"]
+LLAMA_BUILD = {"engine": "llama_cpp", "accepts": [{"format": "gguf", "architectures": BUILD}]}
+
+
+def candidate(fmt: str, **facts: Any) -> EligibilityCandidate:
+    return EligibilityCandidate.model_validate({"id": "c", "format": fmt, **facts})
+
+
+def judged(c: EligibilityCandidate, *engines: EligibilityEngine) -> ModelEligibility:
+    return eligibility.judge_candidate(c, list(engines))
+
+
+def by_engine(answer: ModelEligibility) -> dict[str, tuple[str, str]]:
+    return {str(v.engine): (str(v.verdict), v.reason) for v in answer.engines}
+
+
+def test_a_candidate_is_judged_by_the_same_rules_as_a_library_model() -> None:
+    answer = judged(candidate("gguf", architecture="qwen3"), engine(LLAMA_BUILD), engine(VLLM))
+    assert by_engine(answer)["llama_cpp"] == ("runs", "runs it as it is")
+    assert by_engine(answer)["vllm"][0] == "no"
+    assert answer.level == EligibilityLevel.works_here
+    assert answer.approximate is False
+    assert answer.modelId == "c"
+
+
+def test_a_long_architecture_list_is_counted_not_read_out() -> None:
+    answer = judged(candidate("gguf", architecture="qwen4exp"), engine(LLAMA_BUILD))
+    assert by_engine(answer)["llama_cpp"] == (
+        "no",
+        "loads 6 named architectures, and qwen4exp is not one of them",
+    )
+
+
+def test_an_unknown_architecture_is_assumed_and_said_never_runs() -> None:
+    answer = judged(candidate("gguf"), engine(LLAMA_BUILD), engine(STRATA))
+    got = by_engine(answer)
+    assert got["llama_cpp"] == (
+        "may_run",
+        "runs it if its architecture is one of the 6 it loads, which is not known yet",
+    )
+    assert got["strata"] == (
+        "after_preparation",
+        "runs it after preparing it (an expert pack and MTP helper) if its architecture is "
+        "qwen4exp, which is not known yet",
+    )
+    assert answer.approximate is True
+    assert answer.level == EligibilityLevel.works_here
+
+
+def test_on_a_library_model_an_absent_architecture_is_unreadable_not_unknown() -> None:
+    unread = model("gguf", gguf={"quantization": "Q4_K_M"})
+    assert verdicts(unread, engine(LLAMA_BUILD))["llama_cpp"] == (
+        "no",
+        "loads 6 named architectures, and this library could not read this one's",
+    )
+
+
+def test_flash_next_from_the_hub_is_amber_where_llama_cpp_does_not_know_it() -> None:
+    answer = judged(candidate("gguf", architecture="qwen4exp"), engine(LLAMA_BUILD), engine(STRATA))
+    assert by_engine(answer)["strata"][0] == "after_preparation"
+    assert by_engine(answer)["llama_cpp"][0] == "no"
+    assert answer.level == EligibilityLevel.other_engine
+
+
+def test_the_mlx_marker_read_from_a_remote_config_decides_before_download() -> None:
+    marked = judged(candidate("safetensors", mlxQuantized=True), engine(VLLM), engine(MLX))
+    assert by_engine(marked)["mlx"][0] == "runs"
+    assert by_engine(marked)["vllm"][0] == "no"
+    plain = judged(candidate("safetensors", mlxQuantized=False), engine(VLLM), engine(MLX))
+    assert by_engine(plain)["vllm"] == ("may_run", "vLLM checks the architecture when it loads")
+    assert plain.approximate is False
+
+
+def test_an_unread_marker_leaves_vllm_may_run_and_says_what_it_rests_on() -> None:
+    answer = judged(candidate("safetensors"), engine(VLLM), engine(MLX))
+    got = by_engine(answer)
+    assert got["vllm"] == (
+        "may_run",
+        "vLLM checks the architecture when it loads; and only if it is not MLX-quantized, "
+        "which is not known yet",
+    )
+    # MLX's own rule for a plain folder needs no guess, so it is preferred
+    # over the MLX-quantized rule that would.
+    assert got["mlx"] == ("may_run", "may run it; only the engine can tell, when it loads")
+    assert answer.approximate is True
+
+
+def test_a_search_row_is_approximate_whatever_it_assumed() -> None:
+    row = candidate("gguf", architecture="qwen3", approximate=True)
+    assert judged(row, engine(LLAMA_BUILD)).approximate is True
+
+
+def test_the_route_judges_candidates_after_models_and_alone_judges_only_them(
+    configured_client: TestClient, models_dir: Path
+) -> None:
+    write_gguf(models_dir / "a-Q4_K_M.gguf", qwen_like_kv(name="A"))
+    _scan(configured_client)
+    engines = [{**LLAMA_BUILD, "available": True}, {**STRATA, "available": True}]
+    rows = [
+        {"id": "row:1", "format": "gguf", "architecture": "qwen4exp", "approximate": True},
+        {"id": "row:2", "format": "safetensors", "mlxQuantized": True},
+    ]
+    only = configured_client.post(
+        "/v1/eligibility", json={"candidates": rows, "engines": engines}
+    ).json()["models"]
+    assert [m["modelId"] for m in only] == ["row:1", "row:2"]
+    assert only[0]["level"] == "other_engine" and only[0]["approximate"] is True
+    assert only[1]["level"] == "not_here"
+    ids = [m["id"] for m in configured_client.get("/v1/models").json()["models"]]
+    both = configured_client.post(
+        "/v1/eligibility", json={"models": ids, "candidates": rows[:1], "engines": engines}
+    ).json()["models"]
+    assert [m["modelId"] for m in both] == [*ids, "row:1"]

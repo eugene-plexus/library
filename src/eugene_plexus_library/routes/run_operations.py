@@ -42,7 +42,14 @@ def assigned_agent(
         return node
     if not claims.is_service or claims.sub != tokens.SUB_AGENT:
         raise HTTPException(403, "An assigned node agent is required")
-    return claims.issuer_node
+    return _unjoined_is_null(claims.issuer_node)
+
+
+def _unjoined_is_null(node: str | None) -> str | None:
+    """An agent that has not joined a root signs as `local`, and the console
+    names its node `null` (it has no name to send): one node, so one value.
+    Without this its one-click Run waited at *checking* for ever (library#7)."""
+    return None if node == tokens.STANDALONE_NODE else node
 
 
 @router.get("", response_model=OperationList, dependencies=[Depends(require_operator)])
@@ -80,6 +87,7 @@ def submit(
             raise HTTPException(404, "Download is not in the Library")
         return None
 
+    intent = intent.model_copy(update={"node": _unjoined_is_null(intent.node)})
     return public(journal(request).create(id, intent, resolve))
 
 

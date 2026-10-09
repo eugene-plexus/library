@@ -231,3 +231,25 @@ def test_install_answer_survives_restart_and_is_idempotent(client):
     jobs.checkpoint("a", None, Checkpoint(lease=lease, step="settings"))
     assert client.post("/v1/run-operations/a/answer", json={"answer": "skip"}).status_code == 200
     assert client.post("/v1/run-operations/a/answer", json={"answer": "install"}).status_code == 409
+
+
+def test_an_unjoined_agent_claims_the_run_its_console_named_null(app, tmp_path):
+    """library#7: an agent that has not joined a root signs as `local`, and
+    its console, with no node name to send, submits `node: null`."""
+    from .conftest import FakeInstall
+
+    install = FakeInstall(tmp_path / "node", name="local")
+    app.state.auth_state = install.auth_state()
+    with TestClient(app) as client:
+        model = _model(tmp_path / "model.gguf")
+        app.state.state_store.replace_models([model], scanned_at=datetime.now(UTC))
+        operator = {"Authorization": "Bearer " + install.session()}
+        agent = {"Authorization": "Bearer " + install.service("agent")}
+        intent = {"node": None, "modelId": model.id}
+        assert client.put("/v1/run-operations/a", json=intent, headers=operator).status_code == 202
+        listed = client.get("/v1/run-operations/assigned", headers=agent).json()["operations"]
+        assert [o["id"] for o in listed] == ["a"]
+        assert client.post("/v1/run-operations/a/claim", headers=agent).status_code == 200
+        # The workaround spelling lands on the same node, and is the same intent.
+        named = {"node": "local", "modelId": model.id}
+        assert client.put("/v1/run-operations/a", json=named, headers=operator).status_code == 202

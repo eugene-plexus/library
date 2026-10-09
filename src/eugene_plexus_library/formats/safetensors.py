@@ -311,12 +311,18 @@ class ModelConfig:
 
 def read_config(path: Path) -> ModelConfig:
     """Read a `config.json`. Raises `SafetensorsError` if unparseable."""
+    return parse_config(path.read_bytes(), name=path.name)
+
+
+def parse_config(data: bytes, *, name: str = "config.json") -> ModelConfig:
+    """Parse a `config.json` from its bytes: a local file, or a remote one
+    the catalogue read before download (LS2), by the same rules."""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(data.decode("utf-8"))
     except ValueError as exc:
-        raise SafetensorsError(f"{path.name}: not valid JSON ({exc})") from exc
+        raise SafetensorsError(f"{name}: not valid JSON ({exc})") from exc
     if not isinstance(raw, dict):
-        raise SafetensorsError(f"{path.name}: not a JSON object")
+        raise SafetensorsError(f"{name}: not a JSON object")
 
     architectures = raw.get("architectures")
     architecture: str | None = None

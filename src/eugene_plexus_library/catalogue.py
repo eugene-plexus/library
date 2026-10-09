@@ -51,6 +51,7 @@ from ._generated.models import (
     CatalogueModel,
     CatalogueRecommendation,
     CatalogueSearchResult,
+    EligibilityCandidate,
     Fit,
     FitVerdict,
     GateKind,
@@ -62,7 +63,7 @@ from ._generated.models import (
     ModelStatus,
     QuantSource,
 )
-from .formats import gguf
+from .formats import gguf, safetensors
 from .hub import FileMetadata, RepoInfo
 from .store import StateStore
 
@@ -77,6 +78,9 @@ _SAFETENSORS_SIDECARS = {
     "config.json",
     "generation_config.json",
     "tokenizer.json",
+    # SentencePiece: the only tokenizer some Llama, Mistral and Gemma
+    # repos ship. Left out, the download was a folder nothing could load.
+    "tokenizer.model",
     "tokenizer_config.json",
     "special_tokens_map.json",
     "vocab.json",
@@ -313,6 +317,10 @@ def _safetensors_groups(
     return candidates, other
 
 
+def _name(path: str) -> str:
+    return PurePosixPath(path.replace("\\", "/")).name.lower()
+
+
 def _owned(group: _Group, store: StateStore) -> AlreadyOwned | None:
     """Is this candidate already on the disk?
 
@@ -325,11 +333,13 @@ def _owned(group: _Group, store: StateStore) -> AlreadyOwned | None:
     weights = group.files[0] if group.files else None
     if weights is None:
         return None
-    wanted = PurePosixPath(weights.path).name.lower()
+    wanted = _name(weights.path)
+    if group.format is ModelFormat.safetensors:
+        return _owned_folder(group, wanted, store)
     for model in store.list_models():
         if model.status is not ModelStatus.present:
             continue
-        if PurePosixPath(model.path.replace("\\", "/")).name.lower() != wanted:
+        if _name(model.path) != wanted:
             continue
         if model.sizeBytes and abs(model.sizeBytes - group.size) > 1024 * 1024:
             # Same name, materially different size: a requantized
@@ -339,6 +349,111 @@ def _owned(group: _Group, store: StateStore) -> AlreadyOwned | None:
             continue
         return AlreadyOwned(modelId=model.id, path=model.path, matchedOn=MatchedOn.name_and_size)
     return None
+
+
+def _owned_folder(group: _Group, wanted: str, store: StateStore) -> AlreadyOwned | None:
+    """The same question for a safetensors folder, whose model path is the
+    folder rather than a file: it never matched a weights file's name, so
+    such a candidate never said *already on disk* (design doc section 7).
+    Matched on the first weights file's name inside the folder, and on the
+    weights' total size, which leaves out tokenizer files a copy may lack."""
+    want = sum(f.size for f in group.files if f.path.lower().endswith(".safetensors"))
+    for model in store.list_models():
+        if model.status is not ModelStatus.present or model.format is not ModelFormat.safetensors:
+            continue
+        names = {_name(f.path): f for f in model.files or []}
+        if wanted not in names:
+            continue
+        held = sum(f.sizeBytes or 0 for n, f in names.items() if n.endswith(".safetensors"))
+        if held and abs(held - want) > 1024 * 1024:
+            continue
+        return AlreadyOwned(modelId=model.id, path=model.path, matchedOn=MatchedOn.name_and_size)
+    return None
+
+
+# -- facts for the judge (LS2) ----------------------------------------------
+
+MAX_CONFIG_READS = 8
+"""Folders whose `config.json` one detail call reads. A repo publishing more
+variants than this is rare; the rest are judged with the marker unknown."""
+
+
+def config_path(group: _Group) -> str | None:
+    return next((f.path for f in group.files if _name(f.path) == safetensors.CONFIG_NAME), None)
+
+
+def config_paths(files: list[FileMetadata], *, repo: str) -> list[str]:
+    """The `config.json` of each safetensors candidate, for the detail call to read."""
+    groups, _ = _safetensors_groups(files, repo=repo)
+    paths = [p for p in (config_path(g) for g in groups) if p is not None]
+    return paths[:MAX_CONFIG_READS]
+
+
+def _gguf_architecture(info: RepoInfo) -> str | None:
+    """`general.architecture` as the hub read it. Not `RepoInfo.architecture`,
+    which falls back to the config's `model_type`: another vocabulary."""
+    value = info.gguf.get("architecture")
+    return value if isinstance(value, str) else None
+
+
+def candidate_facts(
+    group: _Group,
+    *,
+    repo: str,
+    info: RepoInfo,
+    configs: dict[str, safetensors.ModelConfig | None],
+) -> EligibilityCandidate:
+    """One version's facts, as `POST /v1/eligibility` judges them."""
+    ident = f"catalogue:{repo}:{group.label}"
+    if group.format is ModelFormat.gguf:
+        first = group.files[0].path if group.files else ""
+        return EligibilityCandidate(
+            id=ident,
+            format=ModelFormat.gguf,
+            architecture=_gguf_architecture(info),
+            quantization=gguf.quant_from_filename(PurePosixPath(first).name),
+        )
+    path = config_path(group)
+    config = configs.get(path) if path else None
+    return EligibilityCandidate(
+        id=ident,
+        format=group.format,
+        architecture=config.architecture if config else None,
+        mlxQuantized=(config.mlx_quantization is not None) if config else None,
+    )
+
+
+def search_facts(repo: str, formats: list[ModelFormat], entry: dict) -> list[EligibilityCandidate]:
+    """A search row's facts, one per format it appears to serve: guesses from
+    its tags and the hub's repo-level GGUF block, so always approximate."""
+    tags = [t for t in (entry.get("tags") or []) if isinstance(t, str)]
+    block = entry.get("gguf")
+    gguf_arch = block.get("architecture") if isinstance(block, dict) else None
+    config = entry.get("config")
+    names = config.get("architectures") if isinstance(config, dict) else None
+    st_arch = names[0] if isinstance(names, list) and names and isinstance(names[0], str) else None
+    out = []
+    for fmt in formats:
+        if fmt is ModelFormat.gguf:
+            out.append(
+                EligibilityCandidate(
+                    id=f"search:{repo}:gguf",
+                    format=fmt,
+                    architecture=gguf_arch if isinstance(gguf_arch, str) else None,
+                    approximate=True,
+                )
+            )
+        else:
+            out.append(
+                EligibilityCandidate(
+                    id=f"search:{repo}:{fmt.value}",
+                    format=fmt,
+                    architecture=st_arch,
+                    mlxQuantized="mlx" in tags or entry.get("library_name") == "mlx",
+                    approximate=True,
+                )
+            )
+    return out
 
 
 def _shape_from_repo(info: RepoInfo) -> fit_mod.ModelShape:
@@ -462,8 +577,12 @@ def build_model(
     budget: MemoryBudget,
     context_length: int,
     kv_cache_type: KvCacheType = KvCacheType.f16,
+    configs: dict[str, safetensors.ModelConfig | None] | None = None,
 ) -> CatalogueModel:
-    """Assemble the detail response: candidates, guidance, warnings."""
+    """Assemble the detail response: candidates, guidance, warnings.
+
+    `configs` are the safetensors folders' remote `config.json`s by path, as
+    the route read them (`config_paths`); a missing one is not known."""
     gguf_groups, projectors, gguf_other = _gguf_groups(files)
     st_groups, st_other = _safetensors_groups(files, repo=info.repo)
 
@@ -491,6 +610,7 @@ def build_model(
                 ),
                 alreadyOwned=_owned(group, store),
                 gated=info.gated is not GateKind.open,
+                facts=candidate_facts(group, repo=info.repo, info=info, configs=configs or {}),
             )
         )
 
@@ -601,6 +721,7 @@ def build_search_result(entry: dict) -> CatalogueSearchResult:
         owner=entry.get("author") or (repo.split("/")[0] if "/" in repo else None),
         name=repo.split("/")[-1] if repo else None,
         formats=formats,
+        facts=search_facts(repo, formats, entry),
         gated=gated,
         private=bool(entry.get("private")),
         downloads=entry.get("downloads"),

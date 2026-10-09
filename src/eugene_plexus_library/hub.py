@@ -314,6 +314,36 @@ class _TtlCache:
         self._entries.clear()
 
 
+SEARCH_FIELDS = (
+    "author",
+    "tags",
+    "library_name",
+    "gated",
+    "private",
+    "downloads",
+    "likes",
+    "trendingScore",
+    "pipeline_tag",
+    "createdAt",
+    "lastModified",
+    "gguf",
+)
+"""What a search row asks upstream for, by name (LS2).
+
+`gguf` is the repo-level GGUF block, whose `architecture` lets a row be
+judged against llama.cpp's and Strata's architecture lists without a call
+per row. Upstream's `expand[]` **replaces** `full=true` rather than adding
+to it (measured 2026-10-09: `full=true&expand[]=gguf` answered `id` and
+`gguf` alone), so every field a row shows is named here; the file list
+(`siblings`), which `full` brought and no row used, is no longer fetched.
+"""
+
+CONFIG_READ_LIMIT = 256 * 1024
+"""The most of a folder's `config.json` the detail call reads (LS2).
+
+Ordinary configs are 1-10 KB and multimodal ones tens of KB; a file that
+is still cut off here is judged without it, as not known."""
+
 _SORT_FIELDS: dict[CatalogueSort, str] = {
     CatalogueSort.downloads: "downloads",
     CatalogueSort.likes: "likes",
@@ -485,7 +515,7 @@ class HubClient:
         """
         params: list[tuple[str, str | int | float | bool | None]] = [
             ("limit", str(limit)),
-            ("full", "true"),
+            *(("expand[]", name) for name in SEARCH_FIELDS),
             ("sort", _SORT_FIELDS[sort]),
             ("direction", "-1" if descending else "1"),
         ]
@@ -538,16 +568,14 @@ class HubClient:
     ) -> list[dict[str, Any]]:
         """A ranked listing with the metadata a review needs, expanded.
 
-        **`full=true` and `expand[]` do not combine**, and `search()`
-        above needs the one while this needs the other. `full=true`
+        **`full=true` and `expand[]` do not combine**: `full=true`
         alone returns `siblings` (the file list) but neither `gguf` nor
         `cardData`; with any `expand[]` present, `full=true` is ignored
         and each row is `_id`, `id` and exactly the expanded keys. No
-        single call carries both a repo's files and its `gguf` block, so
-        the ranking call is its own method rather than a flag on the
-        search one; sharing them would mean one of the two callers gets
-        a body it cannot read and no error saying so. Neither method
-        sends both.
+        single call carries both a repo's files and its `gguf` block.
+        Since LS2 `search()` expands too (`SEARCH_FIELDS`), but names a
+        different set: the ranking call stays its own method so neither
+        caller gets a body it cannot read and no error saying so.
 
         Re-measured 2026-10-03, anonymous GETs to `/api/models` with
         `sort=downloads&direction=-1&filter=gguf`: with `full=true`
@@ -756,6 +784,43 @@ class HubClient:
                 f"{response.status_code}); refusing to read the whole file.",
             )
         return response.content
+
+    async def read_small(
+        self, repo: str, *, revision: str, path: str, limit: int = CONFIG_READ_LIMIT
+    ) -> bytes:
+        """The first `limit` bytes of a small file, such as a folder's `config.json`.
+
+        A Range read like `read_range`, so the detail call can tell an
+        MLX-quantized folder from a plain one before 20 GB is fetched (LS2).
+        Unlike there, a 200 is accepted: the file is small and a server may
+        answer a range covering all of it with the whole file. Never more
+        than `limit` bytes are read either way. Cached like the JSON calls,
+        because the detail call is repeated whenever the context changes.
+        """
+        self._require_enabled()
+        key = f"small:{repo}@{revision}:{path}:{limit}"
+        hit = self._cache.get(key)
+        if hit is not None:
+            return bytes(hit[0])
+        url = self.resolve_url(repo, revision=revision, path=path)
+        headers = self._headers({"Range": f"bytes=0-{limit - 1}"})
+        body = bytearray()
+        try:
+            async with self._client.stream(
+                "GET", url, headers=headers, follow_redirects=True
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    self._raise_for(response, what=f"{path!r} in {repo!r}")
+                async for chunk in response.aiter_bytes():
+                    body += chunk
+                    if len(body) >= limit:
+                        break
+        except httpx.HTTPError as exc:
+            raise HubError(f"Could not read {path!r} from {repo!r} ({exc}).", status=503) from exc
+        data = bytes(body[:limit])
+        self._cache.put(key, data)
+        return data
 
     def stream(
         self, repo: str, *, revision: str, path: str, first: int | None = None

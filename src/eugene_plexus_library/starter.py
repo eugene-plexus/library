@@ -62,17 +62,20 @@ import yaml
 from . import fit as fit_mod
 from ._generated.models import (
     AlreadyOwned,
+    EligibilityCandidate,
     FitOffload,
     FitVerdict,
     KvCacheType,
     MatchedOn,
     MemoryBudget,
+    ModelFormat,
     ModelStatus,
     StarterModel,
     StarterRecommendation,
     StarterSet,
     StarterSetSource,
 )
+from .formats import gguf
 from .store import StateStore
 
 log = logging.getLogger(__name__)
@@ -361,6 +364,14 @@ def _score(
             kv_cache_type=kv,
         ),
         alreadyOwned=_owned(entry, store) if store is not None else None,
+        # What the review recorded, judged like any version (LS2): the
+        # starter set is GGUF, and its label is the quant in the file's name.
+        facts=EligibilityCandidate(
+            id=f"starter:{entry.repo}:{entry.file}",
+            format=ModelFormat.gguf,
+            architecture=entry.architecture,
+            quantization=gguf.quant_from_filename(PurePosixPath(entry.file).name),
+        ),
     )
 
 
