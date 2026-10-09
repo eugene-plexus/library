@@ -420,9 +420,13 @@ class EngineKind(StrEnum):
     it or tell when it is ready.
 
     `strata` is experimental. It launches Strata's Python HTTP
-    server and native engine together, using a prepared Strata JSON
-    configuration as `RuntimeSpec.modelPath`. It does not accept an
-    arbitrary GGUF or prepare model weights automatically.
+    server and native engine together, and loads a model Strata
+    prepared (`ModelFormat` `prepared`): `RuntimeSpec.modelPath`
+    names that model's provenance file (`PreparedProvenance`), whose
+    `entry` is Strata's own JSON configuration. A runtime declared
+    before LS3 may name the JSON configuration itself; that still
+    launches. It does not accept an arbitrary GGUF, and does not yet
+    prepare one itself (LS5).
 
     `kev` drives upstream `python -m kev.serve` and loads Kev
     decision checkpoints (`kev_checkpoint` format) — a decision
@@ -505,6 +509,16 @@ class ModelFormat(StrEnum):
       scanner on purpose, and the decision head is what makes this
       one a launchable model instead. Decision-only —
       `ModelCapabilities.decision`, never `chat`.
+    * `prepared` — what one engine made for itself from another
+      model, in the engine's own format: Strata's expert pack,
+      lookup table and MTP helper, with its JSON configuration
+      (library-sources-and-engines.md §4.5, Troy's L6). The library
+      does not read the engine's files; a small provenance file
+      beside them, `<name>.eugene-prepared.json`
+      (`PreparedProvenance`), names the engine, its entry file and
+      what it was made from, and is the model's path. Only the
+      engine it was prepared for loads it
+      (`ModelRequirement.preparedFor`).
 
     Shared because it appears on both sides of a join: a library
     entry declares what a model *is*, and an engine's
@@ -517,6 +531,7 @@ class ModelFormat(StrEnum):
     gguf = 'gguf'
     safetensors = 'safetensors'
     kev_checkpoint = 'kev_checkpoint'
+    prepared = 'prepared'
 
 
 class MlxQuantizationRule(StrEnum):
@@ -558,6 +573,32 @@ class ModelPreparation(BaseModel):
         ..., description="The adapter's name for the step, e.g. `strata-prepare`."
     )
     note: str | None = Field(None, description='What the step makes, in words.')
+
+
+class PreparedSource(BaseModel):
+    """
+    What a prepared model was made from, as far as it is known. Every
+    field is optional: a model adopted from outside Eugene may say
+    nothing, and "not known" is shown as such.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    path: str | None = Field(
+        None,
+        description="The source model's `LibraryModel.path`, when it is a library\nmodel. The library links the two by it (`PreparedDetail.sourceModelId`).\n",
+    )
+    repoId: str | None = Field(
+        None,
+        description='The hub repo it came from, e.g. `ISTA-DASLab/Qwen3.8-Flash-Next-GGUF`.',
+    )
+    file: str | None = Field(
+        None,
+        description='The repo-relative file, for a GGUF (its first shard when split).',
+    )
+    revision: str | None = Field(None, description='The repo commit.')
 
 
 class EligibilityCandidate(BaseModel):
@@ -1530,6 +1571,47 @@ class KevCheckpointDetail(BaseModel):
     )
 
 
+class PreparedDetail(BaseModel):
+    """
+    A prepared model's provenance, as its file
+    (`PreparedProvenance`) says it, and what the library made of it.
+    Present iff `format` is `prepared` and the file could be read.
+
+    The engine's own files are not read (experimental-engines.md:
+    prepared files stay usable without the library parsing them), so
+    a prepared model has no architecture, context, size or fit here:
+    the engine says what it loaded when it is ready
+    (`RuntimeCapabilities`), and fit waits for the engine's own fit
+    model (LS6). `files` lists the provenance file (`index`) and the
+    entry file (`config`) when the library's host can see it.
+
+    """
+
+    engine: EngineKind
+    entry: str = Field(
+        ..., description='The entry file as the provenance file writes it.'
+    )
+    entryPath: str | None = Field(
+        None,
+        description="`entry` resolved against the folder holding the provenance\nfile, on this library's host; the same as `entry` when that\nis absolute.\n",
+    )
+    entryFound: bool | None = Field(
+        None,
+        description="Whether this library's host sees the entry file. A relative\nentry that is not there makes the model `unreadable`. An\nabsolute entry not seen here is not an error: it is a path on\nthe node that runs the model (an engine's prepared files\nbelong on that node's own fast drive, which only its agent\nsees), and the agent checks it when the model starts, naming\nany missing file.\n",
+    )
+    recipe: str | None = Field(
+        None,
+        description='As `PreparedProvenance.recipe`; absent means prepared outside Eugene.',
+    )
+    recipeVersion: str | None = None
+    source: PreparedSource | None = None
+    sourceModelId: str | None = Field(
+        None,
+        description='The library model it was prepared from, when `source.path`\nnames one this library lists. Absent when it does not, or\nnames none.\n',
+    )
+    preparedAt: AwareDatetime | None = None
+
+
 class RecommendedSampling(BaseModel):
     """
     Sampling parameters the model's author put in the file
@@ -2316,6 +2398,10 @@ class ModelRequirement(BaseModel):
         description='The GGUF quantization must be one of these. Absent means any.',
     )
     mlxQuantization: MlxQuantizationRule | None = None
+    preparedFor: EngineKind | None = Field(
+        None,
+        description="For `format: prepared` only: the engine a prepared model must\nhave been prepared for (`PreparedProvenance.engine`). Absent:\nthe engine declaring this requirement. A prepared model never\nmeets a requirement of an engine it was not prepared for,\nsince its files are in that engine's own format.\n",
+    )
     preparation: ModelPreparation | None = None
     authority: ModelRequirementAuthority | None = None
     preference: int | None = Field(
@@ -2325,6 +2411,59 @@ class ModelRequirement(BaseModel):
     note: str | None = Field(
         None,
         description='Words for the person beside a match, in the engine\'s own terms:\n"vLLM checks the architecture when it loads".\n',
+    )
+
+
+class PreparedProvenance(BaseModel):
+    """
+    The file `<name>.eugene-prepared.json` that makes an engine's
+    prepared files a library model (`ModelFormat` `prepared`;
+    library-sources-and-engines.md §4.5, Troy's L6). A plain JSON
+    file in a Library folder, in the person's own layout like every
+    other model file, and the prepared model's `LibraryModel.path`.
+
+    Written by the library's `POST /v1/models/prepared` when a person
+    adopts a model prepared outside Eugene, and by a preparation job
+    (LS5). Read by the library's scan, which lists a `prepared` model
+    from it, and by the agent at every launch, which hands the engine
+    its entry file. Nothing reads the engine's own files beyond what
+    launching them needs: they stay usable without the library
+    parsing them (experimental-engines.md).
+
+    A reader keeps and ignores fields it does not know, so a newer
+    Eugene can add some; a `formatVersion` above the one it knows
+    means the file was written by a newer Eugene, and the model is
+    listed as unreadable rather than guessed at.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    formatVersion: int | None = Field(
+        None,
+        description='The layout of this file. Absent means 1, the only one so far.',
+        ge=1,
+    )
+    engine: EngineKind = Field(
+        ..., description='The engine it was prepared for. Only that engine loads it.'
+    )
+    entry: str = Field(
+        ...,
+        description="The engine's own entry file: for Strata, its JSON\nconfiguration, which names the pack, tokenizer and MTP files.\nRelative to the folder holding this file, or absolute. A\nrelative entry travels with the folder (through a node's\n`pathMappings`, like any model path); an absolute one is a\npath on the node that runs the model, used as written,\nbecause an engine's prepared files belong on that node's own\nfast drive.\n",
+        min_length=1,
+    )
+    recipe: str | None = Field(
+        None,
+        description='The preparation that made it (`ModelPreparation.recipe`, e.g.\n`strata-prepare`). Absent: it was made outside Eugene and\nadopted as it is.\n',
+    )
+    recipeVersion: str | None = Field(
+        None,
+        description="The recipe's or engine's version that made it, e.g. Strata `v0.1.39`.",
+    )
+    source: PreparedSource | None = None
+    preparedAt: AwareDatetime | None = Field(
+        None, description='When this file was written.'
     )
 
 
@@ -2475,6 +2614,35 @@ class SafetensorsDetail(BaseModel):
     configPath: str | None = Field(
         None,
         description='Absolute path to `config.json`, the file that made this a model.',
+    )
+
+
+class PreparedModelRequest(BaseModel):
+    """
+    Adopt a model an engine has prepared: the library writes its
+    provenance file, `<name>.eugene-prepared.json`, into a Library
+    folder and lists it (library-sources-and-engines.md §4.5). Nothing
+    else is written, copied or moved; the engine's files stay where
+    they are.
+
+    """
+
+    name: str = Field(
+        ...,
+        description="The model's name: the provenance file is\n`<name>.eugene-prepared.json`, and like any model file's name\nit is what `Runtime.modelAlias` defaults to.\n",
+        pattern='^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$',
+    )
+    root: str | None = Field(
+        None,
+        description='Which Library folder (`modelRoots`) to write into. Must be one\nof them. Absent: the folder the entry file is in, when that\nis inside a Library folder, so the provenance sits beside what\nit describes; otherwise the first Library folder.\n',
+    )
+    subdirectory: str | None = Field(
+        None,
+        description='Relative destination under `root`. Path traversal is\nrejected; the result must stay inside the root.\n',
+    )
+    provenance: PreparedProvenance = Field(
+        ...,
+        description="What to write. `entry` is what the person gave: the library\nwrites it relative to the provenance file when it lies inside\nthat file's folder, so the two move together, and as given\notherwise. `formatVersion` is written as 1 and `preparedAt`\nas now when absent.\n",
     )
 
 
@@ -2951,8 +3119,8 @@ class LibraryModel(BaseModel):
     """
     One launchable model on this host.
 
-    The format-independent facts are here; exactly one of `gguf` or
-    `safetensors` carries the rest. That split is not tidiness — a
+    The format-independent facts are here; exactly one of `gguf`,
+    `safetensors`, `kev` or `prepared` carries the rest. That split is not tidiness — a
     quant tier is a GGUF concept and an exact parameter count is a
     safetensors one, and flattening both into one object would
     produce a schema half of whose fields are null for any given
@@ -2966,7 +3134,7 @@ class LibraryModel(BaseModel):
     )
     path: str = Field(
         ...,
-        description="Absolute path, verbatim, in the operator's own layout — the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors. This is what goes on a runtime's\n`modelPath`.\n\n**A path on the host this library runs on** — inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n",
+        description="Absolute path, verbatim, in the operator's own layout — the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors, the provenance file\n(`<name>.eugene-prepared.json`) for `prepared`. This is what\ngoes on a runtime's `modelPath`.\n\n**A path on the host this library runs on** — inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n",
     )
     root: str | None = Field(
         None,
@@ -2975,7 +3143,7 @@ class LibraryModel(BaseModel):
     format: ModelFormat
     name: str = Field(
         ...,
-        description="The filename with its extension stripped, or the directory\nname for safetensors. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
+        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
     )
     displayName: str | None = Field(
         None,
@@ -2984,7 +3152,7 @@ class LibraryModel(BaseModel):
     status: ModelStatus
     sizeBytes: int | None = Field(
         None,
-        description='Total size of every file belonging to this model — all\nshards, and the projector when there is one. The number\nthat answers "will this fit on the drive I am copying it\nto", which is why it is a sum rather than the weights file\nalone.\n',
+        description='Total size of every file belonging to this model — all\nshards, and the projector when there is one. The number\nthat answers "will this fit on the drive I am copying it\nto", which is why it is a sum rather than the weights file\nalone.\n\nAbsent for `prepared`: the engine\'s own files are not read,\nso their size is not known, and the provenance file\'s few\nbytes are not the model\'s size.\n',
         ge=0,
     )
     fileCount: int | None = Field(
@@ -3018,6 +3186,7 @@ class LibraryModel(BaseModel):
     gguf: GgufDetail | None = None
     safetensors: SafetensorsDetail | None = None
     kev: KevCheckpointDetail | None = None
+    prepared: PreparedDetail | None = None
     profileCount: int | None = Field(
         None,
         description='How many launch profiles are saved against this model. On\nthe list so the browser can badge a tuned model without\nfetching every profile collection.\n',
