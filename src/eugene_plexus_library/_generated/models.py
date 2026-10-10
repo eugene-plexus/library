@@ -1718,6 +1718,49 @@ class ModelCapabilities(BaseModel):
     )
 
 
+class ModelRef(BaseModel):
+    id: str
+    name: str
+
+
+class PreparedDependent(BaseModel):
+    """
+    A prepared model made from the one being deleted (LS8).
+    """
+
+    id: str
+    name: str
+    bytesFreed: int = Field(
+        ..., description='What deleting it as well would free.', ge=0
+    )
+    refusal: str | None = Field(
+        None, description='Why it cannot be deleted now, when it cannot.'
+    )
+
+
+class ModelDeleteRequest(BaseModel):
+    token: str = Field(
+        ..., description='The `ModelDeletion.token` the person confirmed.'
+    )
+    alsoDelete: list[str] | None = Field(
+        None,
+        description='Prepared models made from it (`ModelDeletion.preparedFrom`)\nto delete with it.\n',
+    )
+
+
+class ModelDeleted(BaseModel):
+    """
+    What a delete removed (LS8).
+    """
+
+    models: list[str] = Field(
+        ..., description='The ids of the models removed from the Library.'
+    )
+    deleted: list[str] = Field(..., description='Every file removed.')
+    kept: list[str] = Field(..., description='Files kept for other models.')
+    bytesFreed: int = Field(..., ge=0)
+
+
 class ModelFileRole(StrEnum):
     """
     * `weights` — the file named on the launch line. Exactly one per
@@ -2864,6 +2907,16 @@ class ModelFile(BaseModel):
     sizeBytes: int | None = Field(None, ge=0)
 
 
+class KeptModelFile(BaseModel):
+    """
+    A file a model is made of that Delete keeps for another model (LS8).
+    """
+
+    path: str
+    sizeBytes: int | None = Field(None, ge=0)
+    usedBy: list[ModelRef]
+
+
 class GgufDetail(BaseModel):
     """
     GGUF-specific metadata, read from the file's KV block. Present
@@ -3679,6 +3732,34 @@ class LibraryModel(BaseModel):
     error: str | None = Field(
         None,
         description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
+    )
+
+
+class ModelDeletion(BaseModel):
+    """
+    What deleting a model would do, read now (LS8).
+    """
+
+    modelId: str
+    files: list[ModelFile] = Field(
+        ..., description='Every file Delete removes, with its size.'
+    )
+    kept: list[KeptModelFile] = Field(
+        ...,
+        description='Files the model is made of that another listed model also\nnames, kept for it.\n',
+    )
+    bytesFreed: int = Field(..., description='The sizes of `files`, summed.', ge=0)
+    profiles: int = Field(..., description='How many saved profiles go with it.', ge=0)
+    preparedFrom: list[PreparedDependent] = Field(
+        ...,
+        description='Prepared models made from this one (their `sourceModelId`).\nAn engine reads the source while it runs them, so they stop\nworking without it; Delete takes them only when asked\n(`ModelDeleteRequest.alsoDelete`).\n',
+    )
+    refusal: str | None = Field(
+        None,
+        description='Why it cannot be deleted now, in a sentence; absent when it\ncan. A download into its files, or a run operation preparing\nor starting it.\n',
+    )
+    token: str = Field(
+        ..., description='Names this plan; `deleteModel` refuses another.'
     )
 
 

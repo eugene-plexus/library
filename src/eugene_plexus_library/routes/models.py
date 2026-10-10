@@ -6,10 +6,11 @@ import asyncio
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from .. import eligibility, engine_fit, hardware, prepared
+from .. import deletion, eligibility, engine_fit, hardware, prepared
 from .._generated.models import (
     EligibilityList,
     EligibilityRequest,
@@ -17,6 +18,9 @@ from .._generated.models import (
     LibraryFolderList,
     LibraryModel,
     LibraryModelList,
+    ModelDeleted,
+    ModelDeleteRequest,
+    ModelDeletion,
     ModelStatus,
     PreparedModelRequest,
     Problem,
@@ -229,6 +233,114 @@ async def add_prepared_model(request: Request, body: PreparedModelRequest) -> Li
     found = await asyncio.to_thread(prepared.model_from, target, root)
     model = prepared.link_sources([*store.list_models(), found])[-1]
     return store.add_model(model, seen_at=datetime.now(tz=UTC))
+
+
+def _deletion_context(request: Request) -> dict[str, Any]:
+    """What can hold a model back from deletion: the downloads writing
+    files, and the run operations still working on a model."""
+    manager = getattr(request.app.state, "download_manager", None)
+    journal = getattr(request.app.state, "run_operations", None)
+    return {
+        "downloads": manager.records() if manager is not None else [],
+        "operations": journal.list(pending_only=True) if journal is not None else [],
+    }
+
+
+def _present(store: StateStore, model_id: str) -> LibraryModel:
+    model = store.get_model(model_id)
+    if model is None:
+        raise _problem(
+            status.HTTP_404_NOT_FOUND, "Unknown model", f"No model with id {model_id!r}."
+        )
+    return model
+
+
+@router.get(
+    "/v1/models/{model_id}/deletion",
+    response_model=ModelDeletion,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_operator)],
+)
+async def plan_model_deletion(request: Request, model_id: str) -> ModelDeletion:
+    """What Delete would remove, keep and refuse, read now (LS8). Nothing
+    is removed."""
+    store: StateStore = request.app.state.state_store
+    model = _present(store, model_id)
+    listed = store.list_models()
+    context = _deletion_context(request)
+
+    def answer() -> ModelDeletion:
+        return deletion.as_answer(deletion.plan(model, listed, **context), listed, **context)
+
+    return await asyncio.to_thread(answer)
+
+
+@router.post(
+    "/v1/models/{model_id}/delete",
+    response_model=ModelDeleted,
+    dependencies=[Depends(require_operator)],
+)
+async def delete_model(request: Request, model_id: str, body: ModelDeleteRequest) -> ModelDeleted:
+    """Delete a model's files and the model, all or nothing (LS8): what
+    the confirmed plan named, and the prepared models made from it the
+    person ticked."""
+    config: ConfigStore = request.app.state.config_store
+    store: StateStore = request.app.state.state_store
+    scans: ScanManager | None = getattr(request.app.state, "scan_manager", None)
+    if scans is not None:
+        # A walk in flight could list the files again after they go.
+        await scans.wait()
+    model = _present(store, model_id)
+    listed = store.list_models()
+    context = _deletion_context(request)
+    also = list(dict.fromkeys(body.alsoDelete or []))
+
+    def run() -> ModelDeleted:
+        shown = deletion.plan(model, listed, **context)
+        if shown.token != body.token:
+            raise _problem(
+                status.HTTP_409_CONFLICT,
+                "The model changed",
+                "Its files changed since the confirmation was read. Nothing was deleted: "
+                "open Delete again to see what it would remove now.",
+            )
+        if shown.refusal:
+            raise _problem(status.HTTP_409_CONFLICT, "Cannot delete it now", shown.refusal)
+        dependents = {m.id: m for m in shown.prepared_from}
+        unknown = [a for a in also if a not in dependents]
+        if unknown:
+            raise _problem(
+                status.HTTP_409_CONFLICT,
+                "Not made from it",
+                f"{', '.join(unknown)} is not prepared from {model.name}. Nothing was deleted.",
+            )
+        together = {model.id, *also}
+        plans = [deletion.plan(model, listed, also=also, **context)]
+        for other in also:
+            theirs = deletion.plan(dependents[other], listed, also=together, **context)
+            if theirs.refusal:
+                raise _problem(
+                    status.HTTP_409_CONFLICT,
+                    "Cannot delete it now",
+                    f"{dependents[other].name}: {theirs.refusal}",
+                )
+            plans.append(theirs)
+        paths = list(dict.fromkeys(f.path for p in plans for f in p.files))
+        try:
+            deleted = deletion.remove(paths, config.model_roots())
+        except deletion.DeleteRefused as exc:
+            raise _problem(status.HTTP_409_CONFLICT, "A file is in use", str(exc)) from exc
+        for p in plans:
+            store.forget_model(p.model.id)
+        kept = list(dict.fromkeys(k.path for p in plans for k in p.kept))
+        return ModelDeleted(
+            models=[p.model.id for p in plans],
+            deleted=deleted,
+            kept=kept,
+            bytesFreed=sum(p.bytes_freed for p in plans),
+        )
+
+    return await asyncio.to_thread(run)
 
 
 @router.get("/v1/models/{model_id}", response_model=LibraryModel)

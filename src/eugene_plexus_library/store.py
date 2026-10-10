@@ -381,7 +381,8 @@ class StateStore:
             return self._with_profile_count(self._models[model.id])
 
     def forget_model(self, model_id: str) -> bool:
-        """Drop a missing entry and its profiles. No file is touched."""
+        """Drop an entry and its profiles; no file is touched here. Forget, for a
+        missing model, and Delete once its files are gone (LS8)."""
         with self._profile_transaction():
             if model_id not in self._models and model_id not in self._profiles:
                 return False
