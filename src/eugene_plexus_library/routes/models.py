@@ -9,10 +9,11 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from .. import eligibility, prepared
+from .. import eligibility, engine_fit, hardware, prepared
 from .._generated.models import (
     EligibilityList,
     EligibilityRequest,
+    FitQuestion,
     LibraryFolderList,
     LibraryModel,
     LibraryModelList,
@@ -101,12 +102,24 @@ async def judge_eligibility(request: Request, body: EligibilityRequest) -> Eligi
         models = sorted(store.list_models(), key=lambda m: m.name.lower())
     else:
         models = [m for m in (store.get_model(i) for i in body.models or []) if m is not None]
+    question = await _fit_question(request, body.fit) if body.fit is not None else None
     return EligibilityList(
         models=[
-            *(eligibility.judge(m, body.engines) for m in models),
+            *(eligibility.judge(m, body.engines, question) for m in models),
             # Not downloaded yet (LS2): Discover's rows, versions and starters.
-            *(eligibility.judge_candidate(c, body.engines) for c in candidates),
+            *(eligibility.judge_candidate(c, body.engines, question) for c in candidates),
         ]
+    )
+
+
+async def _fit_question(request: Request, asked: FitQuestion) -> engine_fit.Question:
+    """The node's memory as the caller sent it, or this host's when it sent
+    no numbers, and the context to score at (LS6)."""
+    config: ConfigStore = request.app.state.config_store
+    detected = None if engine_fit.has_numbers(asked) else await asyncio.to_thread(hardware.detect)
+    return engine_fit.Question(
+        budget=engine_fit.budget_of(asked, detected),
+        context_length=asked.contextLength or config.guidance_context_length(),
     )
 
 

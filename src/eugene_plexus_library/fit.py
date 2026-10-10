@@ -46,6 +46,7 @@ from typing import Any
 from ._generated.models import (
     Basis,
     Fit,
+    FitModelKind,
     FitOffload,
     FitVerdict,
     HostHardware,
@@ -310,6 +311,7 @@ def budget_from_hardware(
     ram_override: int | None = None,
     unified_override: bool | None = None,
     gpu_count_override: int | None = None,
+    vram_total_override: int | None = None,
 ) -> MemoryBudget:
     """Collapse detected hardware into the numbers a verdict needs.
 
@@ -328,6 +330,11 @@ def budget_from_hardware(
     an integrated GPU on another host, passed as `vram_override`, read as
     a card with memory of its own, and a model too big for it was scored
     as a partial offload into RAM that is the same RAM (2026-09-27).
+
+    `vram_total_override` is the caller's cards' total memory (LS6): a
+    share-taking engine's share is of the total, which an override of free
+    memory alone cannot say. Without it the total is the free figure, as
+    before.
     """
     per_gpu_free = [
         (gpu.vramFreeBytes if gpu.vramFreeBytes is not None else gpu.vramTotalBytes)
@@ -362,6 +369,8 @@ def budget_from_hardware(
             # llama.cpp's default split follows free memory, so an even
             # share is the honest reading of an even budget.
             largest = vram_override // gpu_count
+        if vram_total_override is not None:
+            vram_total = max(vram_total_override, vram_free)
 
     ram_total = hardware.ramTotalBytes or 0
     ram_available = hardware.ramAvailableBytes or ram_total
@@ -476,46 +485,14 @@ def compute(
     which is about whether the bytes fit anywhere; it decides `offload`,
     how a `tight` or `split` would run (moe-aware-fit §1.3).
     """
-    notes: list[str] = []
     shape = shape or ModelShape()
-
-    kv_bytes = shape.kv_bytes(context_length, kv_cache_type)
-    if kv_bytes is None:
-        # No usable shape. A fraction of the weights is a poor estimate
-        # and an honest one; `basis: estimate` is what says not to trust
-        # the breakdown. It scales with context because a KV cache does:
-        # a constant here is what made the context control inert.
-        kv_bytes = int(
-            weights_bytes * ESTIMATED_KV_FRACTION * (context_length / ESTIMATED_KV_BASELINE_CONTEXT)
-        )
-        basis = Basis.estimate
+    kv_bytes, basis, notes = _kv_term(shape, weights_bytes, context_length, kv_cache_type)
+    if basis is Basis.metadata and shape.attention_layers is None and shape.block_count:
         notes.append(
-            f"KV cache is a rough {ESTIMATED_KV_FRACTION:.0%} of the weights per "
-            f"{ESTIMATED_KV_BASELINE_CONTEXT:,} tokens of context, so "
-            f"{format_bytes(kv_bytes)} at {context_length:,}: this model's layer and "
-            "attention metadata was not available. Preflight the file (or scan it, once "
-            "it is on disk) for a real figure."
+            f"assumed all {shape.block_count} layers hold a KV cache. A hybrid "
+            "attention/SSM model has far fewer, so this over-estimates rather than "
+            "under-estimates."
         )
-    elif shape.per_layer_unavailable:
-        # The scalars answered, and this file said they are not the
-        # whole story. Reporting that as `metadata` is the failure mode
-        # this field exists for: the number is a scalar guess on a model
-        # whose layers are not alike, and it over-estimates by up to 43x
-        # -- which reads as "will not fit" about a model that fits.
-        basis = Basis.estimate
-        notes.append(
-            "this model declares per-layer attention and those terms were not stored "
-            "with it, so the cache above is the same-every-layer arithmetic and "
-            "over-estimates, possibly by a lot. Re-scan this directory for a real figure."
-        )
-    else:
-        basis = Basis.metadata
-        if shape.attention_layers is None and shape.block_count:
-            notes.append(
-                f"assumed all {shape.block_count} layers hold a KV cache. A hybrid "
-                "attention/SSM model has far fewer, so this over-estimates rather than "
-                "under-estimates."
-            )
 
     if card_of_unknown_size(budget) and not budget.unifiedMemory:
         notes.append(
@@ -564,6 +541,7 @@ def compute(
         )
     return Fit(
         verdict=verdict,
+        model=FitModelKind.spill,
         requiredBytes=required,
         weightsBytes=weights_bytes,
         kvCacheBytes=kv_bytes,
@@ -577,6 +555,169 @@ def compute(
         offload=offload,
         notes=notes,
     )
+
+
+def _kv_term(
+    shape: ModelShape, weights_bytes: int, context_length: int, kv_cache_type: KvCacheType
+) -> tuple[int, Basis, list[str]]:
+    """The KV cache at `context_length`, its basis, and what was assumed:
+    the one reading every fit model that has a KV term uses (LS6)."""
+    kv_bytes = shape.kv_bytes(context_length, kv_cache_type)
+    if kv_bytes is None:
+        # No usable shape. A fraction of the weights is a poor estimate
+        # and an honest one; `basis: estimate` is what says not to trust
+        # the breakdown. It scales with context because a KV cache does:
+        # a constant here is what made the context control inert.
+        kv_bytes = int(
+            weights_bytes * ESTIMATED_KV_FRACTION * (context_length / ESTIMATED_KV_BASELINE_CONTEXT)
+        )
+        return (
+            kv_bytes,
+            Basis.estimate,
+            [
+                f"KV cache is a rough {ESTIMATED_KV_FRACTION:.0%} of the weights per "
+                f"{ESTIMATED_KV_BASELINE_CONTEXT:,} tokens of context, so "
+                f"{format_bytes(kv_bytes)} at {context_length:,}: this model's layer and "
+                "attention metadata was not available. Preflight the file (or scan it, once "
+                "it is on disk) for a real figure."
+            ],
+        )
+    if shape.per_layer_unavailable:
+        # The scalars answered, and this file said they are not the
+        # whole story. Reporting that as `metadata` is the failure mode
+        # this field exists for: the number is a scalar guess on a model
+        # whose layers are not alike, and it over-estimates by up to 43x
+        # -- which reads as "will not fit" about a model that fits.
+        return (
+            kv_bytes,
+            Basis.estimate,
+            [
+                "this model declares per-layer attention and those terms were not stored "
+                "with it, so the cache above is the same-every-layer arithmetic and "
+                "over-estimates, possibly by a lot. Re-scan this directory for a real figure."
+            ],
+        )
+    return kv_bytes, Basis.metadata, []
+
+
+def share_cards(budget: MemoryBudget) -> int:
+    """How many cards a share-taking engine spreads the model over: the
+    budget's, at least one where there is memory to take a share of."""
+    cards = budget.gpuCount or 0
+    if cards <= 0 and ((budget.vramTotalBytes or 0) > 0 or budget.unifiedMemory):
+        return 1
+    return cards
+
+
+def compute_reserved_share(
+    *,
+    weights_bytes: int,
+    budget: MemoryBudget,
+    context_length: int,
+    utilization: float,
+    shape: ModelShape | None = None,
+    kv_cache_type: KvCacheType = KvCacheType.f16,
+    overhead_bytes: int = DEFAULT_OVERHEAD_BYTES,
+) -> Fit:
+    """`reserved_share` (LS6): an engine that takes a share of each card.
+
+    Read off vLLM's own `request_memory` (upstream main, 2026-10-09): it
+    asks for `total memory x gpu_memory_utilization` on each card it uses
+    and refuses to start when less than that is free; the weights and its
+    own buffers come out of the share, and the KV cache must hold the whole
+    context in what is left. Tensor parallel splits the model evenly across
+    the cards, so each holds its share of the weights and cache and its own
+    buffers. Nothing goes to system memory: there is no `split`.
+
+    * `no`: the model and the context's cache do not fit the share.
+    * `tight`: they fit, but less than the share is free on a card now.
+    * `fits`: they fit, and the share is free.
+    * `unknown`: a card whose memory could not be read, or no card.
+    """
+    shape = shape or ModelShape()
+    kv_bytes, basis, notes = _kv_term(shape, weights_bytes, context_length, kv_cache_type)
+    cards = share_cards(budget)
+    total = budget.vramTotalBytes or 0
+    free = budget.vramFreeBytes or 0
+    per_card_overhead = overhead_bytes
+    overhead_total = per_card_overhead * max(1, cards)
+    required = weights_bytes + kv_bytes + overhead_total
+    share = int(total * utilization)
+
+    if cards <= 0 or total <= 0:
+        verdict = FitVerdict.unknown
+        notes.append(
+            "no graphics card memory to take a share of here, so there is nothing to "
+            "compare against"
+        )
+    else:
+        need_per_card = required / cards
+        share_per_card = share / cards
+        if need_per_card > share_per_card:
+            verdict = FitVerdict.no
+        elif free / cards < share_per_card:
+            verdict = FitVerdict.tight
+        else:
+            verdict = FitVerdict.fits
+        notes.append(
+            f"the engine takes {utilization:.0%} of each card's total memory when it starts "
+            f"({format_bytes(share)} in all) and refuses to start with less free; nothing "
+            "moves to system memory"
+        )
+        if cards > 1:
+            notes.append(f"the model and its cache are split evenly across {cards} cards")
+    notes.append(
+        f"assumes a {kv_cache_type.value} KV cache and a flat "
+        f"{per_card_overhead / GIB:.1f} GiB allowance per card for the engine's own buffers"
+    )
+    if budget.source == Source.override:
+        notes.append("scored against a caller-supplied budget, not this host's detected memory")
+    return Fit(
+        verdict=verdict,
+        model=FitModelKind.reserved_share,
+        requiredBytes=required,
+        weightsBytes=weights_bytes,
+        kvCacheBytes=kv_bytes,
+        overheadBytes=overhead_total,
+        contextLength=context_length,
+        kvCacheType=kv_cache_type,
+        attentionLayers=shape.effective_attention_layers,
+        basis=basis,
+        budget=budget,
+        notes=notes,
+    )
+
+
+def max_context_reserved_share(
+    *,
+    weights_bytes: int,
+    budget: MemoryBudget,
+    shape: ModelShape,
+    utilization: float,
+    kv_cache_type: KvCacheType = KvCacheType.f16,
+    overhead_bytes: int = DEFAULT_OVERHEAD_BYTES,
+    ceiling: int | None = None,
+) -> int | None:
+    """The longest context whose cache the share holds beside the weights:
+    what the engine itself would report as its largest model length."""
+    terms = shape.kv_terms(kv_cache_type)
+    if terms is None or terms[0] <= 0:
+        return None
+    per_token, fixed = terms
+    cards = share_cards(budget)
+    total = budget.vramTotalBytes or 0
+    if cards <= 0 or total <= 0:
+        return None
+    room = int(total * utilization) - overhead_bytes * cards - weights_bytes - fixed
+    if room <= 0:
+        return None
+    context = int(room // per_token)
+    limit = ceiling if ceiling is not None else shape.context_length
+    if limit:
+        context = min(context, limit)
+    if context < 256:
+        return context if context > 0 else None
+    return (context // 256) * 256
 
 
 def offload_for(

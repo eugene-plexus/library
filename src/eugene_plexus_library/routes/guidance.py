@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from fastapi import APIRouter, HTTPException, Query, Request, status
 
 from .. import fit as fit_mod
-from .. import hardware, quants
+from .. import hardware, model_fit, quants
 from .._generated.models import (
+    FitModelKind,
     HostHardware,
     KvCacheType,
-    ModelFileRole,
     ModelFit,
     ModelFormat,
     ModelStatus,
@@ -45,6 +43,18 @@ GPU_COUNT_DESCRIPTION = (
     "How many cards `vramBytes` is the combined free memory of, for a launch that "
     "spreads one model across them. Each card holds its own compute buffers, so the "
     "overhead allowance is counted once per card. Omitted, `vramBytes` is one card."
+)
+FIT_MODEL_DESCRIPTION = (
+    "The engine's own fit model (`EngineDescriptor.fit.kind`, LS6). Absent: `spill`, "
+    "llama.cpp's arithmetic. `engine_table` is answered by the judge, not here."
+)
+SHARE_DESCRIPTION = (
+    "With `fitModel=reserved_share`, required: the share of each card's total memory "
+    "the engine takes."
+)
+VRAM_TOTAL_DESCRIPTION = (
+    "The total memory of the cards `vramBytes` is the free memory of, summed: a "
+    "share-taking engine's share is of this. Absent: taken as `vramBytes`."
 )
 UNIFIED_DESCRIPTION = (
     "Score against one pool shared with host memory: an integrated GPU, Apple silicon "
@@ -134,6 +144,11 @@ async def get_model_fit(
     ),
     unifiedMemory: bool | None = Query(default=None, description=UNIFIED_DESCRIPTION),
     gpuCount: int | None = Query(default=None, ge=1, description=GPU_COUNT_DESCRIPTION),
+    fitModel: FitModelKind | None = Query(default=None, description=FIT_MODEL_DESCRIPTION),
+    gpuMemoryUtilization: float | None = Query(
+        default=None, gt=0, le=1, description=SHARE_DESCRIPTION
+    ),
+    vramTotalBytes: int | None = Query(default=None, ge=0, description=VRAM_TOTAL_DESCRIPTION),
 ) -> ModelFit:
     """Will a model already on this disk run here, and at what context?
 
@@ -145,9 +160,28 @@ async def get_model_fit(
     number that goes in a profile's `-c`, and it is frequently far below
     what the model declares. A current 27B says 262144 and almost nobody
     can hold that.
+
+    Whose fit (LS6): `fitModel` is the engine's own fit model. Absent, it
+    is `spill`, llama.cpp's, which is what every caller before LS6 meant.
     """
     store: StateStore = request.app.state.state_store
     config: ConfigStore = request.app.state.config_store
+    kind = fitModel or FitModelKind.spill
+    if kind is FitModelKind.engine_table:
+        raise _problem(
+            422,
+            "Fit not estimated",
+            (
+                "An engine with its own fit table answers from it, as its node reports "
+                "it: ask POST /v1/eligibility with `fit` and the engine's descriptor."
+            ),
+        )
+    if kind is FitModelKind.reserved_share and gpuMemoryUtilization is None:
+        raise _problem(
+            422,
+            "Fit not estimated",
+            "A share-taking engine's fit needs its share: pass `gpuMemoryUtilization`.",
+        )
 
     model = store.get_model(model_id)
     if model is None:
@@ -163,8 +197,8 @@ async def get_model_fit(
             "Fit not estimated",
             (
                 f"{model.name} was prepared for {engine}, in that engine's own format, "
-                "which the library does not read. No engine has its own fit estimate yet, "
-                "so none is given rather than llama.cpp's."
+                "which the library does not read, so no arithmetic here is its fit. An "
+                "engine with its own fit table answers through POST /v1/eligibility."
             ),
         )
     if model.status is ModelStatus.missing:
@@ -184,19 +218,40 @@ async def get_model_fit(
         ram_override=ramBytes,
         unified_override=unifiedMemory,
         gpu_count_override=gpuCount,
+        vram_total_override=vramTotalBytes,
     )
     context = contextLength or config.guidance_context_length()
     shape = _shape_for(model)
     # The disk footprint includes an optional vision projector. Merely
     # finding it beside a GGUF does not put --mmproj on the launch line.
     # Catalogue candidates already exclude it; local guidance must agree.
-    projector_bytes = (
-        sum(f.sizeBytes or 0 for f in model.files or [] if f.role is ModelFileRole.projector)
-        if model.format is ModelFormat.gguf
-        else 0
-    )
-    weights_bytes = max(0, (model.sizeBytes or 0) - projector_bytes)
-    expert_bytes = model.gguf.expertBytes if model.gguf is not None else None
+    projector_bytes = model_fit.projector_bytes(model)
+    weights_bytes = model_fit.weights_of(model)
+    expert_bytes = model_fit.expert_bytes_of(model)
+
+    if kind is FitModelKind.reserved_share:
+        assert gpuMemoryUtilization is not None
+        share = fit_mod.compute_reserved_share(
+            weights_bytes=weights_bytes,
+            budget=budget,
+            context_length=context,
+            utilization=gpuMemoryUtilization,
+            shape=shape,
+            kv_cache_type=kvCacheType,
+        )
+        return ModelFit(
+            modelId=model.id,
+            path=model.path,
+            fit=share,
+            maxContextLength=fit_mod.max_context_reserved_share(
+                weights_bytes=weights_bytes,
+                budget=budget,
+                shape=shape,
+                utilization=gpuMemoryUtilization,
+                kv_cache_type=kvCacheType,
+            ),
+            modelContextLength=model.contextLength,
+        )
 
     result = fit_mod.compute(
         weights_bytes=weights_bytes,
@@ -233,72 +288,6 @@ async def get_model_fit(
     )
 
 
-def _shape_for(model: object) -> fit_mod.ModelShape:
-    """Recover the KV-cache terms from a stored library entry.
-
-    **This delegates, and that is the whole of review §6.1 #4.** It used
-    to read the stored KV dict itself, with a `by_suffix` helper that
-    accepted only `int` and never built the per-layer form -- so when
-    `attention.head_count_kv` came back as an array (which it is on a
-    current mainstream 12B) it fell through to `head_count`, the
-    pre-grouped-query assumption, ignored the sliding-window layers
-    entirely, and answered tens of GiB of KV where the truth is under
-    one. The starter set and the catalogue, which go through
-    `preflight.shape_from_gguf`, answered correctly for the same file.
-    Two numbers, one file, both labelled `basis: metadata`.
-
-    The route had one commit, from M3, and the 43x fix of 2026-09-16
-    landed in `preflight.py` and here in `fit.py` and not in it. **A
-    second shape builder is the defect; there is one now.**
-
-    The scan keeps selected raw KV pairs on `gguf.metadata` as an escape
-    hatch for the long tail, so the material is all here -- what was
-    missing was the reading. `GgufMetadata` is rebuilt from that dict
-    (with `array_lengths` recovered from the synthetic `<key>.length`
-    entries `public_kv` writes, which is how a stepped-over per-layer
-    array stays visible as one) and handed to the one reader.
-
-    A safetensors entry has none of this -- the shape lives in
-    `config.json`, which the scan reads for architecture and context and
-    not for head counts -- so its fit stays an estimate and says so.
-    """
-    from .. import preflight
-    from .._generated.models import LibraryModel
-    from ..formats import gguf as gguf_format
-
-    assert isinstance(model, LibraryModel)
-    if model.format is not ModelFormat.gguf or model.gguf is None:
-        return fit_mod.ModelShape(context_length=model.contextLength, parameters=model.parameters)
-
-    raw = model.gguf.metadata or {}
-    kv: dict[str, object] = {}
-    array_lengths: dict[str, int] = {}
-    for key, value in raw.items():
-        # `public_kv` folds a stepped-over array in as `<key>.length`.
-        # Splitting it back out is what lets `per_layer_dropped` tell
-        # "this file declares the simple form" from "this file has
-        # per-layer attention and we did not keep it" -- and those get
-        # different answers about whether the number is metadata.
-        if key.endswith(".length") and isinstance(value, int):
-            array_lengths[key[: -len(".length")]] = value
-        else:
-            kv[key] = value
-
-    meta = gguf_format.GgufMetadata(
-        version=model.gguf.ggufVersion or 0,
-        tensor_count=0,
-        kv_count=len(kv),
-        header_bytes=0,
-        kv=kv,
-        array_lengths=array_lengths,
-    )
-    shape = preflight.shape_from_gguf(meta)
-    # `context_length` and `parameters` are the library's own reading of
-    # the entry rather than the file's -- the scan reconciles a
-    # safetensors sidecar and a filename into them -- so they are kept
-    # over what the KV block alone would say.
-    return replace(
-        shape,
-        context_length=model.contextLength or shape.context_length,
-        parameters=model.parameters,
-    )
+# The one shape reader, now beside the judge's use of it (LS6); the name
+# stays for the tests that pin it.
+_shape_for = model_fit.shape_of

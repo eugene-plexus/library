@@ -290,6 +290,8 @@ def test_every_source_is_searched_together_and_each_result_says_where_from(
             "architecture": "qwen4exp",
             "quantization": "IQ2_XS",
             "file": "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+            # The list's own size, for an engine's fit (LS6).
+            "sizeBytes": 68026093024,
             "mlxQuantized": None,
             "approximate": False,
         }

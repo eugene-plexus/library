@@ -372,6 +372,7 @@ def _score(
             architecture=entry.architecture,
             quantization=gguf.quant_from_filename(PurePosixPath(entry.file).name),
             file=PurePosixPath(entry.file).name,
+            sizeBytes=entry.size_bytes,
         ),
     )
 

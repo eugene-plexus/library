@@ -415,6 +415,9 @@ def candidate_facts(
             architecture=_gguf_architecture(info),
             quantization=gguf.quant_from_filename(PurePosixPath(first).name),
             file=PurePosixPath(first).name or None,
+            # The weights an engine's fit is computed from (LS6): the same
+            # sum this version's own `fit` is.
+            sizeBytes=group.size,
         )
     path = config_path(group)
     config = configs.get(path) if path else None
@@ -423,6 +426,7 @@ def candidate_facts(
         format=group.format,
         architecture=config.architecture if config else None,
         mlxQuantized=(config.mlx_quantization is not None) if config else None,
+        sizeBytes=group.size,
     )
 
 
@@ -820,6 +824,7 @@ def supported_rows(
                                 else None
                             ),
                             file=file,
+                            sizeBytes=model.sizeBytes,
                         )
                     ],
                 )

@@ -162,6 +162,8 @@ def test_a_gguf_version_carries_the_hubs_architecture_and_its_quant(tmp_path: Pa
     assert not facts["IQ2_XS"].approximate
     # The file's own name (LS4), which an engine that runs only named files reads.
     assert facts["IQ2_XS"].file == "Repo-IQ2_XS.gguf"
+    # Its size (LS6), which an engine's fit is computed from.
+    assert facts["IQ2_XS"].sizeBytes == 3 * GIB
 
 
 def test_a_folder_carries_what_its_remote_config_says(tmp_path: Path) -> None:

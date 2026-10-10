@@ -14,8 +14,10 @@ candidate nobody has read them yet, so an absent fact is *not known* and
 the term is assumed, at best `may_run`, and said.
 
 Pure: the facts are the library's own, the engines are the caller's, and
-nothing is fetched. Engines are named by kind only; how an engine is
-called in words is the console's business, not the library's.
+nothing is fetched. Since LS6 it answers each engine's fit too, when asked,
+by the engine's own fit model (`engine_fit`). Engines are named by kind
+only; how an engine is called in words is the console's business, not the
+library's.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import PureWindowsPath
 
+from . import engine_fit
 from ._generated.models import (
     EligibilityCandidate,
     EligibilityEngine,
@@ -269,8 +272,20 @@ def _why_not(facts: Facts, engine: EligibilityEngine) -> str:
 
 
 def level_of(verdicts: Iterable[EngineVerdict]) -> EligibilityLevel:
-    """Troy's three-level dot (L5)."""
-    verdicts = list(verdicts)
+    """Troy's three-level dot (L5).
+
+    An engine whose own fit says `no` counts as one that cannot run the
+    model (LS6, §4.3): a model too large for llama.cpp that Strata runs
+    after preparing it is *other engine*, and one that fits no engine that
+    would load it is *not here*. Only a measured `no` counts, never a fit
+    that is not estimated or `unknown`.
+    """
+    verdicts = [
+        v.model_copy(update={"verdict": EngineVerdictKind.no})
+        if engine_fit.counts_as_no(v.fit)
+        else v
+        for v in verdicts
+    ]
     here = (EngineVerdictKind.runs, EngineVerdictKind.may_run)
     if any(v.available and v.verdict in here for v in verdicts):
         return EligibilityLevel.works_here
@@ -292,9 +307,30 @@ def _order(verdict: EngineVerdict) -> tuple[bool, int, int, str]:
     )
 
 
-def judge_facts(facts: Facts, engines: Sequence[EligibilityEngine]) -> ModelEligibility:
-    """Every engine against one model, best first, and the model's level."""
+def judge_facts(
+    facts: Facts,
+    engines: Sequence[EligibilityEngine],
+    fit: tuple[engine_fit.Sizing, engine_fit.Question] | None = None,
+) -> ModelEligibility:
+    """Every engine against one model, best first, and the model's level.
+
+    With `fit` (LS6), every verdict but `no` carries its engine's own fit,
+    and the level counts an engine whose fit is `no` as one that cannot run
+    the model."""
     judged = [_judge_engine(facts, e) for e in engines]
+    if fit is not None:
+        sizing, question = fit
+        judged = [
+            (
+                verdict
+                if verdict.verdict is EngineVerdictKind.no
+                else verdict.model_copy(
+                    update={"fit": engine_fit.engine_fit(sizing, engine, question)}
+                ),
+                guessed,
+            )
+            for (verdict, guessed), engine in zip(judged, engines, strict=True)
+        ]
     verdicts = sorted((v for v, _ in judged), key=_order)
     return ModelEligibility(
         modelId=facts.id,
@@ -304,11 +340,19 @@ def judge_facts(facts: Facts, engines: Sequence[EligibilityEngine]) -> ModelElig
     )
 
 
-def judge(model: LibraryModel, engines: Sequence[EligibilityEngine]) -> ModelEligibility:
-    return judge_facts(facts_of_model(model), engines)
+def judge(
+    model: LibraryModel,
+    engines: Sequence[EligibilityEngine],
+    question: engine_fit.Question | None = None,
+) -> ModelEligibility:
+    fit = (engine_fit.sizing_of_model(model), question) if question is not None else None
+    return judge_facts(facts_of_model(model), engines, fit)
 
 
 def judge_candidate(
-    candidate: EligibilityCandidate, engines: Sequence[EligibilityEngine]
+    candidate: EligibilityCandidate,
+    engines: Sequence[EligibilityEngine],
+    question: engine_fit.Question | None = None,
 ) -> ModelEligibility:
-    return judge_facts(facts_of_candidate(candidate), engines)
+    fit = (engine_fit.sizing_of_candidate(candidate), question) if question is not None else None
+    return judge_facts(facts_of_candidate(candidate), engines, fit)
