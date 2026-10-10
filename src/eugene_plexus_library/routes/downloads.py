@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from .._generated.models import (
     Download,
-    DownloadClaim,
     DownloadList,
     DownloadSpec,
     Problem,
@@ -127,33 +126,6 @@ async def cancel_download(request: Request, download_id: str) -> None:
         await _manager(request).cancel(download_id)
     except DownloadError as exc:
         raise _translate(exc) from exc
-
-
-@router.post(
-    "/v1/downloads/{download_id}/claim",
-    response_model=DownloadClaim,
-    dependencies=[Depends(require_operator)],
-)
-async def claim_download(request: Request, download_id: str) -> DownloadClaim:
-    """Take responsibility for what a finished download was started for.
-
-    Clears `runWhenReady` atomically and says whether this caller is the
-    one who cleared it. Nothing about the transfer changes; the flag is
-    an operator intent this component records and never acts on.
-
-    A second claim is a `200` with `claimed: false`, not an error: a
-    client that retried after a timeout has not done anything wrong, and
-    every console on the install is expected to try.
-    """
-    outcome = await _manager(request).claim(download_id)
-    if outcome is None:
-        raise _problem(
-            404,
-            "No such download",
-            f"There is no download {download_id!r} on this component.",
-        )
-    claimed, record = outcome
-    return DownloadClaim(claimed=claimed, modelId=record.modelId)
 
 
 @router.post(

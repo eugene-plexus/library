@@ -25,8 +25,9 @@ it as a repo id would break the ordinary case to serve the rare one.
 
 ## Host
 
-Any host, not just `huggingface.co` -- `catalogueBaseUrl` is a config
-field, mirrors exist, and a person on a mirror pastes a mirror's link.
+Any host, not just `huggingface.co` -- a hub's address in
+`catalogueSources` is config, mirrors exist, and a person on a mirror pastes
+a mirror's link.
 The host is discarded once the path is read; what comes back is a repo
 id, which is host-relative anyway.
 """

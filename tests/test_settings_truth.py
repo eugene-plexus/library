@@ -52,14 +52,17 @@ def _hub(store: ConfigStore) -> dict:  # type: ignore[type-arg]
     return next(s for s in sources if s["kind"] == "hf_hub")
 
 
+def _set_hub(store: ConfigStore, **fields: Any) -> None:
+    _patch(store, {"catalogueSources": [{"id": "huggingface", "kind": "hf_hub", **fields}]})
+
+
 def test_an_empty_token_is_no_token(tmp_path: Path) -> None:
-    """Through the keys LS4 replaced, which PATCH still takes for the first hub."""
     store = _store(tmp_path)
-    _patch(store, {"hfToken": "", "catalogueBaseUrl": ""})
+    _set_hub(store, token="", address="")
     hub = _hub(store)
     assert hub["hasToken"] is False and hub["token"] is None, "an empty token read as saved"
     assert hub["address"] == "https://huggingface.co"
-    _patch(store, {"hfToken": "hf_real"})
+    _set_hub(store, token="hf_real")
     assert _hub(store)["hasToken"] is True and _hub(store)["token"] is None
 
 
@@ -67,7 +70,7 @@ def test_a_token_survives_a_round_trip_that_never_saw_it(tmp_path: Path) -> None
     """GET redacts, so a console that renames a hub sends the entry back
     without its token: the token stored under that id stays; `""` clears it."""
     store = _store(tmp_path)
-    _patch(store, {"hfToken": "hf_real"})
+    _set_hub(store, token="hf_real")
     shown = store.as_document().model_dump()["catalogueSources"]
     at = next(i for i, s in enumerate(shown) if s["kind"] == "hf_hub")
     shown[at]["label"] = "My hub"
@@ -104,7 +107,10 @@ def test_the_default_roots_say_where_they_come_from(tmp_path: Path) -> None:
 
 
 def test_a_saved_token_reaches_the_hub_client_at_once(client: Any) -> None:
-    saved = client.patch("/v1/config", json={"hfToken": "hf_new"})
+    saved = client.patch(
+        "/v1/config",
+        json={"catalogueSources": [{"id": "huggingface", "kind": "hf_hub", "token": "hf_new"}]},
+    )
     assert saved.status_code == 200, saved.text
     _source, hub = client.app.state.hub_clients.resolve(None)
     assert hub._token == "hf_new"

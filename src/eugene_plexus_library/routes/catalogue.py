@@ -122,8 +122,7 @@ def _from_hub_error(exc: HubError) -> HTTPException:
 
 SOURCE_DESCRIPTION = (
     "The `hf_hub` source the repo is on (`CatalogueSource.id`, a search result's "
-    "`hubSource`, LS4). Absent: the first enabled hub, which is what a console older "
-    "than the sources list meant."
+    "`hubSource`, LS4). Absent: the first enabled hub."
 )
 
 
@@ -163,98 +162,6 @@ async def _budget(
     )
 
 
-@router.get("/v1/catalogue/search", response_model=CatalogueSearchPage)
-async def search_catalogue(
-    request: Request,
-    q: str | None = Query(default=None, description="Free-text query."),
-    format: ModelFormat | None = Query(
-        default=None,
-        description=(
-            "Restrict to repos serving this format. `gguf` maps to upstream's own "
-            "filter; `safetensors` is inferred from tags and is approximate, since a "
-            "repo can hold both."
-        ),
-    ),
-    author: str | None = Query(
-        default=None,
-        description=(
-            'Publisher, e.g. `unsloth`. A first-class parameter because "the quant '
-            'publisher I trust" is how people actually navigate this catalogue.'
-        ),
-    ),
-    sort: CatalogueSort = Query(
-        default=CatalogueSort.downloads,
-        description="Ordering. `trending` is upstream's own trending score.",
-    ),
-    direction: str = Query(
-        default="desc",
-        pattern="^(asc|desc)$",
-        description="Sort direction.",
-    ),
-    limit: int = Query(default=25, ge=1, le=100, description="Rows per page."),
-    cursor: str | None = Query(
-        default=None,
-        description=(
-            "Opaque continuation token from a previous response's `nextCursor`. "
-            "Cursor-based because upstream paginates with an opaque cursor and there "
-            "is no page number to pass through."
-        ),
-    ),
-) -> CatalogueSearchPage:
-    """Search upstream. Repos, not candidates.
-
-    No sizes and no fit verdicts here: the upstream search response
-    carries filenames without sizes, so scoring a row would cost one
-    extra call per row — fifty requests for one keystroke, against a
-    budget of 500 per five minutes. Sizes, quant options and guidance
-    are on `GET /v1/catalogue/model`.
-
-    Debounce this client-side. Responses are cached here for a short
-    window, which is not a substitute.
-    """
-    client = _client(request)
-
-    # A pasted repo reference is a lookup, not a query. Upstream's
-    # full-text index has never matched a URL, so before this the
-    # commonest way a person arrives with a model in mind -- someone
-    # linked them one -- produced an empty list and no clue.
-    reference = repo_ref.parse(q)
-    if reference is not None:
-        resolved = await _resolve_reference(client, reference)
-        if resolved is not None:
-            return resolved
-
-    try:
-        results, next_cursor, _cached_at = await client.search(
-            query=q,
-            author=author,
-            gguf_only=format is ModelFormat.gguf,
-            sort=sort,
-            descending=direction == "desc",
-            limit=limit,
-            cursor=cursor,
-        )
-    except HubError as exc:
-        raise _from_hub_error(exc) from exc
-
-    rows = [
-        catalogue_mod.build_search_result(entry) for entry in results if isinstance(entry, dict)
-    ]
-    if format is ModelFormat.safetensors:
-        # Upstream has no reliable safetensors filter, so this is a
-        # post-filter on tags and is approximate by nature — a repo can
-        # hold both formats. Named as approximate in the contract rather
-        # than presented as authoritative.
-        rows = [r for r in rows if ModelFormat.safetensors in (r.formats or [])]
-
-    return CatalogueSearchPage(
-        results=rows,
-        nextCursor=next_cursor,
-        cachedAt=None,
-        interpretedAs=InterpretedAs.search,
-    )
-
-
 _CURSOR_VERSION = 1
 
 
@@ -279,7 +186,7 @@ def _decode_cursor(cursor: str) -> dict[str, str]:
             400,
             "Not a cursor this library made",
             "`cursor` must be the `nextCursor` of an earlier answer from this endpoint. A "
-            "hub's own cursor belongs on `GET /v1/catalogue/search`.",
+            "hub's own cursor does not belong here.",
             code="bad-cursor",
         ) from exc
 
@@ -297,7 +204,7 @@ async def search_catalogue_sources(
     """Search the chosen sources together (LS4, design §4.4).
 
     Every enabled source in `catalogueSources`, or the ones named. A hub is
-    searched as `GET` searches one; an engine's list from the lists the
+    searched upstream (with the hub's own cursor); an engine's list from the lists the
     caller sent (the picked node's, as it sends that node's `accepts` to the
     judge, so this calls no agent). Every result names its source, and
     `sources` says what each answered: one hub down is not an empty search.
@@ -354,8 +261,8 @@ async def search_catalogue_sources(
             if body.engines is None:
                 status.results = 0
                 status.problem = (
-                    "no engine's list came with the search: the node's agent is older than "
-                    "the sources list, or the console did not send it"
+                    "no engine's list came with the search: the caller did not send the "
+                    "node's engines (the console sends them with every search)"
                 )
                 continue
             if not any(
@@ -368,9 +275,7 @@ async def search_catalogue_sources(
                     if source.engine
                     else "none of the node's engines publishes"
                 )
-                status.problem = (
-                    f"{who} a list of its own (an agent older than the sources list publishes none)"
-                )
+                status.problem = f"{who} a list of its own"
                 continue
             rows = catalogue_mod.supported_rows(
                 body.engines,

@@ -58,9 +58,15 @@ def stock_umask() -> Iterator[None]:
 
 
 def _save_a_token(client: TestClient) -> None:
-    response = client.patch("/v1/config", json={"hfToken": TOKEN})
+    sources = [{"id": "huggingface", "kind": "hf_hub", "token": TOKEN}]
+    response = client.patch("/v1/config", json={"catalogueSources": sources})
     assert response.status_code == 200, response.text
-    assert "hfToken" in response.json()["applied"]
+    assert "catalogueSources" in response.json()["applied"]
+
+
+def _hub_token_on_disk(path: Path) -> Any:
+    sources = yaml.safe_load(path.read_text(encoding="utf-8"))["catalogueSources"]
+    return next(s for s in sources if s["id"] == "huggingface")["token"]
 
 
 @posix_only
@@ -69,7 +75,7 @@ def test_the_config_holding_the_token_is_0600(client: TestClient, settings: Sett
     _save_a_token(client)
 
     path = settings.config_file
-    assert yaml.safe_load(path.read_text(encoding="utf-8"))["hfToken"] == TOKEN
+    assert _hub_token_on_disk(path) == TOKEN
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
@@ -85,7 +91,7 @@ def test_the_config_is_created_asking_for_0600_through_an_exclusive_temp(
     temps = [(flags, mode) for path, flags, mode in spy.calls if Path(path).name.startswith(prefix)]
     assert temps, "the config was never written through a private temp"
     assert all(mode == 0o600 and flags & os.O_EXCL for flags, mode in temps)
-    assert yaml.safe_load(settings.config_file.read_text(encoding="utf-8"))["hfToken"] == TOKEN
+    assert _hub_token_on_disk(settings.config_file) == TOKEN
     leftovers = [p.name for p in settings.config_file.parent.iterdir() if p.name.startswith(prefix)]
     assert leftovers == []
 

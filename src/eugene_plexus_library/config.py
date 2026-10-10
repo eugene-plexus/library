@@ -19,11 +19,8 @@ the coercion and the validation.
 
 `catalogueSources` (LS4) is where Discover finds models, and holds the
 one secret: each hub's token, redacted in `GET`, accepted in `PATCH`, and
-sealed at rest with the master key, per entry (`catalogue_sources.py`). It
-replaced `catalogueBaseUrl` and `hfToken`, the single hub's address and
-token: a file with only those migrates on load, and the file keeps both
-beside the list, mirroring the first hub, so an older library reading it
-still has its hub and token. `PATCH` still takes either old key.
+sealed at rest with the master key, per entry (`catalogue_sources.py`). A
+file without it gets the default list.
 
 `modelRoots` can take its **default** from the process environment
 (`Settings.default_model_roots`), for a host whose layout is fixed
@@ -480,16 +477,11 @@ class ConfigStore:
             self._started = dict(self._values)
 
     def _sources_loaded(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
-        """`catalogueSources` as the file has it, its tokens opened; or, in a
-        file written before LS4, the list its hub address and token mean."""
+        """`catalogueSources` as the file has it, its tokens opened; the
+        default list when the file has none."""
         listed = raw.get(sources_mod.SOURCES_KEY)
         if not isinstance(listed, list):
-            return sources_mod.migrate(
-                self._decrypt_loaded(
-                    sources_mod.OLD_ADDRESS_KEY, raw.get(sources_mod.OLD_ADDRESS_KEY)
-                ),
-                self._decrypt_loaded(sources_mod.OLD_TOKEN_KEY, raw.get(sources_mod.OLD_TOKEN_KEY)),
-            )
+            return sources_mod.default_sources()
         out: list[dict[str, Any]] = []
         for entry in listed:
             if not isinstance(entry, dict):
@@ -565,18 +557,6 @@ class ConfigStore:
 
         with self._lock:
             for key, new_value in patch.items():
-                if key in (sources_mod.OLD_ADDRESS_KEY, sources_mod.OLD_TOKEN_KEY):
-                    # Replaced by `catalogueSources` (LS4); still accepted, as
-                    # the first hub's address or token, for an older caller.
-                    listed, error = sources_mod.apply_old_key(
-                        self._values.get(sources_mod.SOURCES_KEY), key, new_value
-                    )
-                    if error is not None:
-                        rejected.append(ConfigFieldError(key=key, message=error))
-                        continue
-                    self._values[sources_mod.SOURCES_KEY] = listed
-                    applied.append(key)
-                    continue
                 field = _FIELDS_BY_KEY.get(key)
                 if field is None:
                     rejected.append(ConfigFieldError(key=key, message="unknown field"))
@@ -695,10 +675,6 @@ class ConfigStore:
             field = _FIELDS_BY_KEY.get(key)
             if key == sources_mod.SOURCES_KEY:
                 on_disk[key] = [self._sealed_entry(e) for e in value or [] if isinstance(e, dict)]
-                # What a library older than LS4 reads: the first hub.
-                address, token = sources_mod.mirror(value)
-                on_disk[sources_mod.OLD_ADDRESS_KEY] = address
-                on_disk[sources_mod.OLD_TOKEN_KEY] = self._sealed(token)
                 continue
             if key == ROOTS_KEY and self._roots_defaulted:
                 # The environment's default is not the operator's choice,

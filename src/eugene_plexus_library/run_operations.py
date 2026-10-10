@@ -53,15 +53,12 @@ class Intent(BaseModel):
     node: str | None = Field(default=None, max_length=128)
     modelId: str | None = None
     download: DownloadSpec | None = None
-    downloadId: str | None = None
     preparation: PreparationIntent | None = None
 
     @model_validator(mode="after")
     def one_source(self) -> Intent:
-        if sum(x is not None for x in (self.modelId, self.download, self.downloadId)) != 1:
-            raise ValueError("choose exactly one of modelId, download, or downloadId")
-        if self.download is not None:
-            self.download.runWhenReady = False
+        if sum(x is not None for x in (self.modelId, self.download)) != 1:
+            raise ValueError("choose exactly one of modelId or download")
         return self
 
 

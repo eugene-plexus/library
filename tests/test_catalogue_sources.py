@@ -79,35 +79,39 @@ def _on_disk(store: ConfigStore) -> dict[str, Any]:
 # -- config ---------------------------------------------------------------------
 
 
-def test_an_old_files_hub_and_sealed_token_become_the_first_source(tmp_path: Path) -> None:
-    sealed = security.seal("hf_old", KEY).to_dict()
-    store = _store(tmp_path, {"catalogueBaseUrl": MIRROR + "/", "hfToken": sealed})
-    engines, hub = store.catalogue_sources()
-    assert (hub.id, hub.kind.value, hub.address, hub.token) == (
-        "huggingface",
-        "hf_hub",
-        MIRROR,
-        "hf_old",
+def test_a_file_without_a_source_list_gets_the_default_list(tmp_path: Path) -> None:
+    store = _store(tmp_path, {"guidanceContextLength": 4096})
+    assert [(s.id, s.kind.value) for s in store.catalogue_sources()] == [
+        ("engines", "engine_list"),
+        ("huggingface", "hf_hub"),
+    ]
+
+
+def test_a_hubs_token_is_sealed_in_the_file_and_reads_back(tmp_path: Path) -> None:
+    sealed = security.seal("hf_sealed", KEY).to_dict()
+    store = _store(
+        tmp_path,
+        {
+            "catalogueSources": [
+                {"id": "mirror", "kind": "hf_hub", "address": MIRROR, "token": sealed},
+                {
+                    "id": "plain",
+                    "kind": "hf_hub",
+                    "address": MIRROR + "/other",
+                    "token": "hf_plain",
+                },
+            ]
+        },
     )
-    assert hub.label == "Hub at mirror.example", "a mirror is not called Hugging Face"
-    assert (engines.kind.value, engines.engine) == ("engine_list", None)
-    shown = store.as_document().model_dump()["catalogueSources"][1]
+    assert [s.token for s in store.catalogue_sources()] == ["hf_sealed", "hf_plain"]
+    shown = store.as_document().model_dump()["catalogueSources"][0]
     assert shown["token"] is None and shown["hasToken"] is True
-    assert "hfToken" not in store.as_document().model_dump()
-
-
-def test_the_file_keeps_the_old_keys_for_an_older_library(tmp_path: Path) -> None:
-    store = _store(tmp_path, {"catalogueBaseUrl": MIRROR, "hfToken": "hf_plain"})
     store.apply_patch(ConfigUpdateRequest.model_validate({"guidanceContextLength": 4096}))
     disk = _on_disk(store)
-    assert disk["catalogueBaseUrl"] == MIRROR
-    assert security.is_envelope(disk["hfToken"]), "the token is sealed where it is mirrored"
-    assert security.open_envelope(security.Envelope.from_dict(disk["hfToken"]), KEY) == "hf_plain"
-    entry = disk["catalogueSources"][1]
-    assert security.is_envelope(entry["token"]) and "hasToken" not in entry
-    # And it reads back the same, from the list now rather than the old keys.
-    again = _store(tmp_path)
-    assert again.catalogue_sources()[1].token == "hf_plain"
+    assert {"catalogueBaseUrl", "hfToken"}.isdisjoint(disk)
+    for entry in disk["catalogueSources"]:
+        assert security.is_envelope(entry["token"]) and "hasToken" not in entry
+    assert [s.token for s in _store(tmp_path).catalogue_sources()] == ["hf_sealed", "hf_plain"]
 
 
 def test_a_new_install_has_the_public_hub_and_every_engines_list(tmp_path: Path) -> None:
@@ -140,17 +144,6 @@ def test_a_bad_list_is_refused_naming_the_entry(tmp_path: Path, value: Any, said
     store = _store(tmp_path)
     result = store.apply_patch(ConfigUpdateRequest.model_validate({"catalogueSources": value}))
     assert result.applied == [] and said in result.rejected[0].message
-
-
-def test_the_old_keys_need_a_hub_to_set(tmp_path: Path) -> None:
-    store = _store(tmp_path)
-    store.apply_patch(
-        ConfigUpdateRequest.model_validate(
-            {"catalogueSources": [{"id": "engines", "kind": "engine_list"}]}
-        )
-    )
-    result = store.apply_patch(ConfigUpdateRequest.model_validate({"hfToken": "t"}))
-    assert result.rejected and "no hub there" in result.rejected[0].message
 
 
 def test_which_hub_a_call_means(tmp_path: Path) -> None:

@@ -115,9 +115,14 @@ def test_the_starter_set_is_served_with_a_recommendation(
 def test_it_answers_with_the_hub_unreachable(offline_client: TestClient) -> None:
     """The point of carrying every measured number in the list. A first
     model can be chosen with no internet; only fetching it needs one.
-    The search endpoint beside it fails, as it must."""
+    The search endpoint beside it says the hub is unreachable, as it must."""
     assert offline_client.get("/v1/catalogue/starter").status_code == 200
-    assert offline_client.get("/v1/catalogue/search", params={"q": "x"}).status_code == 503
+    searched = offline_client.post("/v1/catalogue/search", json={"q": "x"})
+    assert searched.status_code == 200
+    body = searched.json()
+    assert body["results"] == []
+    hub = next(s for s in body["sources"] if s["kind"] == "hf_hub")
+    assert hub["problem"], "an unreachable hub is named, not an empty search"
 
 
 def test_the_context_is_the_one_the_caller_asked_for(catalogue_client: TestClient) -> None:
@@ -161,9 +166,9 @@ def test_an_operators_own_list_replaces_the_shipped_one(
 
 
 def test_a_pasted_url_resolves_to_one_repo(catalogue_client: TestClient) -> None:
-    body = catalogue_client.get(
+    body = catalogue_client.post(
         "/v1/catalogue/search",
-        params={"q": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main"},
+        json={"q": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main"},
     ).json()
     assert body["interpretedAs"] == "repo"
     assert body["interpretedFrom"] == "unsloth/Qwen3.8-27B-GGUF"
@@ -172,8 +177,8 @@ def test_a_pasted_url_resolves_to_one_repo(catalogue_client: TestClient) -> None
 
 
 def test_a_bare_owner_slash_name_resolves_too(catalogue_client: TestClient) -> None:
-    body = catalogue_client.get(
-        "/v1/catalogue/search", params={"q": "unsloth/Qwen3.8-27B-GGUF"}
+    body = catalogue_client.post(
+        "/v1/catalogue/search", json={"q": "unsloth/Qwen3.8-27B-GGUF"}
     ).json()
     assert body["interpretedAs"] == "repo"
 
@@ -190,8 +195,8 @@ def test_a_url_that_does_not_resolve_is_a_404_naming_the_repo(
     the true statement. The detail says all three reasons because
     upstream refuses to distinguish them.
     """
-    response = catalogue_client.get(
-        "/v1/catalogue/search", params={"q": "https://huggingface.co/nobody/nothing"}
+    response = catalogue_client.post(
+        "/v1/catalogue/search", json={"q": "https://huggingface.co/nobody/nothing"}
     )
     assert response.status_code == 404
     detail = response.json()["detail"]["detail"]
@@ -204,7 +209,7 @@ def test_a_bare_name_that_does_not_resolve_falls_through_to_a_search(
 ) -> None:
     """It may simply be what they meant to type. A guess that misses is
     a search, not an error."""
-    body = catalogue_client.get("/v1/catalogue/search", params={"q": "nobody/nothing"}).json()
+    body = catalogue_client.post("/v1/catalogue/search", json={"q": "nobody/nothing"}).json()
     assert body["interpretedAs"] == "search"
     assert [r["repo"] for r in body["results"]] == ["org/from-search"]
 
@@ -212,7 +217,7 @@ def test_a_bare_name_that_does_not_resolve_falls_through_to_a_search(
 def test_an_ordinary_query_is_still_an_ordinary_search(
     catalogue_client: TestClient,
 ) -> None:
-    body = catalogue_client.get("/v1/catalogue/search", params={"q": "qwen"}).json()
+    body = catalogue_client.post("/v1/catalogue/search", json={"q": "qwen"}).json()
     assert body["interpretedAs"] == "search"
     assert [r["repo"] for r in body["results"]] == ["org/from-search"]
 

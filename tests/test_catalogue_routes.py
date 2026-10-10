@@ -136,7 +136,7 @@ def catalogue_client(
 
 
 def test_search_returns_rows_and_a_cursor_field(catalogue_client: TestClient) -> None:
-    body = catalogue_client.get("/v1/catalogue/search", params={"q": "qwen"}).json()
+    body = catalogue_client.post("/v1/catalogue/search", json={"q": "qwen"}).json()
     assert [r["repo"] for r in body["results"]] == ["org/repo", "org/torch-only"]
     assert "nextCursor" in body
 
@@ -145,8 +145,8 @@ def test_a_safetensors_filter_is_applied_locally(catalogue_client: TestClient) -
     """Upstream has no reliable safetensors filter, so this is a
     post-filter on tags and approximate by nature — a repo can hold both
     formats."""
-    body = catalogue_client.get(
-        "/v1/catalogue/search", params={"q": "x", "format": "safetensors"}
+    body = catalogue_client.post(
+        "/v1/catalogue/search", json={"q": "x", "format": "safetensors"}
     ).json()
     assert [r["repo"] for r in body["results"]] == ["org/torch-only"]
 
@@ -241,13 +241,20 @@ def test_the_catalogue_switch_refuses_every_endpoint(catalogue_client: TestClien
     """An air-gapped install gets one legible answer, not four different
     timeouts."""
     catalogue_client.patch("/v1/config", json={"catalogueEnabled": False})
-    for path, params in (
-        ("/v1/catalogue/search", {"q": "x"}),
-        ("/v1/catalogue/model", {"repo": "org/repo"}),
-        ("/v1/catalogue/model/card", {"repo": "org/repo"}),
-        ("/v1/catalogue/model/preflight", {"repo": "org/repo", "file": "model-Q4_K_M.gguf"}),
-    ):
-        response = catalogue_client.get(path, params=params)
+    searched = catalogue_client.post("/v1/catalogue/search", json={"q": "x"})
+    assert searched.status_code == 200 and searched.json()["results"] == []
+    problems = [str(s["problem"]) for s in searched.json()["sources"] if s["kind"] == "hf_hub"]
+    assert problems and all("catalogueEnabled" in p for p in problems), searched.json()
+    refused = [
+        catalogue_client.get("/v1/catalogue/model", params={"repo": "org/repo"}),
+        catalogue_client.get("/v1/catalogue/model/card", params={"repo": "org/repo"}),
+        catalogue_client.get(
+            "/v1/catalogue/model/preflight",
+            params={"repo": "org/repo", "file": "model-Q4_K_M.gguf"},
+        ),
+    ]
+    for response in refused:
+        path = response.request.url.path
         assert response.status_code == 409, path
         assert "catalogueEnabled" in response.json()["detail"]["detail"]
 

@@ -85,11 +85,6 @@ def submit(
             if found is None:
                 raise HTTPException(404, "Model is not in the Library")
             return found.model_dump(mode="json")  # type: ignore[no-any-return]
-        if (
-            intent.downloadId is not None
-            and request.app.state.download_manager.get(intent.downloadId) is None
-        ):
-            raise HTTPException(404, "Download is not in the Library")
         return None
 
     intent = intent.model_copy(update={"node": _unjoined_is_null(intent.node)})
@@ -281,7 +276,7 @@ async def advance_downloads(app: Any) -> None:
         for record in await asyncio.to_thread(jobs.list, all_records=True, pending_only=True):
             try:
                 intent = record["intent"]
-                download_id = intent.get("downloadId") or record["id"]
+                download_id = record["id"]
                 if (
                     record["step"] == "cancelled"
                     and intent.get("download")
@@ -355,9 +350,6 @@ async def advance_downloads(app: Any) -> None:
                             )
 
                 await asyncio.to_thread(jobs.change, record["id"], update)
-                # Legacy browser intent clears only AFTER the durable job exists.
-                if download.runWhenReady:
-                    await manager.claim(download_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

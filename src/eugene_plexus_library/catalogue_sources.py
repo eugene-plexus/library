@@ -9,12 +9,6 @@ Each source has an id, a kind and its own settings. Two kinds:
   caller of a search sends the picked node's, so a source of this kind holds
   only which engine's list (`engine`, absent for every engine) and on/off.
 
-The list replaced `catalogueBaseUrl` and `hfToken`, the single hub's address
-and token. A config file holding only those becomes one `hf_hub` source with
-both (`migrate`), and the file keeps them beside the list, mirroring the
-first `hf_hub` source (`mirror`), so a library older than LS4 reading the
-same file still has its hub and its token.
-
 The token is the one secret, per entry, with `share_credentials`' rules
 (common.yaml `catalogue_sources`): `GET` answers `null` and `hasToken`; a
 `PATCH` entry without it keeps the token stored under the same id; `""`
@@ -42,9 +36,6 @@ DEFAULT_HUB_ID = "huggingface"
 DEFAULT_LIST_ID = "engines"
 
 SOURCES_KEY = "catalogueSources"
-#: The keys LS4 replaced, still mirrored in the file and accepted in PATCH.
-OLD_ADDRESS_KEY = "catalogueBaseUrl"
-OLD_TOKEN_KEY = "hfToken"
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _KEYS = frozenset({"id", "kind", "label", "enabled", "address", "token", "hasToken", "engine"})
@@ -69,29 +60,6 @@ def default_sources() -> list[dict[str, Any]]:
             "address": DEFAULT_ADDRESS,
         },
     ]
-
-
-def _hub_label(address: str) -> str:
-    """What to call a migrated hub: its own name only when it is that hub."""
-    if address.rstrip("/") == DEFAULT_ADDRESS:
-        return "Hugging Face"
-    host = urlsplit(address).netloc or address
-    return f"Hub at {host}"
-
-
-def migrate(address: Any, token: Any) -> list[dict[str, Any]]:
-    """The list a pre-LS4 config file means: its hub, at its address with its
-    token (already decrypted by the caller, or None), then every engine's
-    list. A blank address was always the public hub."""
-    where = address.strip().rstrip("/") if isinstance(address, str) and address.strip() else ""
-    where = where or DEFAULT_ADDRESS
-    sources = default_sources()
-    hub = next(s for s in sources if s["kind"] == "hf_hub")
-    hub["address"] = where
-    hub["label"] = _hub_label(where)
-    if isinstance(token, str) and token.strip():
-        hub["token"] = token.strip()
-    return sources
 
 
 def validate(value: Any) -> str | None:
@@ -201,51 +169,6 @@ def redact(sources: Any) -> list[dict[str, Any]]:
             shown["hasToken"] = bool(entry.get("token"))
         out.append(shown)
     return out
-
-
-def first_hub_index(sources: Sequence[dict[str, Any]], *, enabled_only: bool = False) -> int | None:
-    for index, entry in enumerate(sources):
-        if entry.get("kind") == "hf_hub" and (not enabled_only or entry.get("enabled", True)):
-            return index
-    return None
-
-
-def mirror(sources: Any) -> tuple[str, str | None]:
-    """`(catalogueBaseUrl, hfToken)` for the file, from the first hub: what a
-    library older than LS4 reads there. With no hub, the public one, no token."""
-    listed = sources if isinstance(sources, list) else []
-    index = first_hub_index(listed)
-    if index is None:
-        return DEFAULT_ADDRESS, None
-    entry = listed[index]
-    return entry.get("address") or DEFAULT_ADDRESS, entry.get("token") or None
-
-
-def apply_old_key(sources: Any, key: str, value: Any) -> tuple[list[dict[str, Any]], str | None]:
-    """A PATCH of `catalogueBaseUrl` or `hfToken`, which LS4 replaced: set
-    on the first hub. `(sources, error)`; null clears to the default."""
-    listed = [dict(e) for e in sources] if isinstance(sources, list) else []
-    index = first_hub_index(listed)
-    if index is None:
-        return listed, (
-            f"`{key}` sets the first hub in `catalogueSources`, and there is no hub there; "
-            "add one to `catalogueSources` instead"
-        )
-    if value is not None and not isinstance(value, str):
-        return listed, f"expected string, got {type(value).__name__}"
-    entry = listed[index]
-    if key == OLD_ADDRESS_KEY:
-        address = (value or "").strip() or DEFAULT_ADDRESS
-        if not re.match(r"^https?://\S+$", address):
-            return listed, f"must be an http:// or https:// address (got {address!r})"
-        entry["address"] = address.rstrip("/")
-    else:
-        token = (value or "").strip()
-        if token:
-            entry["token"] = token
-        else:
-            entry.pop("token", None)
-    return listed, None
 
 
 # -- resolving a source ---------------------------------------------------------

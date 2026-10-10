@@ -49,8 +49,8 @@ def live_client(configured_client: TestClient) -> TestClient:
 
 
 def test_search_returns_repos_without_sizes(live_client: TestClient) -> None:
-    body = live_client.get(
-        "/v1/catalogue/search", params={"q": "qwen3", "format": "gguf", "limit": 5}
+    body = live_client.post(
+        "/v1/catalogue/search", json={"q": "qwen3", "format": "gguf", "limit": 5}
     ).json()
     assert body["results"]
     assert all(r["repo"] for r in body["results"])
@@ -152,8 +152,9 @@ def test_a_real_download_verifies_and_lands_under_its_own_name(
 def test_the_air_gap_switch_refuses_rather_than_hanging(live_client: TestClient) -> None:
     live_client.patch("/v1/config", json={"catalogueEnabled": False})
     try:
-        response = live_client.get("/v1/catalogue/search", params={"q": "qwen"})
-        assert response.status_code == 409
-        assert "catalogueEnabled" in response.json()["detail"]["detail"]
+        response = live_client.post("/v1/catalogue/search", json={"q": "qwen"})
+        assert response.status_code == 200
+        problems = [s["problem"] for s in response.json()["sources"] if s["kind"] == "hf_hub"]
+        assert problems and all("catalogueEnabled" in p for p in problems)
     finally:
         live_client.patch("/v1/config", json={"catalogueEnabled": True})
