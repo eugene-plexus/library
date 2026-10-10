@@ -82,7 +82,7 @@ def _on_disk(store: ConfigStore) -> dict[str, Any]:
 def test_an_old_files_hub_and_sealed_token_become_the_first_source(tmp_path: Path) -> None:
     sealed = security.seal("hf_old", KEY).to_dict()
     store = _store(tmp_path, {"catalogueBaseUrl": MIRROR + "/", "hfToken": sealed})
-    hub, engines = store.catalogue_sources()
+    engines, hub = store.catalogue_sources()
     assert (hub.id, hub.kind.value, hub.address, hub.token) == (
         "huggingface",
         "hf_hub",
@@ -91,7 +91,7 @@ def test_an_old_files_hub_and_sealed_token_become_the_first_source(tmp_path: Pat
     )
     assert hub.label == "Hub at mirror.example", "a mirror is not called Hugging Face"
     assert (engines.kind.value, engines.engine) == ("engine_list", None)
-    shown = store.as_document().model_dump()["catalogueSources"][0]
+    shown = store.as_document().model_dump()["catalogueSources"][1]
     assert shown["token"] is None and shown["hasToken"] is True
     assert "hfToken" not in store.as_document().model_dump()
 
@@ -103,18 +103,19 @@ def test_the_file_keeps_the_old_keys_for_an_older_library(tmp_path: Path) -> Non
     assert disk["catalogueBaseUrl"] == MIRROR
     assert security.is_envelope(disk["hfToken"]), "the token is sealed where it is mirrored"
     assert security.open_envelope(security.Envelope.from_dict(disk["hfToken"]), KEY) == "hf_plain"
-    entry = disk["catalogueSources"][0]
+    entry = disk["catalogueSources"][1]
     assert security.is_envelope(entry["token"]) and "hasToken" not in entry
     # And it reads back the same, from the list now rather than the old keys.
     again = _store(tmp_path)
-    assert again.catalogue_sources()[0].token == "hf_plain"
+    assert again.catalogue_sources()[1].token == "hf_plain"
 
 
 def test_a_new_install_has_the_public_hub_and_every_engines_list(tmp_path: Path) -> None:
     store = _store(tmp_path)
+    # The engines' lists first (LS7): a search answers in the list's order.
     assert [(s.id, s.kind.value) for s in store.catalogue_sources()] == [
-        ("huggingface", "hf_hub"),
         ("engines", "engine_list"),
+        ("huggingface", "hf_hub"),
     ]
     field = next(f for f in store.schema().fields if f.key == "catalogueSources")
     assert field.valueType.value == "catalogue_sources"
@@ -274,13 +275,15 @@ def test_every_source_is_searched_together_and_each_result_says_where_from(
 ) -> None:
     page = _search(configured_client, engines=LISTS)
     got = [(r["source"], r["repo"], r.get("hubSource")) for r in page["results"]]
+    # In the list's order whatever a source's kind (LS7, Troy: the order is
+    # the person's): this list has the engines' lists last.
     assert got == [
-        ("engines", IQ2_XS["source"]["repoId"], "huggingface"),
-        ("engines", CODER["source"]["repoId"], "huggingface"),
         ("huggingface", "org/Small-GGUF", "huggingface"),
         ("corp", "corp/Inside-GGUF", "corp"),
+        ("engines", IQ2_XS["source"]["repoId"], "huggingface"),
+        ("engines", CODER["source"]["repoId"], "huggingface"),
     ]
-    listed = page["results"][0]
+    listed = page["results"][2]
     assert listed["engine"] == "strata" and listed["name"] == "Qwen3.8-Flash-Next IQ2_XS"
     assert listed["supported"]["source"]["file"].endswith("IQ2_XS-00001-of-00002.gguf")
     assert listed["facts"] == [
@@ -297,7 +300,7 @@ def test_every_source_is_searched_together_and_each_result_says_where_from(
         }
     ]
     # One repo on two hubs is two rows the judge tells apart.
-    assert page["results"][2]["facts"][0]["id"] == "search:huggingface:org/Small-GGUF:gguf"
+    assert page["results"][0]["facts"][0]["id"] == "search:huggingface:org/Small-GGUF:gguf"
     assert [(s["id"], s["searched"], s.get("results")) for s in page["sources"]] == [
         ("huggingface", True, 1),
         ("corp", True, 1),

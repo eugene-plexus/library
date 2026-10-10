@@ -173,7 +173,7 @@ def _write_provenance(body: PreparedModelRequest, roots: list[Path]) -> tuple[Pa
             "Entry file not found",
             f"The entry file {resolved} is not there. Nothing was written.",
         )
-    provenance = body.provenance.model_copy(
+    provenance = prepared.rebased(body.provenance, entry, folder).model_copy(
         update={
             "formatVersion": body.provenance.formatVersion or prepared.FORMAT_VERSION,
             "entry": written,

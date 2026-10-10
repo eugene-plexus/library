@@ -586,6 +586,31 @@ class ModelPreparation(BaseModel):
         None,
         description="The context sizes, in tokens, the preparation can be asked for\n(LS5): an engine that fixes the context when it prepares\noffers its own choices, and without one takes its own\nrecommendation for the node. Strata's are its setup's own.\nAbsent: the preparation takes no context.\n",
     )
+    minEngineVersion: str | None = Field(
+        None,
+        description="The oldest version of the engine that prepares this model, as\nthe engine's own setup states it (LS7, B30): e.g. Strata's\n`v0.1.38` for UD-IQ4_XS. Absent: any version the adapter runs.\n",
+    )
+    engineTooOld: str | None = Field(
+        None,
+        description='Set by the node that reported it when its installed engine is\nolder than `minEngineVersion` (LS7, B30): the installed\nversion, so the console says *needs Strata vX: update Strata on\nthis node* before a preparation would fail halfway. Absent: the\ninstalled engine can prepare it, or none is installed.\n',
+    )
+
+
+class PreparedFile(BaseModel):
+    """
+    One file a prepared model is made of (LS7).
+    """
+
+    path: str = Field(
+        ...,
+        description='Relative to the folder holding the provenance file, with `/`.',
+        min_length=1,
+    )
+    sizeBytes: int | None = Field(None, ge=0)
+    shared: bool | None = Field(
+        False,
+        description="Used by other models the same engine prepared in this folder too\n(Strata's MTP helper): kept while any of them is.\n",
+    )
 
 
 class PreparedSource(BaseModel):
@@ -1774,45 +1799,16 @@ class KevCheckpointDetail(BaseModel):
     )
 
 
-class PreparedDetail(BaseModel):
+class PreparedFactMissing(BaseModel):
     """
-    A prepared model's provenance, as its file
-    (`PreparedProvenance`) says it, and what the library made of it.
-    Present iff `format` is `prepared` and the file could be read.
-
-    The engine's own files are not read (experimental-engines.md:
-    prepared files stay usable without the library parsing them), so
-    a prepared model has no architecture, context, size or fit here:
-    the engine says what it loaded when it is ready
-    (`RuntimeCapabilities`), and fit waits for the engine's own fit
-    model (LS6). `files` lists the provenance file (`index`) and the
-    entry file (`config`) when the library's host can see it.
-
+    A fact about a prepared model the Library could not give, and why.
     """
 
-    engine: EngineKind
-    entry: str = Field(
-        ..., description='The entry file as the provenance file writes it.'
+    fact: str = Field(
+        ...,
+        description='Which (`architecture`, `contextLength`, `diskBytes`, `source`, ...).',
     )
-    entryPath: str | None = Field(
-        None,
-        description="`entry` resolved against the folder holding the provenance\nfile, on this library's host; the same as `entry` when that\nis absolute.\n",
-    )
-    entryFound: bool | None = Field(
-        None,
-        description="Whether this library's host sees the entry file. A relative\nentry that is not there makes the model `unreadable`. An\nabsolute entry not seen here is not an error: it is a path on\nthe node that runs the model (an engine's prepared files\nbelong on that node's own fast drive, which only its agent\nsees), and the agent checks it when the model starts, naming\nany missing file.\n",
-    )
-    recipe: str | None = Field(
-        None,
-        description='As `PreparedProvenance.recipe`; absent means prepared outside Eugene.',
-    )
-    recipeVersion: str | None = None
-    source: PreparedSource | None = None
-    sourceModelId: str | None = Field(
-        None,
-        description='The library model it was prepared from, when `source.path`\nnames one this library lists. Absent when it does not, or\nnames none.\n',
-    )
-    preparedAt: AwareDatetime | None = None
+    reason: str
 
 
 class RecommendedSampling(BaseModel):
@@ -2755,6 +2751,31 @@ class PreparedProvenance(BaseModel):
     preparedAt: AwareDatetime | None = Field(
         None, description='When this file was written.'
     )
+    title: str | None = Field(
+        None,
+        description="What it is, in the engine's list's words when it came from the\nlist (`SupportedModel.title`), e.g. `Qwen3.8-Flash-Next IQ2_XS`\n(LS7, B22 replaced).\n",
+    )
+    architecture: str | None = Field(
+        None,
+        description='The architecture of the model it was made from, as the hub or\nthe source file read it (`qwen4exp`): kept for when the source\nmodel is no longer in the Library.\n',
+    )
+    quantization: str | None = Field(
+        None,
+        description="The engine's name for the size it was made from, e.g. `IQ2_XS`.",
+    )
+    contextLength: int | None = Field(
+        None,
+        description="The context, in tokens, it was prepared for: an engine that fixes\nthe context when it prepares (Strata's `--max-context`).\n",
+        ge=1,
+    )
+    mode: str | None = Field(
+        None,
+        description="How the engine runs it on the node that prepared it, in the\nengine's own words (Strata: *every expert in RAM*, *a RAM budget\nof its experts, the rest from the SSD*, *the low-RAM mode*).\n",
+    )
+    files: list[PreparedFile] | None = Field(
+        None,
+        description="Every file the model is made of beside its source model and\nthis provenance file, the entry first, as the engine's adapter\nread them off its entry file: what is the model's own on disk.\nThe source model's files are its own model's, not listed.\n",
+    )
 
 
 class EngineFit(BaseModel):
@@ -2926,6 +2947,76 @@ class SafetensorsDetail(BaseModel):
     )
 
 
+class PreparedDetail(BaseModel):
+    """
+    A prepared model's provenance, as its file
+    (`PreparedProvenance`) says it, and what the library made of it.
+    Present iff `format` is `prepared` and the file could be read.
+
+    The library does not read the engine's own files
+    (experimental-engines.md: prepared files stay usable without the
+    library parsing them). What it knows of a prepared model (LS7,
+    B22 replaced: the Library imparts what is known and names what is
+    not) is what the engine's adapter read off those files when it
+    was prepared or added and the provenance file records (`title`,
+    `contextLength`, `mode`, `files`), measured on this host; what it
+    inherits from the model it was made from when the library lists
+    that (`LibraryModel.architecture`, `parameters`, `sizeLabel`);
+    and in `missing`, each fact it cannot give, with why. Fit is the
+    engine's own (LS6). `LibraryModel.files` lists the provenance
+    file (`index`), the entry file (`config`) and the files it
+    records, and `LibraryModel.sizeBytes` is `diskBytes`.
+
+    """
+
+    engine: EngineKind
+    entry: str = Field(
+        ..., description='The entry file as the provenance file writes it.'
+    )
+    entryPath: str | None = Field(
+        None,
+        description="`entry` resolved against the folder holding the provenance\nfile, on this library's host; the same as `entry` when that\nis absolute.\n",
+    )
+    entryFound: bool | None = Field(
+        None,
+        description="Whether this library's host sees the entry file. A relative\nentry that is not there makes the model `unreadable`. An\nabsolute entry not seen here is not an error: it is a path on\nthe node that runs the model (an engine's prepared files\nbelong on that node's own fast drive, which only its agent\nsees), and the agent checks it when the model starts, naming\nany missing file.\n",
+    )
+    recipe: str | None = Field(
+        None,
+        description='As `PreparedProvenance.recipe`; absent means prepared outside Eugene.',
+    )
+    recipeVersion: str | None = None
+    source: PreparedSource | None = None
+    sourceModelId: str | None = Field(
+        None,
+        description='The library model it was prepared from, when `source.path`\nnames one this library lists. Absent when it does not, or\nnames none.\n',
+    )
+    preparedAt: AwareDatetime | None = None
+    title: str | None = Field(None, description='From the provenance file (LS7).')
+    contextLength: int | None = Field(
+        None,
+        description='The context it was prepared for, from the provenance file (LS7).',
+        ge=1,
+    )
+    mode: str | None = Field(
+        None,
+        description="How the engine runs it, in the engine's words, from the provenance file (LS7).",
+    )
+    files: list[PreparedFile] | None = Field(
+        None,
+        description='The files it is made of beside its source model, each measured\non this host where the Library sees it (LS7).\n',
+    )
+    diskBytes: int | None = Field(
+        None,
+        description="What its own files take on disk, the shared ones counted too,\nmeasured on this host (LS7). Absent when they are not on the\nLibrary's machine.\n",
+        ge=0,
+    )
+    missing: list[PreparedFactMissing] | None = Field(
+        None,
+        description='Each fact the Library could not give, and why (LS7, Troy: the\nLibrary imparts what is known, and names what is not).\n',
+    )
+
+
 class PreparedModelRequest(BaseModel):
     """
     Adopt a model an engine has prepared: the library writes its
@@ -2951,7 +3042,7 @@ class PreparedModelRequest(BaseModel):
     )
     provenance: PreparedProvenance = Field(
         ...,
-        description="What to write. `entry` is what the person gave: the library\nwrites it relative to the provenance file when it lies inside\nthat file's folder, so the two move together, and as given\notherwise. `formatVersion` is written as 1 and `preparedAt`\nas now when absent.\n",
+        description="What to write. `entry` is what the person gave: the library\nwrites it relative to the provenance file when it lies inside\nthat file's folder, so the two move together, and as given\notherwise. `files` come relative to the entry's folder, as the\nagent's `inspectPreparedModel` answers them, and are written\nrelative to the provenance file's folder (LS7).\n`formatVersion` is written as 1 and `preparedAt` as now when\nabsent.\n",
     )
 
 

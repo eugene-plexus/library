@@ -153,7 +153,8 @@ FIELDS: list[ConfigField] = [
         label="Where to find models",
         description=(
             "The places Discover searches, together; every result says "
-            "which one it came from. A hub is Hugging Face or anything "
+            "which one it came from, and results come in this list's "
+            "order. A hub is Hugging Face or anything "
             "that speaks its API — a regional mirror, or an enterprise "
             "instance — at its own address, with its own access token: "
             "needed for gated models (the ones whose licence you accept "

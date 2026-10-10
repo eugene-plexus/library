@@ -48,7 +48,8 @@ def test_a_null_in_the_file_is_the_default(tmp_path: Path) -> None:
 
 
 def _hub(store: ConfigStore) -> dict:  # type: ignore[type-arg]
-    return store.as_document().model_dump()["catalogueSources"][0]
+    sources = store.as_document().model_dump()["catalogueSources"]
+    return next(s for s in sources if s["kind"] == "hf_hub")
 
 
 def test_an_empty_token_is_no_token(tmp_path: Path) -> None:
@@ -68,13 +69,14 @@ def test_a_token_survives_a_round_trip_that_never_saw_it(tmp_path: Path) -> None
     store = _store(tmp_path)
     _patch(store, {"hfToken": "hf_real"})
     shown = store.as_document().model_dump()["catalogueSources"]
-    shown[0]["label"] = "My hub"
+    at = next(i for i, s in enumerate(shown) if s["kind"] == "hf_hub")
+    shown[at]["label"] = "My hub"
     _patch(store, {"catalogueSources": shown})
     assert _hub(store)["label"] == "My hub" and _hub(store)["hasToken"] is True
-    assert store.catalogue_sources()[0].token == "hf_real"
-    shown[0]["token"] = ""
+    assert store.catalogue_sources()[at].token == "hf_real"
+    shown[at]["token"] = ""
     _patch(store, {"catalogueSources": shown})
-    assert _hub(store)["hasToken"] is False and store.catalogue_sources()[0].token is None
+    assert _hub(store)["hasToken"] is False and store.catalogue_sources()[at].token is None
 
 
 def test_a_restart_is_pending_only_while_the_value_differs(tmp_path: Path) -> None:

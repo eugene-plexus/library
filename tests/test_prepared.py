@@ -119,7 +119,7 @@ def test_a_provenance_file_that_cannot_be_listed_says_why(
 
 def test_fields_a_newer_eugene_adds_are_ignored(models_dir: Path) -> None:
     (models_dir / "c.json").write_text("{}", encoding="utf-8")
-    provenance(models_dir, entry="c.json", files=["pack/0.bin"], formatVersion=1)
+    provenance(models_dir, entry="c.json", weights=["pack/0.bin"], formatVersion=1)
     assert scan(models_dir)["qwen-flash"].status is ModelStatus.present
 
 
@@ -135,6 +135,67 @@ def test_the_source_is_linked_when_the_library_lists_it(models_dir: Path) -> Non
     assert found["orphan"].prepared.sourceModelId is None
     assert found["orphan"].prepared.source is not None
     assert found["orphan"].prepared.source.path == "/gone.gguf"
+
+
+def test_the_library_gives_what_is_known_of_a_prepared_model(models_dir: Path) -> None:
+    """LS7, B22 replaced: what the engine's files said when it was prepared,
+    measured here; what it inherits from its source; and what is missing, why."""
+    source = write_gguf(models_dir / "Flash-Next-IQ2_XS.gguf", qwen_like_kv(name="F"))
+    data = models_dir / "Strata-data"
+    (data / "packs").mkdir(parents=True)
+    (data / "strata-iq2_xs.json").write_text("{}", encoding="utf-8")
+    (data / "packs" / "dense.bin").write_bytes(b"d" * 30)
+    (data / "mtp").mkdir()
+    (data / "mtp" / "experts.bin").write_bytes(b"m" * 20)
+    path = provenance(
+        data,
+        entry="strata-iq2_xs.json",
+        source={"path": str(source)},
+        title="Qwen3.8-Flash-Next IQ2_XS",
+        contextLength=131072,
+        mode="every expert in RAM",
+        files=[
+            {"path": "strata-iq2_xs.json", "sizeBytes": 999},
+            {"path": "packs/dense.bin", "sizeBytes": 1},
+            {"path": "mtp/experts.bin", "shared": True},
+        ],
+    )
+    found = scan(models_dir)
+    model = found["qwen-flash"]
+    detail = model.prepared
+    assert detail is not None
+    assert model.displayName == detail.title == "Qwen3.8-Flash-Next IQ2_XS"
+    assert model.contextLength == detail.contextLength == 131072
+    assert detail.mode == "every expert in RAM"
+    # Measured here, not taken from the file: 2 + 30 + 20 and the provenance.
+    sizes = {f.path: f.sizeBytes for f in detail.files or []}
+    assert sizes == {"strata-iq2_xs.json": 2, "packs/dense.bin": 30, "mtp/experts.bin": 20}
+    assert [f.shared for f in detail.files or []] == [False, False, True]
+    assert detail.diskBytes == model.sizeBytes == 52 + path.stat().st_size
+    assert {Path(f.path) for f in model.files or []} >= {data / "packs" / "dense.bin"}
+    # Inherited from the source model the Library lists.
+    assert model.architecture == found["Flash-Next-IQ2_XS"].architecture == "llama"
+    assert detail.missing is None
+
+
+def test_what_the_library_cannot_give_is_named_with_why(models_dir: Path) -> None:
+    (models_dir / "c.json").write_text("{}", encoding="utf-8")
+    provenance(models_dir, entry="c.json", files=[{"path": "c.json"}, {"path": "gone.bin"}])
+    detail = scan(models_dir)["qwen-flash"].prepared
+    assert detail is not None
+    why = {m.fact: m.reason for m in detail.missing or []}
+    assert set(why) == {"diskBytes", "source", "architecture", "contextLength"}
+    assert "gone.bin" in why["diskBytes"]
+    assert "without naming the model it was made from" in why["source"]
+    assert "not in the Library" in why["architecture"]
+    assert detail.diskBytes is None
+    provenance(models_dir, name="bare", entry="c.json")
+    bare = scan(models_dir)["bare"].prepared
+    assert bare is not None
+    assert (
+        "add it again or prepare it again"
+        in {m.fact: m.reason for m in bare.missing or []}["files"]
+    )
 
 
 def test_a_provenance_file_inside_a_safetensors_folder_is_found_too(models_dir: Path) -> None:
@@ -261,6 +322,34 @@ def test_adopting_writes_the_file_beside_its_entry_and_lists_it_at_once(
     again = configured_client.get(f"/v1/models/{model['id']}").json()
     assert again["status"] == "present"
     assert again["prepared"]["entryFound"] is True
+
+
+def test_adopting_elsewhere_keeps_the_files_relative_to_the_provenance(
+    configured_client: TestClient, models_dir: Path
+) -> None:
+    """The agent's inspect lists files relative to the entry's folder; the
+    provenance file lists them relative to its own (LS7)."""
+    folder = models_dir / "Strata-data"
+    folder.mkdir()
+    entry = folder / "strata-qwen.json"
+    entry.write_text("{}", encoding="utf-8")
+    (folder / "pack.bin").write_bytes(b"p" * 5)
+    answer = adopt(
+        configured_client,
+        subdirectory="mine",
+        provenance={
+            "engine": "strata",
+            "entry": str(entry),
+            "files": [{"path": "strata-qwen.json"}, {"path": "pack.bin"}],
+        },
+    )
+    assert answer.status_code == 201, answer.text
+    on_disk = json.loads((models_dir / "mine" / f"qwen-flash{prepared.SUFFIX}").read_text())
+    assert [f["path"] for f in on_disk["files"]] == [
+        "../Strata-data/strata-qwen.json",
+        "../Strata-data/pack.bin",
+    ]
+    assert answer.json()["prepared"]["diskBytes"] > 5
 
 
 def test_an_entry_outside_the_library_is_refused_and_nothing_written(

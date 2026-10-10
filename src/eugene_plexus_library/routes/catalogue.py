@@ -334,7 +334,10 @@ async def search_catalogue_sources(
                 return resolved
 
     statuses: list[CatalogueSourceStatus] = []
-    listed: list[CatalogueSearchResult] = []
+    # Each source's rows, answered in the list's order whatever its kind
+    # (LS7, Troy: the order is the person's; the default list puts the
+    # engines' lists first).
+    by_source: dict[str, list[CatalogueSearchResult]] = {}
     asked: list[tuple[CatalogueSource, CatalogueSourceStatus]] = []
     for source in sources:
         status = _status(source)
@@ -379,7 +382,7 @@ async def search_catalogue_sources(
                 author=body.author,
             )
             status.results = len(rows)
-            listed.extend(rows)
+            by_source[source.id] = rows
             continue
         asked.append((source, status))
 
@@ -400,7 +403,6 @@ async def search_catalogue_sources(
         )
 
     answers = await asyncio.gather(*(one_hub(s) for s, _ in asked), return_exceptions=True)
-    found: list[CatalogueSearchResult] = []
     more: dict[str, str] = {}
     for (source, status), answer in zip(asked, answers, strict=True):
         if isinstance(answer, HubError):
@@ -418,12 +420,12 @@ async def search_catalogue_sources(
         if body.format is ModelFormat.safetensors:
             rows = [r for r in rows if ModelFormat.safetensors in (r.formats or [])]
         status.results = len(rows)
-        found.extend(rows)
+        by_source[source.id] = rows
         if next_cursor:
             more[source.id] = next_cursor
 
     return CatalogueSearchPage(
-        results=[*listed, *found],
+        results=[row for s in sources for row in by_source.get(s.id, [])],
         nextCursor=_encode_cursor(more) if more else None,
         cachedAt=None,
         interpretedAs=InterpretedAs.search,

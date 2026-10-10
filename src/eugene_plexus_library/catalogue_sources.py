@@ -52,20 +52,21 @@ _ENGINES = frozenset(k.value for k in EngineKind)
 
 
 def default_sources() -> list[dict[str, Any]]:
-    """The public hub and every engine's list."""
+    """Every engine's list, then the public hub: a search answers in the
+    list's order (LS7), and what an engine says it runs best comes first."""
     return [
+        {
+            "id": DEFAULT_LIST_ID,
+            "kind": "engine_list",
+            "label": "Engines' own lists",
+            "enabled": True,
+        },
         {
             "id": DEFAULT_HUB_ID,
             "kind": "hf_hub",
             "label": "Hugging Face",
             "enabled": True,
             "address": DEFAULT_ADDRESS,
-        },
-        {
-            "id": DEFAULT_LIST_ID,
-            "kind": "engine_list",
-            "label": "Engines' own lists",
-            "enabled": True,
         },
     ]
 
@@ -85,10 +86,11 @@ def migrate(address: Any, token: Any) -> list[dict[str, Any]]:
     where = address.strip().rstrip("/") if isinstance(address, str) and address.strip() else ""
     where = where or DEFAULT_ADDRESS
     sources = default_sources()
-    sources[0]["address"] = where
-    sources[0]["label"] = _hub_label(where)
+    hub = next(s for s in sources if s["kind"] == "hf_hub")
+    hub["address"] = where
+    hub["label"] = _hub_label(where)
     if isinstance(token, str) and token.strip():
-        sources[0]["token"] = token.strip()
+        hub["token"] = token.strip()
     return sources
 
 
