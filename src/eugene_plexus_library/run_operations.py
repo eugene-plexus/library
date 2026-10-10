@@ -119,6 +119,40 @@ class ProfileRequest(BaseModel):
     contextSize: int | None = Field(default=None, gt=0)
 
 
+class PreparedFileRequest(BaseModel):
+    """A file of the prepared model, which the library writes itself (LS10):
+    the engine's node prepares it in a folder of its own and sends it."""
+
+    model_config = ConfigDict(extra="forbid")
+    lease: str
+    path: str = Field(
+        min_length=1,
+        max_length=1024,
+        description="Where it goes, relative to the run's Library folder with `/` between "
+        "folders: inside an engine's own folder at its top (`Strata-data/...`).",
+    )
+
+
+class PreparedFileComplete(PreparedFileRequest):
+    """Every byte of the file has been sent: check it, then put it in place."""
+
+    sizeBytes: int = Field(ge=0)
+    sha256: str = Field(pattern="^[0-9a-f]{64}$")
+
+
+class PreparedFileState(BaseModel):
+    """What the library holds at one path of a preparation."""
+
+    path: str
+    sizeBytes: int | None = Field(
+        default=None, ge=0, description="The whole file under its own name, when there is one."
+    )
+    sha256: str | None = Field(default=None, description="Its SHA-256, in hex.")
+    receivedBytes: int = Field(
+        ge=0, description="What has arrived of a send that is not complete yet."
+    )
+
+
 class Operation(BaseModel):
     """HTTP view; the journal envelope has its own version and schema."""
 

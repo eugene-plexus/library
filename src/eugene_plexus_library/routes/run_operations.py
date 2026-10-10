@@ -10,13 +10,13 @@ from datetime import UTC, datetime
 from pathlib import Path as FilePath
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from pydantic import BaseModel
 
-from .. import prepared, tokens
+from .. import prepared, prepared_uploads, tokens
 from .._generated.models import DownloadSpec, LibraryModel, ModelProfileSpec
 from ..dependencies import require_authorized, require_operator
-from ..paths import is_within
+from ..paths import is_within, normalize
 from ..run_operations import (
     TERMINAL,
     Checkpoint,
@@ -25,6 +25,9 @@ from ..run_operations import (
     Journal,
     Operation,
     OperationList,
+    PreparedFileComplete,
+    PreparedFileRequest,
+    PreparedFileState,
     PreparedRequest,
     ProfileRequest,
     public,
@@ -266,6 +269,114 @@ async def prepared_model(
         record["model"] = listed
 
     return public(await asyncio.to_thread(jobs.change, id, update))
+
+
+# -------- a preparation's files, written by the library (LS10) --------
+
+
+async def _preparing_folder(request: Request, id: str, node: str | None, lease: str) -> FilePath:
+    """The Library folder the run's model is in, while its node prepares it
+    under its lease (B105)."""
+    jobs = journal(request)
+    record = await asyncio.to_thread(jobs.get, id)
+    jobs.verify_lease(record, node, lease)
+    if record["step"] != "preparing" or not record["intent"].get("preparation"):
+        raise HTTPException(409, "Run is not preparing a model")
+    root = (record.get("model") or {}).get("root")
+    roots = request.app.state.config_store.model_roots()
+    folder = next((r for r in roots if root and normalize(r) == normalize(root)), None)
+    if folder is None:
+        raise HTTPException(
+            409, f"The run's Library folder {root} is not one of the Library's folders now."
+        )
+    return FilePath(folder)
+
+
+def _target(folder: FilePath, path: str) -> prepared_uploads.Target:
+    try:
+        return prepared_uploads.target(folder, path)
+    except prepared_uploads.UploadRefused as exc:
+        raise HTTPException(exc.status, exc.detail) from None
+
+
+async def _refused(call: Any, *args: Any) -> Any:
+    try:
+        return await asyncio.to_thread(call, *args)
+    except prepared_uploads.UploadRefused as exc:
+        raise HTTPException(exc.status, exc.detail) from None
+
+
+@router.post("/{id}/files/state", response_model=PreparedFileState)
+async def prepared_file_state(
+    request: Request, id: str, body: PreparedFileRequest, node: str | None = Depends(assigned_agent)
+) -> dict[str, Any]:
+    """What the library holds of one file of the preparation: whole (its
+    size and SHA-256), and what has arrived of a send not complete."""
+    folder = await _preparing_folder(request, id, node, body.lease)
+    found = _target(folder, body.path)
+    return {"path": body.path, **await _refused(prepared_uploads.state, found)}
+
+
+@router.put(
+    "/{id}/files",
+    response_model=PreparedFileState,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/octet-stream": {"schema": {"type": "string", "format": "binary"}}
+            },
+        }
+    },
+)
+async def prepared_file_chunk(
+    request: Request,
+    id: str,
+    path: Annotated[str, Query(min_length=1, max_length=1024)],
+    offset: Annotated[int, Query(ge=0)],
+    lease: Annotated[str, Query()],
+    node: str | None = Depends(assigned_agent),
+) -> dict[str, Any]:
+    """One chunk of a file of the preparation, at `offset`: what has arrived
+    so far, or 0 to start the file again (B104)."""
+    folder = await _preparing_folder(request, id, node, lease)
+    found = _target(folder, path)
+    data = await _capped_body(request)
+    received = await _refused(prepared_uploads.write, found, offset, data)
+    return {"path": path, "sizeBytes": None, "sha256": None, "receivedBytes": received}
+
+
+@router.post("/{id}/files/complete", response_model=PreparedFileState)
+async def prepared_file_complete(
+    request: Request,
+    id: str,
+    body: PreparedFileComplete,
+    node: str | None = Depends(assigned_agent),
+) -> dict[str, Any]:
+    """Every byte is sent: checked against the size and SHA-256 the node
+    states, then under its own name. Again for a file in place: no change."""
+    folder = await _preparing_folder(request, id, node, body.lease)
+    found = _target(folder, body.path)
+    held = await _refused(prepared_uploads.complete, found, body.sizeBytes, body.sha256)
+    return {"path": body.path, **held}
+
+
+async def _capped_body(request: Request) -> bytes:
+    """The chunk, refused past what one may carry: a declared length before
+    a byte is read, and what arrives as it is counted."""
+    limit = prepared_uploads.MAX_CHUNK_BYTES
+    declared = request.headers.get("content-length")
+    too_large = HTTPException(413, f"A chunk carries at most {limit // (1024 * 1024)} MiB.")
+    if declared is not None and declared.strip().isdigit() and int(declared) > limit:
+        raise too_large
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise too_large
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 async def advance_downloads(app: Any) -> None:
