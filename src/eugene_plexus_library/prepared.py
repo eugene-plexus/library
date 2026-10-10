@@ -95,6 +95,15 @@ def read(path: Path) -> PreparedProvenance:
         raise PreparedError(problems) from exc
 
 
+#: Why an entry outside the Library folders is refused, or listed unreadable
+#: (Troy, LS7: B19/B20 amended).
+OUTSIDE_LIBRARY = (
+    "A prepared model's files live in the Library, so any node can run it and nothing is "
+    "lost with a node or an engine: move the engine's folder into a Library folder, then "
+    "add it from there."
+)
+
+
 def model_from(path: Path, root: Path) -> LibraryModel:
     """One prepared model from its provenance file, or an unreadable entry
     naming why. Never cached: the file is a few hundred bytes, and whether
@@ -106,6 +115,13 @@ def model_from(path: Path, root: Path) -> LibraryModel:
         return unreadable(path, root, str(exc))
     entry = provenance.entry
     resolved = entry_path(path, entry)
+    if is_absolute(entry) and not is_within(resolved, root):
+        return unreadable(
+            path,
+            root,
+            f"its entry file {resolved} is outside the Library folder {root}. {OUTSIDE_LIBRARY}",
+            provenance=provenance,
+        )
     found = os.path.isfile(resolved)
     if not found and not is_absolute(entry):
         # Relative means it travels with this folder, so it should be here.

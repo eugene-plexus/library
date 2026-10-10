@@ -158,10 +158,16 @@ def _write_provenance(body: PreparedModelRequest, roots: list[Path]) -> tuple[Pa
     target = folder / f"{body.name}{prepared.SUFFIX}"
     written = prepared.written_entry(entry, folder)
     resolved = prepared.entry_path(target, written)
-    # An entry in a Library folder is on this host, so it can be checked
-    # now. Any other absolute entry is a path on the node that runs it.
-    here = not prepared.is_absolute(written) or any(is_within(written, r) for r in roots)
-    if here and not os.path.isfile(resolved):
+    # The Library is the home of a model's files (Troy, LS7: B19/B20 amended),
+    # so an entry is in the Library folder its provenance goes into, never a
+    # path on one node's own disk; and being here, it is checked now.
+    if prepared.is_absolute(written) and not is_within(written, root):
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Entry outside the Library",
+            f"{written} is not in the Library folder {root}. {prepared.OUTSIDE_LIBRARY}",
+        )
+    if not os.path.isfile(resolved):
         raise _problem(
             status.HTTP_400_BAD_REQUEST,
             "Entry file not found",

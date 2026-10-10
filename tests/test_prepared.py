@@ -88,14 +88,13 @@ def test_a_relative_entry_that_is_not_there_is_unreadable_and_named(models_dir: 
     assert "gone.json" in (found.error or "")
 
 
-def test_an_absolute_entry_on_another_node_is_listed_not_found_here(models_dir: Path) -> None:
+def test_an_entry_outside_the_library_is_unreadable_and_says_why(models_dir: Path) -> None:
+    """The Library is the home of a model's files (Troy, LS7: B19 amended)."""
     provenance(models_dir, entry=r"Z:\Strata\strata-qwen.json")
     found = scan(models_dir)["qwen-flash"]
-    assert found.status is ModelStatus.present
-    assert found.prepared is not None
-    assert found.prepared.entryFound is False
-    assert found.prepared.entryPath == r"Z:\Strata\strata-qwen.json"
-    assert [f.role for f in found.files or []] == [ModelFileRole.index]
+    assert found.status is ModelStatus.unreadable
+    assert "outside the Library folder" in (found.error or "")
+    assert "move the engine's folder into a Library folder" in (found.error or "")
 
 
 @pytest.mark.parametrize(
@@ -264,19 +263,19 @@ def test_adopting_writes_the_file_beside_its_entry_and_lists_it_at_once(
     assert again["prepared"]["entryFound"] is True
 
 
-def test_an_entry_on_another_node_is_written_as_given(
+def test_an_entry_outside_the_library_is_refused_and_nothing_written(
     configured_client: TestClient, models_dir: Path
 ) -> None:
+    """B20 amended (Troy, LS7): an entry on one node's own disk is refused."""
     answer = adopt(
         configured_client,
         root=str(models_dir),
         subdirectory="strata",
         provenance={"engine": "strata", "entry": r"Z:\Strata\strata-qwen.json"},
     )
-    assert answer.status_code == 201, answer.text
-    written = models_dir / "strata" / f"qwen-flash{prepared.SUFFIX}"
-    assert json.loads(written.read_text(encoding="utf-8"))["entry"] == r"Z:\Strata\strata-qwen.json"
-    assert answer.json()["prepared"]["entryFound"] is False
+    assert answer.status_code == 400, answer.text
+    assert answer.json()["detail"]["title"] == "Entry outside the Library"
+    assert not (models_dir / "strata" / f"qwen-flash{prepared.SUFFIX}").exists()
 
 
 def test_adopting_refuses_and_writes_nothing_when_it_should(
