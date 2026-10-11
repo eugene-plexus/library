@@ -57,6 +57,10 @@ from typing import Any, BinaryIO, TypeGuard
 
 MAGIC = b"GGUF"
 
+# `<arch>.pooling_type` is llama.cpp's `llama_pooling_type`: 0 none, 1 mean,
+# 2 cls, 3 last, 4 rank. Rank is what a reranker is converted with.
+POOLING_RANK = 4
+
 # GGUF value type tags, in the order the format defines them.
 (
     T_UINT8,
@@ -321,12 +325,49 @@ class GgufMetadata:
         Worth detecting because the failure is silent: llama-server's
         own help says `--embedding` is "for use only with dedicated
         embedding models", and launching one of these as a chat model
-        does not error — it starts, serves, and returns nonsense.
+        does not error — it starts, and answers neither embeddings (a
+        501) nor chat (a 500, or text that means nothing).
+
+        **True for a reranker too**: rank pooling is a pooling type. A
+        caller that needs to tell them apart asks `is_rerank` first, or
+        `is_search_embedding`, which already has.
         """
         if self.arch_key("pooling_type") is not None:
             return True
         causal = self.arch_key("attention.causal")
         return causal is False
+
+    @property
+    def is_rerank(self) -> bool:
+        """A reranker: rank pooling (type 4), or classifier output labels.
+
+        It scores how well a passage answers a question, and needs
+        `--reranking` the way an embedder needs `--embeddings`. The
+        agent reads the same two keys when it starts a model with `auto`
+        (`engines/run_mode.py`), so what the console predicts from this
+        and what the agent decides agree.
+
+        **The header can miss one.** The gpustack bge-reranker-v2-m3 file
+        is a non-causal `bert` with a classifier head and neither key, so
+        it reads as an embedding model here and in the agent, and the
+        profile's `mode` is how a person says otherwise.
+        """
+        if self.arch_key("pooling_type") == POOLING_RANK:
+            return True
+        labels = self.arch_key("classifier.output_labels")
+        if isinstance(labels, list):
+            return len(labels) > 0
+        # A label list long enough to have been stepped over rather than kept
+        # is still a list of labels.
+        arch = self.architecture
+        return (
+            arch is not None and self.array_lengths.get(f"{arch}.classifier.output_labels", 0) > 0
+        )
+
+    @property
+    def is_search_embedding(self) -> bool:
+        """An embedding model that is not a reranker: what `capabilities.embedding` says."""
+        return self.is_embedding and not self.is_rerank
 
     @property
     def recommended_sampling(self) -> Sampling:

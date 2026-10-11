@@ -238,6 +238,51 @@ def embedding_kv(*, name: str = "Test Embed") -> dict[str, Any]:
     }
 
 
+def decoder_embedding_kv(*, name: str = "Test Qwen3 Embed") -> dict[str, Any]:
+    """Qwen3-Embedding-0.6B as read off the real file (2026-10-11): a decoder, so
+    **no attention key at all**, with last pooling (3) and a chat template left
+    over from the model it was made from."""
+    return {
+        "general.architecture": "qwen3",
+        "general.name": name,
+        "qwen3.block_count": 28,
+        "qwen3.context_length": 32768,
+        "qwen3.pooling_type": 3,
+        "tokenizer.chat_template": "{{ x }}",
+        "general.file_type": 7,
+    }
+
+
+def reranker_kv(*, name: str = "Test Qwen3 Rerank") -> dict[str, Any]:
+    """The ggml-org Qwen3-Reranker-0.6B as read off the real file: rank pooling (4),
+    its yes/no labels, and the rerank template baked into the tokenizer."""
+    return {
+        "general.architecture": "qwen3",
+        "general.name": name,
+        "qwen3.block_count": 28,
+        "qwen3.context_length": 40960,
+        "qwen3.pooling_type": 4,
+        "qwen3.classifier.output_labels": ["yes", "no"],
+        "tokenizer.chat_template": "{{ x }}",
+        "tokenizer.chat_template.rerank": "{{ q }}{{ d }}",
+        "general.file_type": 7,
+    }
+
+
+def cross_encoder_kv(*, name: str = "Test bge Rerank") -> dict[str, Any]:
+    """The gpustack bge-reranker-v2-m3 as read off the real file: a non-causal `bert`
+    with a classifier head in its tensors, and **neither a pooling type nor labels**
+    in its metadata. The one reranker the header cannot name."""
+    return {
+        "general.architecture": "bert",
+        "general.name": name,
+        "bert.block_count": 24,
+        "bert.context_length": 8192,
+        "bert.attention.causal": False,
+        "general.file_type": 7,
+    }
+
+
 def write_safetensors(
     path: Path,
     tensors: dict[str, tuple[str, list[int]]],

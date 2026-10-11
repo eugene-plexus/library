@@ -895,8 +895,9 @@ class Scanner:
             parameters=None,
             sizeLabel=metadata.size_label,
             capabilities=ModelCapabilities(
-                chat=not metadata.is_embedding,
-                embedding=metadata.is_embedding,
+                chat=not (metadata.is_embedding or metadata.is_rerank),
+                embedding=metadata.is_search_embedding,
+                rerank=metadata.is_rerank,
                 vision=projector is not None,
                 chatTemplate=metadata.has_chat_template,
             ),

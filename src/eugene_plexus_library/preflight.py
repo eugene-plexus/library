@@ -572,8 +572,9 @@ async def preflight(
             vocabSize=meta.vocab_size,
             shardCount=meta.shard_count,
             capabilities=ModelCapabilities(
-                chat=not meta.is_embedding,
-                embedding=meta.is_embedding,
+                chat=not (meta.is_embedding or meta.is_rerank),
+                embedding=meta.is_search_embedding,
+                rerank=meta.is_rerank,
                 vision=meta.is_projector,
                 chatTemplate=meta.has_chat_template,
             ),
