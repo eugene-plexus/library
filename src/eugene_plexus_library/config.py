@@ -79,23 +79,16 @@ FIELDS: list[ConfigField] = [
         key="modelRoots",
         label="Folders",
         description=(
-            "The directories this Library catalogues, as the machine the "
-            "Library runs on spells them. Point them at wherever you "
-            "already keep models — an LM Studio folder, a drive full of "
-            "GGUFs, a HuggingFace cache. Subdirectories are searched, so "
-            "one entry covers a whole publisher/repo tree. Nothing is "
-            "moved, renamed or copied; these are read only. Order matters "
-            "only in that it is the order you see them in, and downloads "
-            "will default to the first. A node runs a model only from one "
-            "of these folders. Each folder also carries its MOUNTS: where "
-            "other machines find the same directory — one path for Linux "
-            "and macOS nodes (`/mnt/models`), one for Windows nodes "
-            "(`\\\\NAS\\models`); a node takes the entry of its own "
-            "shape and inherits it, so the reach of a folder is stated "
-            "once, here. A node that mounts the share somewhere else "
-            "carries one override under Library → that node → Folders. "
-            "No mounts means the folder is reached at its own path, or "
-            "not at all — every single-machine install."
+            "The folders this Library catalogues, spelled as the machine the "
+            "Library runs on spells them.\n\n"
+            "Point them at wherever you already keep models. Subfolders are "
+            "searched, and nothing is moved or copied. Downloads go to the first "
+            "folder by default, and a node runs a model only from one of these "
+            "folders.\n\n"
+            "Each folder can list its **mounts**, where other machines find it: one "
+            "path for Linux and macOS nodes (`/mnt/models`) and one for Windows nodes "
+            "(`\\\\NAS\\models`). A node that mounts the share elsewhere sets an override "
+            "under Library → that node → Folders."
         ),
         category="library",
         valueType=ConfigValueType.library_folders,
@@ -149,21 +142,16 @@ FIELDS: list[ConfigField] = [
         key=sources_mod.SOURCES_KEY,
         label="Where to find models",
         description=(
-            "The places Discover searches, together; every result says "
-            "which one it came from, and results come in this list's "
-            "order. A hub is Hugging Face or anything "
-            "that speaks its API — a regional mirror, or an enterprise "
-            "instance — at its own address, with its own access token: "
-            "needed for gated models (the ones whose licence you accept "
-            "on their own page) and private repositories, and worth "
-            "setting even without either, because the hub serves a "
-            "signed-in client faster and allows it more requests. Tokens "
-            "are stored encrypted and never shown again. An engine's list "
-            "is the models an engine says it supports (Strata's sizes of "
-            "Qwen3.8-Flash-Next, for one), as the node picked in Discover "
-            "reports them; leave its engine empty for every engine's. "
-            "Switching a source off stops searching it; turning off "
-            "Search and download models stops everything."
+            "The places Discover searches; every result says which source it came "
+            "from, in this list's order.\n\n"
+            "A **hub** is Hugging Face or anything that speaks its API, such as a "
+            "mirror or an enterprise instance, at its own address. Its access "
+            "token is needed for gated and private models, and also makes searches "
+            "faster and raises the request limit. Tokens are stored encrypted and "
+            "never shown again.\n\n"
+            "An **engine** list is the models an engine says it supports, as the node "
+            "picked in Discover reports them. Leave its engine empty for every "
+            "engine's."
         ),
         category="catalogue",
         valueType=ConfigValueType.catalogue_sources,
@@ -224,13 +212,12 @@ FIELDS: list[ConfigField] = [
         key="starterModelsFile",
         label="Starter model list",
         description=(
-            "A YAML file naming the handful of models a new install is "
-            "offered before it has any, one per size class. Empty means "
-            "the list that ships inside this component, which a review "
-            "keeps current; point this at your own file to recommend "
-            "something else, or at a file with an empty `classes:` list "
-            "to recommend nothing at all. The path is on the machine "
-            "the library runs on."
+            "A YAML file naming the starter models a new install is offered, one "
+            "per size class.\n\n"
+            "Empty uses the list that ships with this version. Point it at your own "
+            "file to recommend something else, or at a file with an empty `classes:` "
+            "list to recommend nothing. The path is on the machine the Library runs "
+            "on."
         ),
         category="guidance",
         valueType=ConfigValueType.file_path,
