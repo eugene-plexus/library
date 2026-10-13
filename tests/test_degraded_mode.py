@@ -55,7 +55,8 @@ def test_a_root_that_is_not_a_string_does_not_stop_the_scan(
     """A hand-edited config file must not be able to wedge the walk."""
     write_gguf(models_dir / "a.gguf", qwen_like_kv())
     settings_at.config_file.write_text(
-        f"modelRoots:\n  - 42\n  - {models_dir.as_posix()}\n", encoding="utf-8"
+        f"modelRoots:\n  - 42\n  - path: {models_dir.as_posix()}\n    mounts: []\n",
+        encoding="utf-8",
     )
 
     for client in _client(settings_at):

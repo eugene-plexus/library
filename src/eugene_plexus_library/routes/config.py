@@ -18,7 +18,7 @@ from .._generated.models import (
     ConfigUpdateResult,
 )
 from ..config import ConfigStore
-from ..folders import folder_paths
+from ..folders import folder_paths, folders_from_body
 
 router = APIRouter(tags=["config"])
 
@@ -76,7 +76,8 @@ def test_config(request: Request, body: ConfigTestRequest | None = None) -> Conf
     if body and body.overrides:
         overrides = body.overrides.model_dump(exclude_none=True)
 
-    raw = overrides.get("modelRoots", store.get("modelRoots")) or []
+    # Judged as a PATCH would judge it, so a bare string is a folder here too.
+    raw = folders_from_body(overrides.get("modelRoots", store.get("modelRoots")) or [])
     if not isinstance(raw, list):
         return ConfigTestResult(
             ok=False,

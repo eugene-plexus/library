@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "lastScanAt": "2026-10-01T09:30:00+00:00",
+  "models": [
+    {
+      "id": "386a26e9af6dbb71",
+      "path": "/models/qwen/qwen3-8b-q4_k_m.gguf",
+      "format": "gguf",
+      "name": "qwen3-8b-q4_k_m",
+      "status": "present",
+      "sizeBytes": 5000000000,
+      "files": [
+        {
+          "path": "/models/qwen/qwen3-8b-q4_k_m.gguf",
+          "role": "weights",
+          "sizeBytes": 5000000000
+        }
+      ],
+      "firstSeenAt": "2026-10-01T09:30:00Z",
+      "lastSeenAt": "2026-10-01T09:30:00Z",
+      "modifiedAt": "2026-09-30T12:00:00Z"
+    },
+    {
+      "id": "4c26952e6cb539c3",
+      "path": "/models/gemma/gemma-3-4b-q8_0.gguf",
+      "format": "gguf",
+      "name": "gemma-3-4b-q8_0",
+      "status": "present",
+      "sizeBytes": 4300000000,
+      "files": [
+        {
+          "path": "/models/gemma/gemma-3-4b-q8_0.gguf",
+          "role": "weights",
+          "sizeBytes": 4300000000
+        }
+      ],
+      "firstSeenAt": "2026-10-01T09:30:00Z",
+      "lastSeenAt": "2026-10-01T09:30:00Z",
+      "modifiedAt": "2026-09-30T12:00:00Z"
+    },
+    {
+      "id": "983b5bcf65063028",
+      "path": "/models/other/tiny.gguf",
+      "format": "gguf",
+      "name": "tiny",
+      "status": "present",
+      "sizeBytes": 400000000,
+      "files": [
+        {
+          "path": "/models/other/tiny.gguf",
+          "role": "weights",
+          "sizeBytes": 400000000
+        }
+      ],
+      "firstSeenAt": "2026-10-01T09:30:00Z",
+      "lastSeenAt": "2026-10-01T09:30:00Z",
+      "modifiedAt": "2026-09-30T12:00:00Z"
+    }
+  ],
+  "profiles": {
+    "386a26e9af6dbb71": [
+      {
+        "id": "0f71f3da4306",
+        "name": "fast",
+        "default": true,
+        "engine": "llama_cpp",
+        "flags": {
+          "contextSize": 8192,
+          "gpuLayers": 99,
+          "flashAttention": true
+        },
+        "notes": "OOMs above 24 layers",
+        "createdAt": "2026-10-13T13:47:37.224744Z",
+        "updatedAt": "2026-10-13T13:47:37.224744Z"
+      },
+      {
+        "id": "900eb22089e9",
+        "name": "cpu only",
+        "default": false,
+        "engine": "llama_cpp",
+        "flags": {
+          "gpuLayers": 0,
+          "flashAttention": false
+        },
+        "createdAt": "2026-10-13T13:47:37.225744Z",
+        "updatedAt": "2026-10-13T13:47:37.225744Z"
+      }
+    ],
+    "4c26952e6cb539c3": [
+      {
+        "id": "b26212f444aa",
+        "name": "built",
+        "default": true,
+        "maxTokens": 2048,
+        "temperature": 0.7,
+        "engine": "llama_cpp",
+        "flags": {
+          "contextSize": 16384,
+          "cacheType": "q8_0",
+          "flashAttention": true
+        },
+        "builtBy": {
+          "buildId": "b-1",
+          "node": "Amish_Station",
+          "accuracy": "high",
+          "builtAt": "2026-10-01T08:00:00Z",
+          "engineVersion": "b6900",
+          "flags": {
+            "contextSize": 16384,
+            "cacheType": "q8_0",
+            "flashAttention": true
+          },
+          "decodeTokensPerSecond": 88.5
+        },
+        "createdAt": "2026-10-13T13:47:37.226744Z",
+        "updatedAt": "2026-10-13T13:47:37.226744Z"
+      }
+    ]
+  },
+  "downloads": [
+    {
+      "id": "d1",
+      "state": "downloading",
+      "repo": "unsloth/Qwen3-8B-GGUF",
+      "files": [
+        {
+          "path": "Qwen3-8B-Q4_K_M.gguf",
+          "destinationPath": "/models/qwen/Qwen3-8B-Q4_K_M.gguf",
+          "sizeBytes": 5000000000,
+          "bytesDownloaded": 1000000000,
+          "state": "downloading"
+        }
+      ],
+      "bytesTotal": 5000000000,
+      "bytesDownloaded": 1000000000,
+      "startedAt": "2026-10-01T09:40:00Z"
+    }
+  ]
+}

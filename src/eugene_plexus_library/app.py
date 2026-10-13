@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import __version__
+from . import __version__, conversions
 from .auth_state import load_auth_state
 from .catalogue_sources import HubClients
 from .config import DEFAULT_ROOTS_VARIABLE, ConfigStore
@@ -67,7 +67,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     else:
         try:
+            # What v0.1 saved is converted once, before anything reads it.
+            conversions.convert_config(settings.config_file)
             config_store.load()
+        except conversions.ConversionFailed as exc:
+            # The config stays as it was and the library runs on defaults, as for
+            # any config it cannot load: the endpoints that repair it stay up.
+            log.error("%s Running on defaults; fix it via /v1/config and restart.", exc)
         # Bad config must never stop startup — see below.
         except Exception as exc:
             # Degraded, not dead. The config endpoints are how an
@@ -84,8 +90,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.safe_mode = settings.safe_mode
     _announce_default_roots(config_store)
 
+    # What v0.1 saved is converted once, before the store reads it. A conversion
+    # that cannot finish leaves the files as they were and the store refusing
+    # writes, naming why on /healthz (storageError): never a crash.
     state_store = StateStore(settings.state_file)
-    state_store.load()
+    blocked: str | None = None
+    try:
+        conversions.convert_state(settings.state_file)
+    except conversions.ConversionFailed as exc:
+        blocked = str(exc)
+    state_store.load(blocked=blocked)
     app.state.state_store = state_store
 
     manager = ScanManager(

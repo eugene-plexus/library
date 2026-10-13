@@ -1,0 +1,43 @@
+{
+  "version": 2,
+  "lastScanAt": "2026-10-05T09:30:00+00:00",
+  "models": [
+    {
+      "id": "386a26e9af6dbb71",
+      "path": "/models/qwen/qwen3-8b-q4_k_m.gguf",
+      "format": "gguf",
+      "name": "qwen3-8b-q4_k_m",
+      "status": "present",
+      "sizeBytes": 5000000000,
+      "files": [
+        {
+          "path": "/models/qwen/qwen3-8b-q4_k_m.gguf",
+          "role": "weights",
+          "sizeBytes": 5000000000
+        }
+      ],
+      "firstSeenAt": "2026-10-05T09:30:00Z",
+      "lastSeenAt": "2026-10-05T09:30:00Z",
+      "modifiedAt": "2026-09-30T12:00:00Z"
+    },
+    {
+      "id": "4c26952e6cb539c3",
+      "path": "/models/gemma/gemma-3-4b-q8_0.gguf",
+      "format": "gguf",
+      "name": "gemma-3-4b-q8_0",
+      "status": "present",
+      "sizeBytes": 4300000000,
+      "files": [
+        {
+          "path": "/models/gemma/gemma-3-4b-q8_0.gguf",
+          "role": "weights",
+          "sizeBytes": 4300000000
+        }
+      ],
+      "firstSeenAt": "2026-10-05T09:30:00Z",
+      "lastSeenAt": "2026-10-05T09:30:00Z",
+      "modifiedAt": "2026-09-30T12:00:00Z"
+    }
+  ],
+  "downloads": []
+}

@@ -63,3 +63,22 @@ def test_every_served_description_opens_with_one_short_sentence(client: TestClie
     fields = client.get("/v1/config/schema").json()["fields"]
     assert fields
     assert _violations(fields) == []
+
+
+def test_two_settings_say_what_the_one_line_leaves_out(client: TestClient) -> None:
+    """Said in the details a click away, not in the line (which stays one short sentence)."""
+    fields = {f["key"]: f for f in client.get("/v1/config/schema").json()["fields"]}
+
+    def details(key: str) -> str:
+        return " ".join(_paragraphs(fields[key]["description"])[1:])
+
+    # The switch lives on another setting, so a person reading the list of sources is told.
+    assert "Turning off Search and download models stops every source here." in details(
+        "catalogueSources"
+    )
+    # What a folder with no mounts means for a machine that is not this one.
+    assert (
+        "A folder with no mounts is reached at its own path on other machines, or not at all."
+        in (details("modelRoots"))
+    )
+    assert fields["catalogueEnabled"]["label"] == "Search and download models"

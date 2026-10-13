@@ -33,10 +33,12 @@ model with nested metadata, and nobody hand-edits it. YAML would cost
 parse time and gain nothing. `config.yaml` — the part an operator does
 edit — stays YAML.
 
-Legacy combined state is preserved before the first migration. Unsupported
-versions and invalid profile documents make writes unavailable and appear on
-health; loading never silently discards them. Cache corruption can be rebuilt
-only once profiles have an independent, readable document.
+Only the current version is read. What v0.1 saved (the profiles inside the state
+file, flash attention as a checkbox) is converted once at start, with a backup,
+by `conversions.py`. Unsupported versions, invalid profile documents and a
+conversion that failed make writes unavailable and appear on health; loading
+never silently discards them. A corrupt cache is rebuilt by a scan, because the
+profiles are in a document of their own.
 
 Writes are atomic (fsynced temp file, then `os.replace`) so a crash mid-write
 leaves the previous state rather than a truncated file. Losing a scan
@@ -91,7 +93,7 @@ class StateStore:
 
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._profiles_path = path.with_suffix(".profiles.json")
+        self._profiles_path = profile_storage.path_for(path)
         self._storage_error: str | None = None
         self._lock = threading.RLock()
         self._models: dict[str, LibraryModel] = {}
@@ -118,32 +120,41 @@ class StateStore:
                 handle.flush()
                 os.fsync(handle.fileno())
 
-    def load(self) -> None:
-        """Load caches independently; refuse writes if user data is unreadable."""
+    def load(self, *, blocked: str | None = None) -> None:
+        """Load caches independently; refuse writes if user data is unreadable.
+
+        `blocked` is why what v0.1 saved could not be converted
+        (`conversions.ConversionFailed`). It is the reason writes are refused,
+        and it is not replaced by whatever else this load finds wrong with the
+        files it left as they were.
+        """
         with self._lock:
+            self._storage_error = blocked
+            self._models = {}
+            self._profiles = {}
+            self._downloads = {}
             raw: dict[str, Any] = {}
             if self._path.exists():
                 try:
                     raw = json.loads(self._path.read_text(encoding="utf-8"))
                     if not isinstance(raw, dict):
                         raise ValueError("state must be an object")
-                    version = raw.get("version", 1)
-                    if type(version) is not int or version not in (1, STATE_VERSION):
-                        self._storage_error = (
+                    version = raw.get("version")
+                    if type(version) is not int or version != STATE_VERSION:
+                        self._storage_error = self._storage_error or (
                             f"Unsupported library state version {version!r}; "
                             "restore matching software and state."
                         )
+                        log.error("%s", self._storage_error)
                         return
                 except (OSError, ValueError) as exc:
                     self._preserve(self._path)
                     raw = {}
                     if not self._profiles_path.exists():
-                        self._storage_error = (
-                            f"Legacy library state is unreadable: {exc}. "
+                        self._storage_error = self._storage_error or (
+                            f"Library state is unreadable: {exc}. "
                             "Restore its preserved copy before saving."
                         )
-            self._models = {}
-            self._downloads = {}
             for entry in raw.get("models") or []:
                 try:
                     model = LibraryModel.model_validate(entry)
@@ -152,6 +163,7 @@ class StateStore:
                     continue
                 self._models[model.id] = model
             try:
+                profiles: dict[str, list[dict[str, Any]]] = {}
                 if self._profiles_path.exists():
                     profiles, identities = profile_storage.read(self._profiles_path)
                     for entry in identities:
@@ -160,21 +172,15 @@ class StateStore:
                             self._models[model.id] = model.model_copy(
                                 update={"status": ModelStatus.missing}
                             )
-                else:
-                    profiles = raw.get("profiles", {})
-                if not isinstance(profiles, dict):
-                    raise StorageUnavailable("Profile records must be an object")
                 # Validate all owned records before adopting any: never drop tuning work.
                 self._profiles = {
                     model_id: [ModelProfile.model_validate(p) for p in records]
                     for model_id, records in profiles.items()
                 }
-                if not self._profiles_path.exists() and self._storage_error is None:
-                    self._preserve(self._path)
-                    self._write_profiles_locked()
             except (OSError, ValueError, KeyError, TypeError, StorageUnavailable) as exc:
-                self._preserve(self._profiles_path if self._profiles_path.exists() else self._path)
-                self._storage_error = (
+                if self._profiles_path.exists():
+                    self._preserve(self._profiles_path)
+                self._storage_error = self._storage_error or (
                     f"Saved profiles are unreadable: {exc}. Restore matching data before saving."
                 )
                 self._profiles = {}

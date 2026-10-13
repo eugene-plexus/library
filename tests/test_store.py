@@ -46,19 +46,6 @@ def store(tmp_path: Path) -> StateStore:
     return StateStore(tmp_path / "state.json")
 
 
-def test_invalid_legacy_profile_collection_is_preserved_and_refuses_writes(tmp_path: Path) -> None:
-    path = tmp_path / "state.json"
-    before = b'{"version":1,"profiles":["unreadable tuning work"]}'
-    path.write_bytes(before)
-    state = StateStore(path)
-    state.load()
-    assert state.storage_error is not None
-    assert path.read_bytes() == before
-    assert path.with_name("state.json.preserved").read_bytes() == before
-    with pytest.raises(RuntimeError):
-        state.replace_models([], scanned_at=datetime.now(UTC))
-
-
 # --- the incremental-rescan cache ----------------------------------------
 
 
@@ -291,7 +278,7 @@ def test_one_bad_record_does_not_lose_the_others(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     good = _model(tmp_path / "good.gguf").model_dump(mode="json", exclude_none=True)
     path.write_text(
-        json.dumps({"version": 1, "models": [good, {"nonsense": True}], "profiles": {}}),
+        json.dumps({"version": 2, "models": [good, {"nonsense": True}]}),
         encoding="utf-8",
     )
 
@@ -342,24 +329,39 @@ def test_profiles_survive_corruption_and_replacement_of_cache(tmp_path: Path) ->
     assert path.with_name(path.name + ".preserved").read_bytes() == b"broken cache"
 
 
-def test_legacy_profiles_migrate_before_cache_rewrite(tmp_path: Path) -> None:
+def test_the_state_of_v0_1_is_not_read_here_and_is_not_touched(tmp_path: Path) -> None:
+    """What v0.1 saved is converted before this load (`conversions.py`). A
+    store that is handed it anyway reads nothing from it, refuses writes, and
+    leaves the bytes as they were: version 1 is not a format this reads."""
+    from eugene_plexus_library.profile_storage import StorageUnavailable
+
     path = tmp_path / "state.json"
+    before = json.dumps({"version": 1, "models": [], "profiles": {"model": []}})
+    path.write_text(before, encoding="utf-8")
     store = StateStore(path)
-    profile = store.create_profile("model", _spec("one"))
-    path.with_suffix(".profiles.json").unlink()
-    original = json.dumps(
-        {"version": 1, "models": [], "profiles": {"model": [profile.model_dump(mode="json")]}}
-    )
-    path.write_text(original, encoding="utf-8")
-    migrated = StateStore(path)
-    migrated.load()
-    assert migrated.get_profile("model", profile.id) is not None
-    migrated.replace_models([], scanned_at=datetime.now(UTC))
-    assert "profiles" not in json.loads(path.read_text(encoding="utf-8"))
-    assert path.with_name(path.name + ".preserved").read_text(encoding="utf-8") == original
-    again = StateStore(path)
-    again.load()
-    assert again.get_profile("model", profile.id) is not None
+    store.load()
+
+    assert store.storage_error is not None and "version 1" in store.storage_error
+    with pytest.raises(StorageUnavailable):
+        store.create_profile("model", _spec("one"))
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_a_reason_given_to_load_is_the_reason_writes_are_refused(tmp_path: Path) -> None:
+    """`blocked` is why the conversion could not finish; it is what health
+    reports, and a state file left at version 1 does not replace it."""
+    from eugene_plexus_library.profile_storage import StorageUnavailable
+
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"version": 1, "models": []}), encoding="utf-8")
+    store = StateStore(path)
+    store.load(blocked="could not convert: disk full")
+
+    assert store.storage_error == "could not convert: disk full"
+    with pytest.raises(StorageUnavailable, match="disk full"):
+        store.replace_models([], scanned_at=datetime.now(UTC))
+    store.load()
+    assert store.storage_error is not None and "disk full" not in store.storage_error
 
 
 def test_unreadable_owned_profile_is_preserved_and_read_only(tmp_path: Path) -> None:

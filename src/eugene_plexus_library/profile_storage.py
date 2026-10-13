@@ -2,7 +2,12 @@
 
 The persistence envelope owns its version and record shape. HTTP model
 validation belongs to its caller; changing generated API models does not
-implicitly change this format. Keep a legacy backup before migrating.
+implicitly change this format.
+
+Only the current version is read. Version 1 (flash attention saved as a
+checkbox) is what v0.1 and the first v0.2 builds wrote; `conversions.py`
+rewrites it as version 2 at start, with a backup, and that rewrite is the
+record that it happened.
 """
 
 from __future__ import annotations
@@ -13,11 +18,16 @@ from typing import Any
 
 from ._private_files import write_private_text
 
-VERSION = 1
+VERSION = 2
 
 
 class StorageUnavailable(RuntimeError):
     """Stored user data cannot safely be changed by this version."""
+
+
+def path_for(state_file: Path) -> Path:
+    """Where the profile document lives: beside the state file it belongs to."""
+    return state_file.with_suffix(".profiles.json")
 
 
 def read(path: Path) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
@@ -27,7 +37,11 @@ def read(path: Path) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, An
         or type(raw.get("version")) is not int
         or raw["version"] != VERSION
     ):
-        raise StorageUnavailable(f"{path}: unsupported profile storage version")
+        found = raw.get("version") if isinstance(raw, dict) else None
+        raise StorageUnavailable(
+            f"{path}: unsupported profile storage version {found!r}; this Library reads "
+            f"version {VERSION}"
+        )
     profiles: dict[str, list[dict[str, Any]]] = {}
     if not isinstance(raw.get("profiles"), dict) or not isinstance(raw.get("models", []), list):
         raise StorageUnavailable(f"{path}: invalid profile storage document")

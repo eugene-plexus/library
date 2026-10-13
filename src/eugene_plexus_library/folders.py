@@ -12,10 +12,13 @@ states them.
 
 Two rules this module enforces, and one it deliberately does not:
 
-* **A bare string is a folder with no mounts.** Every config file, PATCH
-  body, wizard and default variable written for `path_list` keeps
-  working; `GET /v1/config` always answers in the object form, so a
-  reader sees one shape.
+* **A bare string is a folder with no mounts, where a person or a script
+  says one**: a PATCH body (the setup wizard sends them) and the default
+  variable. `GET /v1/config` always answers in the object form, so a reader
+  sees one shape, and a config file holds only that shape: what v0.1 wrote as
+  bare strings is rewritten once at start (`conversions.convert_config`),
+  and a bare string found in the file after that is skipped like any other
+  malformed entry.
 * **A mount is absolute and shaped.** A drive letter or UNC prefix means
   Windows nodes, a leading `/` means POSIX nodes; that shape is how a
   node picks its entry, so an unshaped mount could never be picked and
@@ -31,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from ._generated.models import LibraryFolder
@@ -53,14 +57,34 @@ def is_absolute_path(path: str) -> bool:
     return is_windows_shaped(path) or path.startswith("/") or path.startswith("~")
 
 
-def coerce_folders(value: Any) -> list[dict[str, Any]]:
-    """The object form of a folder list, leniently.
+def folders_from_paths(paths: Sequence[str]) -> list[dict[str, Any]]:
+    """Directories as this host spells them, as folders with no mounts.
 
-    Strings become `{path, mounts: []}`; objects keep their `path` and a
-    cleaned `mounts`; anything else is skipped with a log line rather
-    than raised, because a hand-edited config file must not stop the
-    component from starting -- `validate_folders` is the strict half,
-    applied at PATCH time.
+    The default variable names directories and nothing more. Blank ones are
+    dropped, order is kept.
+    """
+    return [{"path": path.strip(), "mounts": []} for path in paths if path.strip()]
+
+
+def folders_from_body(value: Any) -> Any:
+    """A PATCH body's `modelRoots`, each bare string made a folder with no mounts.
+
+    The setup wizard and scripts say a folder by its path. Anything else is
+    left alone for `validate_folders` to judge, so a blank path or a wrong type
+    is refused rather than dropped.
+    """
+    if not isinstance(value, list):
+        return value
+    return [{"path": item, "mounts": []} if isinstance(item, str) else item for item in value]
+
+
+def coerce_folders(value: Any) -> list[dict[str, Any]]:
+    """The folders a config file holds, leniently.
+
+    Objects keep their `path` and a cleaned `mounts`; anything else, a bare
+    string included, is skipped with a log line rather than raised, because a
+    hand-edited config file must not stop the component from starting --
+    `validate_folders` is the strict half, applied at PATCH time.
     """
     if value is None:
         return []
@@ -69,10 +93,6 @@ def coerce_folders(value: Any) -> list[dict[str, Any]]:
         return []
     out: list[dict[str, Any]] = []
     for index, item in enumerate(value):
-        if isinstance(item, str):
-            if item.strip():
-                out.append({"path": item.strip(), "mounts": []})
-            continue
         if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"].strip():
             raw_mounts = item.get("mounts")
             mounts = (
@@ -103,9 +123,7 @@ def validate_folders(value: Any) -> str | None:
     for index, item in enumerate(value):
         path: Any
         mounts: list[Any]
-        if isinstance(item, str):
-            path, mounts = item, []
-        elif isinstance(item, dict):
+        if isinstance(item, dict):
             extra = sorted(set(item) - {"path", "mounts"})
             if extra:
                 return f"entry {index} has unknown key(s) {extra}; a folder is `path` and `mounts`"
@@ -118,7 +136,7 @@ def validate_folders(value: Any) -> str | None:
             mounts = raw_mounts
         else:
             return (
-                f"entry {index} is {type(item).__name__}, expected a path or an object "
+                f"entry {index} is {type(item).__name__}, expected an object "
                 f"with `path` and `mounts`"
             )
         if not isinstance(path, str) or not path.strip():
@@ -155,6 +173,8 @@ __all__ = [
     "as_models",
     "coerce_folders",
     "folder_paths",
+    "folders_from_body",
+    "folders_from_paths",
     "is_absolute_path",
     "is_windows_shaped",
     "validate_folders",

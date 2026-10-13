@@ -81,7 +81,9 @@ def test_a_file_written_before_the_variable_existed_picks_it_up(tmp_path: Path) 
 
 
 def test_directories_the_operator_set_win(tmp_path: Path) -> None:
-    (tmp_path / "config.yaml").write_text("modelRoots:\n  - /data/mine\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "modelRoots:\n  - path: /data/mine\n    mounts: []\n", encoding="utf-8"
+    )
     store = ConfigStore(tmp_path / "config.yaml", default_roots=["/models"])
     store.load()
 
@@ -235,7 +237,7 @@ def test_the_operators_own_directories_silence_the_default(
     tmp_path: Path, models_dir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     (tmp_path / "config.yaml").write_text(
-        f"modelRoots:\n  - {models_dir.as_posix()}\n", encoding="utf-8"
+        f"modelRoots:\n  - path: {models_dir.as_posix()}\n    mounts: []\n", encoding="utf-8"
     )
     caplog.set_level(logging.INFO, logger="eugene_plexus_library.app")
 

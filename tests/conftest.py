@@ -378,7 +378,7 @@ def configured_client(settings: Settings, models_dir: Path) -> Iterator[TestClie
     afterwards, so the startup-scan path is the one under test.
     """
     settings.config_file.write_text(
-        f"modelRoots:\n  - {models_dir.as_posix()}\nscanOnStartup: true\n",
+        f"modelRoots:\n  - path: {models_dir.as_posix()}\n    mounts: []\nscanOnStartup: true\n",
         encoding="utf-8",
     )
     with TestClient(create_app(settings=settings)) as c:

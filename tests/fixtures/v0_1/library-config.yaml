@@ -1,0 +1,11 @@
+catalogueBaseUrl: https://huggingface.co
+catalogueEnabled: true
+downloadLayout: publisher_repo
+followSymlinks: false
+guidanceContextLength: 8192
+logLevel: INFO
+maxConcurrentDownloads: 1
+modelRoots:
+- /data/models
+- D:\gguf
+scanOnStartup: false

@@ -14,8 +14,9 @@ renders them with no library-specific UI code. Each entry is a
 where other machines find the same directory, one per OS shape -- so
 the reach of a folder is stated once here and every node inherits it,
 instead of each node's agent carrying a row per folder. A bare string
-is still accepted and means a folder with no mounts; `folders.py` holds
-the coercion and the validation.
+in a PATCH body means a folder with no mounts; the file itself holds only the
+object form (`conversions.py` rewrote what v0.1 wrote). `folders.py` holds the
+coercion and the validation.
 
 `catalogueSources` (LS4) is where Discover finds models, and holds the
 one secret: each hub's token, redacted in `GET`, accepted in `PATCH`, and
@@ -59,7 +60,14 @@ from ._generated.models import (
     ConfigValueType,
     LibraryFolder,
 )
-from .folders import as_models, coerce_folders, folder_paths, validate_folders
+from .folders import (
+    as_models,
+    coerce_folders,
+    folder_paths,
+    folders_from_body,
+    folders_from_paths,
+    validate_folders,
+)
 
 log = logging.getLogger(__name__)
 
@@ -87,7 +95,8 @@ FIELDS: list[ConfigField] = [
             "folders.\n\n"
             "Each folder can list its **mounts**, where other machines find it: one "
             "path for Linux and macOS nodes (`/mnt/models`) and one for Windows nodes "
-            "(`\\\\NAS\\models`). A node that mounts the share elsewhere sets an override "
+            "(`\\\\NAS\\models`). A folder with no mounts is reached at its own path on other "
+            "machines, or not at all. A node that mounts the share elsewhere sets an override "
             "under Library → that node → Folders."
         ),
         category="library",
@@ -151,7 +160,8 @@ FIELDS: list[ConfigField] = [
             "never shown again.\n\n"
             "An **engine** list is the models an engine says it supports, as the node "
             "picked in Discover reports them. Leave its engine empty for every "
-            "engine's."
+            "engine's.\n\n"
+            "Turning off Search and download models stops every source here."
         ),
         category="catalogue",
         valueType=ConfigValueType.catalogue_sources,
@@ -276,7 +286,7 @@ def as_schema(
         if field.key in UNSET_MEANS:
             update["unsetMeans"] = UNSET_MEANS[field.key]
         if field.key == ROOTS_KEY and default_roots:
-            update["default"] = coerce_folders(list(default_roots))
+            update["default"] = folders_from_paths(default_roots)
             update["defaultSource"] = (
                 f"Set by this install's environment ({DEFAULT_ROOTS_VARIABLE}), with no "
                 "mounts declared. Clearing the list returns to it; adding mounts replaces it "
@@ -307,7 +317,7 @@ def _defaults(*, default_roots: Sequence[str] = ()) -> dict[str, Any]:
     # Copies: a default list held as a value must not be the schema's own.
     values = {f.key: copy.deepcopy(f.default) for f in FIELDS if f.default is not None}
     if default_roots:
-        values[ROOTS_KEY] = coerce_folders(list(default_roots))
+        values[ROOTS_KEY] = folders_from_paths(default_roots)
     return values
 
 
@@ -450,11 +460,10 @@ class ConfigStore:
                 # container that came up before this default did.
                 self._roots_defaulted = bool(self._default_roots) and not merged.get(ROOTS_KEY)
                 if self._roots_defaulted:
-                    merged[ROOTS_KEY] = coerce_folders(list(self._default_roots))
+                    merged[ROOTS_KEY] = folders_from_paths(self._default_roots)
                 else:
-                    # A file written for `path_list` holds bare strings;
-                    # read as folders with no mounts, so one shape is
-                    # held in memory and one shape is written back.
+                    # The file holds folders (a v0.1 file's bare strings were
+                    # rewritten before this read); a junk entry is skipped.
                     merged[ROOTS_KEY] = coerce_folders(merged.get(ROOTS_KEY))
                 self._values = merged
             else:
@@ -548,6 +557,10 @@ class ConfigStore:
                 if field is None:
                     rejected.append(ConfigFieldError(key=key, message="unknown field"))
                     continue
+                if key == ROOTS_KEY:
+                    # The wizard and scripts say a folder by its path: a bare
+                    # string is a folder with no mounts, before it is judged.
+                    new_value = folders_from_body(new_value)
                 error = _validate_value(field, new_value)
                 if error is not None:
                     rejected.append(ConfigFieldError(key=key, message=error))
@@ -564,8 +577,7 @@ class ConfigStore:
 
                 defaults = self._field_defaults()
                 if key == ROOTS_KEY and new_value is not None:
-                    # Bare strings are accepted (the wizard, a script, the
-                    # M2 shape) and stored in the object form.
+                    # Cleaned, and stored in the object form.
                     new_value = coerce_folders(new_value)
                 if key == ROOTS_KEY and self._default_roots:
                     # `[]` clears to the default as `null` does: with the

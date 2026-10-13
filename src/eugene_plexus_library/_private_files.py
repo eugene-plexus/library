@@ -48,7 +48,7 @@ import os
 import uuid
 from pathlib import Path
 
-__all__ = ["PRIVATE_MODE", "write_private_text"]
+__all__ = ["PRIVATE_MODE", "write_private_bytes", "write_private_text"]
 
 PRIVATE_MODE = 0o600
 """Owner read and write, nobody else anything."""
@@ -64,9 +64,13 @@ def write_private_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
     Raises what the filesystem raises, after removing the temp file, so
     no `.tmp` is left beside the target to be mistaken for something.
     """
+    write_private_bytes(path, text.encode(encoding))
+
+
+def write_private_bytes(path: Path, data: bytes) -> None:
+    """`write_private_text` for bytes: a copy of a file is kept exactly as it was."""
     target = Path(os.path.realpath(path))
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-    data = text.encode(encoding)
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, PRIVATE_MODE)
     try:
         with os.fdopen(fd, "wb") as handle:

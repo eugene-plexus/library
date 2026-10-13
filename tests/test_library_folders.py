@@ -1,23 +1,32 @@
 """Library folders carry their mounts (2026-09-14).
 
-The claims: a bare string is a folder with no mounts wherever a folder is
-expected (file, PATCH, default variable) and the wire always answers in
-the object form; a mount must be absolute and shaped, and two mounts of
-one shape are refused because a node takes the first of its shape; the
-folders' own paths are what the scanner and the Test button use, never a
-mount; and the M2-era config file a script writes by hand still loads.
+The claims: a bare string is a folder with no mounts where a person or a
+script says one (a PATCH body, the Test button, the default variable) and
+the wire always answers in the object form; a config file holds only that
+form, and a bare string in one is skipped like any junk (what v0.1 wrote is
+rewritten once at start: `test_conversions.py`); a mount must be absolute and
+shaped, and two mounts of one shape are refused because a node takes the
+first of its shape; the folders' own paths are what the scanner and the Test
+button use, never a mount.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
 
 from eugene_plexus_library._generated.models import ConfigUpdateRequest, ConfigUpdateResult
 from eugene_plexus_library.config import ConfigStore
-from eugene_plexus_library.folders import coerce_folders, folder_paths, validate_folders
+from eugene_plexus_library.folders import (
+    coerce_folders,
+    folder_paths,
+    folders_from_body,
+    folders_from_paths,
+    validate_folders,
+)
 
 
 def _patch(store: ConfigStore, **fields: object) -> ConfigUpdateResult:
@@ -31,11 +40,25 @@ def _on_disk(path: Path) -> dict[str, object]:
 # --- coercion ---------------------------------------------------------------
 
 
-def test_a_bare_string_is_a_folder_with_no_mounts() -> None:
-    assert coerce_folders(["/models", " D:\\gguf "]) == [
+def test_a_bare_path_is_a_folder_with_no_mounts() -> None:
+    """The default variable names directories and nothing more."""
+    assert folders_from_paths(["/models", " D:\\gguf ", "  "]) == [
         {"path": "/models", "mounts": []},
         {"path": "D:\\gguf", "mounts": []},
     ]
+
+
+def test_a_patch_body_says_a_folder_by_its_path_and_anything_else_is_left_to_validation() -> None:
+    body = ["/models", {"path": "/archive", "mounts": ["/mnt/archive"]}, "", 3]
+    assert folders_from_body(body) == [
+        {"path": "/models", "mounts": []},
+        {"path": "/archive", "mounts": ["/mnt/archive"]},
+        {"path": "", "mounts": []},  # a blank path is refused by validation, not dropped here
+        3,
+    ]
+    assert validate_folders(folders_from_body(body)) is not None
+    assert folders_from_body("/models") == "/models"  # a wrong type is validation's to refuse
+    assert folders_from_body(None) is None
 
 
 def test_objects_keep_their_mounts_and_junk_is_skipped_not_raised() -> None:
@@ -53,20 +76,30 @@ def test_objects_keep_their_mounts_and_junk_is_skipped_not_raised() -> None:
     assert coerce_folders(None) == []
 
 
+def test_a_config_file_is_read_as_folders_only(caplog: pytest.LogCaptureFixture) -> None:
+    """A bare string is what v0.1 wrote and what `conversions.convert_config`
+    rewrites. It is no longer read here: it is skipped, and named."""
+    assert coerce_folders(["/models", {"path": "/archive", "mounts": []}]) == [
+        {"path": "/archive", "mounts": []}
+    ]
+    assert "modelRoots entry 0 is malformed ('/models')" in caplog.text
+
+
 # --- validation -------------------------------------------------------------
 
 
-def test_validation_accepts_strings_and_objects_together() -> None:
+def test_validation_judges_folders_and_a_bare_string_is_not_one() -> None:
     assert (
         validate_folders(
             [
-                "/models",
+                {"path": "/models", "mounts": []},
                 {"path": "/archive", "mounts": ["/mnt/archive", "Z:\\archive"]},
                 {"path": "D:\\local"},
             ]
         )
         is None
     )
+    assert "expected an object" in (validate_folders(["/models"]) or "")
 
 
 def test_a_mount_must_be_absolute_and_shaped() -> None:
@@ -89,24 +122,25 @@ def test_validation_names_what_else_is_wrong() -> None:
     assert "unknown key" in (validate_folders([{"path": "/m", "to": "/x"}]) or "")
     assert "`path`" in (validate_folders([{"mounts": []}]) or "")
     assert "`mounts` must be a list" in (validate_folders([{"path": "/m", "mounts": "/x"}]) or "")
-    assert "expected a path or an object" in (validate_folders([3]) or "")
+    assert "expected an object" in (validate_folders([3]) or "")
 
 
-def test_duplicate_folders_are_refused_across_both_shapes(tmp_path: Path) -> None:
-    error = validate_folders([str(tmp_path), {"path": str(tmp_path / "."), "mounts": []}])
+def test_duplicate_folders_are_refused_however_the_path_is_spelled(tmp_path: Path) -> None:
+    error = validate_folders(
+        [{"path": str(tmp_path), "mounts": []}, {"path": str(tmp_path / "."), "mounts": []}]
+    )
     assert error is not None and "duplicates" in error
+    # And a bare string in a body is the same folder as an object for it.
+    body = folders_from_body([str(tmp_path), {"path": str(tmp_path / "."), "mounts": []}])
+    assert "duplicates" in (validate_folders(body) or "")
 
 
 # --- the store ----------------------------------------------------------------
 
 
-def test_a_file_written_for_path_list_loads_as_folders_and_is_written_back_as_such(
-    tmp_path: Path,
-) -> None:
-    """`m11-acceptance.sh` writes `modelRoots:` as bare strings by hand;
-    so did every install before this. It still loads, and the next write
-    holds one shape."""
-    (tmp_path / "config.yaml").write_text("modelRoots:\n  - /data/mine\n", encoding="utf-8")
+def test_a_config_file_of_folders_loads_and_is_not_rewritten_by_the_load(tmp_path: Path) -> None:
+    written = "modelRoots:\n- mounts: []\n  path: /data/mine\n"
+    (tmp_path / "config.yaml").write_text(written, encoding="utf-8")
     store = ConfigStore(tmp_path / "config.yaml")
     store.load()
 
@@ -114,11 +148,36 @@ def test_a_file_written_for_path_list_loads_as_folders_and_is_written_back_as_su
     assert [f.model_dump() for f in store.library_folders()] == [
         {"path": "/data/mine", "mounts": []}
     ]
+    assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == written
 
-    _patch(store, scanOnStartup=False)
+
+def test_a_bare_string_in_a_loaded_file_is_not_a_folder(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The file was not converted (it is read here without the start that
+    converts it), so what v0.1 wrote is junk to this reader: skipped, with
+    the entry named."""
+    (tmp_path / "config.yaml").write_text("modelRoots:\n  - /data/mine\n", encoding="utf-8")
+    store = ConfigStore(tmp_path / "config.yaml")
+    store.load()
+
+    assert store.model_roots() == []
+    assert "modelRoots entry 0 is malformed ('/data/mine')" in caplog.text
+
+
+def test_a_patch_may_still_say_a_folder_by_its_path(tmp_path: Path) -> None:
+    """The setup wizard sends strings; the file and the wire hold objects."""
+    store = ConfigStore(tmp_path / "config.yaml")
+    store.load()
+
+    result = _patch(store, modelRoots=["/data/mine", {"path": "/data/other", "mounts": []}])
+
+    assert result.applied == ["modelRoots"] and result.rejected == []
     assert _on_disk(tmp_path / "config.yaml")["modelRoots"] == [
-        {"path": "/data/mine", "mounts": []}
+        {"path": "/data/mine", "mounts": []},
+        {"path": "/data/other", "mounts": []},
     ]
+    assert _patch(store, modelRoots=[" "]).rejected[0].key == "modelRoots"
 
 
 def test_mounts_persist_and_the_paths_are_what_the_scanner_walks(tmp_path: Path) -> None:
