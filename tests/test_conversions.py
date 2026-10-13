@@ -114,6 +114,15 @@ def settings_in(directory: Path) -> Settings:
     )
 
 
+def assert_no_path(text: str, directory: Path) -> None:
+    """Nothing of where `directory` is: not as the system writes a path, not as
+    `repr` escapes one (a Windows path in an `OSError`'s text has its backslashes
+    doubled), and not even its own name, which any form of it carries."""
+    assert str(directory) not in text, text
+    assert repr(str(directory))[1:-1] not in text, text
+    assert directory.name not in text, text
+
+
 # --- the state of v0.1 --------------------------------------------------------
 
 
@@ -686,6 +695,111 @@ def test_a_config_that_cannot_be_converted_runs_on_defaults_and_names_the_cause(
 
     assert str(config) in caplog.text and "Running on defaults" in caplog.text
     assert before != config.read_bytes(), "the repair is what replaced it"
+
+
+def test_a_failed_config_conversion_shows_on_healthz_naming_the_file_and_not_where_it_is(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The library runs on defaults with no folders, and `/healthz` used to say `ok`.
+
+    The reproduction: the state is already version 2, and the copy of the config cannot be
+    kept because something else is at its name."""
+    convert_state(v0_1_state(tmp_path))
+    config = v0_1_config(tmp_path)
+    before = config.read_bytes()
+    config.with_name(config.name + BACKUP_SUFFIX).mkdir()
+    caplog.set_level(logging.ERROR)
+
+    with TestClient(create_app(settings_in(tmp_path))) as client:
+        answer = client.get("/healthz")
+        assert answer.status_code == 200, "degraded, not dead"
+        health = answer.json()
+        assert health["status"] == "degraded"
+        details = health["details"]
+        assert details["rootsConfigured"] == 0, "this is the library that runs on defaults"
+        assert "storageError" not in details, "the state converted: this is the config's alone"
+        error = details["configError"]
+        # The file by its name, what was observed, and what to do; never where it is.
+        assert error.startswith("config.yaml: what v0.1 saved could not be converted (")
+        assert "config.yaml.v0.1.bak" in error, "the cause names the file in the way"
+        assert "It is left as it was." in error and error.endswith("Fix the cause and restart.")
+        assert_no_path(error, tmp_path)
+        # The endpoints that repair it are up.
+        assert client.get("/v1/config/schema").status_code == 200
+
+    # The log keeps the whole path, once, with the same words.
+    [line] = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert str(config) in line and line.endswith(
+        "Running on defaults; fix it via /v1/config and restart."
+    )
+    assert config.read_bytes() == before, "a start that could not convert does not touch the file"
+
+
+def test_a_start_that_converted_everything_reports_no_config_error(tmp_path: Path) -> None:
+    v0_1_state(tmp_path)
+    v0_1_config(tmp_path)
+
+    with TestClient(create_app(settings_in(tmp_path))) as client:
+        health = client.get("/healthz").json()
+
+    assert health["status"] == "ok" and "configError" not in health["details"]
+
+
+def test_a_start_with_nothing_to_convert_reports_no_config_error(tmp_path: Path) -> None:
+    with TestClient(create_app(settings_in(tmp_path))) as client:
+        health = client.get("/healthz").json()
+
+    assert health["status"] == "ok" and "configError" not in health["details"]
+
+
+def test_the_plain_sentence_names_files_by_name_where_the_log_names_them_by_path(
+    tmp_path: Path,
+) -> None:
+    config = v0_1_config(tmp_path)
+    config.with_name(config.name + BACKUP_SUFFIX).mkdir()
+
+    with pytest.raises(ConversionFailed) as caught:
+        convert_config(config)
+
+    assert str(config) in str(caught.value), "the log's sentence is as it was"
+    plain = caught.value.plain
+    assert plain.startswith("config.yaml: what v0.1 saved could not be converted (")
+    assert_no_path(plain, tmp_path)
+
+
+def test_the_plain_sentence_for_a_failure_after_the_copy_names_the_copy_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = v0_1_config(tmp_path)
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError(13, "Permission denied", str(config))
+
+    monkeypatch.setattr(conversions, "write_private_text", refuse)
+    with pytest.raises(ConversionFailed) as caught:
+        convert_config(config)
+
+    assert caught.value.plain == (
+        "config.yaml: what v0.1 saved could not be converted "
+        "(PermissionError: Permission denied (config.yaml)). It is left as it was. "
+        "The copy from before is config.yaml.v0.1.bak. Fix the cause and restart."
+    )
+    assert str(tmp_path) in str(caught.value)
+    assert_no_path(caught.value.plain, tmp_path)
+
+
+def test_the_plain_sentence_for_the_state_names_it_by_name_too(tmp_path: Path) -> None:
+    state = tmp_path / "library-state.json"
+    state.write_bytes(b'{"version": 1, "models": [], "profiles": {"m": {"not": "a list"}}}')
+
+    with pytest.raises(ConversionFailed) as caught:
+        convert_state(state)
+
+    assert caught.value.plain.startswith("library-state.json: what v0.1 saved could not be")
+    assert "the profiles of 'm' are not records" in caught.value.plain
+    assert "The copy from before is library-state.json.v0.1.bak." in caught.value.plain
+    assert_no_path(caught.value.plain, tmp_path)
+    assert str(state) in str(caught.value)
 
 
 def test_safe_mode_does_not_convert_a_config_it_ignores(tmp_path: Path) -> None:

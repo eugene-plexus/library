@@ -8,7 +8,10 @@ calls in `app.py`.
 
 A conversion that cannot finish raises `ConversionFailed`, whose message names
 the cause and says the file was left as it was. Its caller degrades instead of
-crashing (a store that refuses writes, a config that runs on defaults). Every
+crashing (a store that refuses writes, a config that runs on defaults), and says
+so: the state's on `/healthz` as `storageError`, the config's as `configError`.
+The message names each file by its path, which is what the log wants; `plain` is
+the same sentence naming each by its name, which `/healthz` (no path) wants. Every
 rewrite is a temp file and a rename, so a crash leaves the old bytes or the new
 ones, and the next start begins again from whichever it finds. The rewrite is
 also the record: a converted file no longer has the old version (or the old
@@ -36,6 +39,7 @@ Three things are converted:
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -57,7 +61,15 @@ _MOST_BACKUPS = 100
 
 
 class ConversionFailed(Exception):
-    """Saved data from v0.1 could not be converted; the file is as it was."""
+    """Saved data from v0.1 could not be converted; the file is as it was.
+
+    `str(exc)` names every file by its path, for the log. `plain` is the same
+    sentence with each file named by its name and the cause in the system's own
+    words, for the health report, which carries no path."""
+
+    def __init__(self, message: str, plain: str | None = None) -> None:
+        super().__init__(message)
+        self.plain = message if plain is None else plain
 
 
 def keep_backup(path: Path, data: bytes) -> Path:
@@ -79,11 +91,37 @@ def keep_backup(path: Path, data: bytes) -> Path:
     raise OSError(f"{_MOST_BACKUPS} different copies of {path.name} are already kept beside it")
 
 
-def _failed(path: Path, cause: str, backup: Path | None = None) -> ConversionFailed:
-    kept = f" The copy from before is {backup}." if backup is not None else ""
+def _plain_cause(exc: Exception) -> str:
+    """What `exc` says, without a path: for an `OSError` the system's words and
+    the names (not the paths) of the files it was about; for anything else its
+    type and message, which name no file."""
+    if isinstance(exc, OSError) and exc.strerror:
+        names = ", ".join(
+            Path(os.fsdecode(named)).name
+            for named in (exc.filename, exc.filename2)
+            if isinstance(named, str | bytes | os.PathLike)
+        )
+        return f"{type(exc).__name__}: {exc.strerror}" + (f" ({names})" if names else "")
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _failed(
+    path: Path, cause: str, backup: Path | None = None, plain_cause: str | None = None
+) -> ConversionFailed:
+    def sentence(file: str, why: str, copy: str | None) -> str:
+        kept = f" The copy from before is {copy}." if copy is not None else ""
+        return (
+            f"{file}: what v0.1 saved could not be converted ({why}). It is left as it was.{kept} "
+            "Fix the cause and restart."
+        )
+
     return ConversionFailed(
-        f"{path}: what v0.1 saved could not be converted ({cause}). It is left as it was.{kept} "
-        "Fix the cause and restart."
+        sentence(str(path), cause, None if backup is None else str(backup)),
+        sentence(
+            path.name,
+            cause if plain_cause is None else plain_cause,
+            None if backup is None else backup.name,
+        ),
     )
 
 
@@ -94,7 +132,7 @@ def _guarded(path: Path, step: Callable[..., None], *args: Path) -> None:
     except ConversionFailed:
         raise
     except Exception as exc:
-        raise _failed(path, f"{type(exc).__name__}: {exc}") from exc
+        raise _failed(path, f"{type(exc).__name__}: {exc}", None, _plain_cause(exc)) from exc
 
 
 @contextmanager
@@ -105,7 +143,7 @@ def _after_backup(path: Path, backup: Path) -> Iterator[None]:
     except ConversionFailed:
         raise
     except Exception as exc:
-        raise _failed(path, f"{type(exc).__name__}: {exc}", backup) from exc
+        raise _failed(path, f"{type(exc).__name__}: {exc}", backup, _plain_cause(exc)) from exc
 
 
 def _read(path: Path) -> bytes | None:

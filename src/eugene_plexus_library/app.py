@@ -58,6 +58,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         master_key=app.state.auth_state.master_key,
         default_roots=settings.default_roots(),
     )
+    # Why the config was not read, when it was not: a conversion that failed.
+    # `/healthz` says it (`configError`) in the sentence that names the file by
+    # its name; the log has the same with the path.
+    app.state.config_error = None
     if settings.safe_mode:
         log.warning(
             "starting in SAFE MODE (EUGENE_PLEXUS_LIBRARY_SAFE_MODE=1); ignoring %s and "
@@ -73,6 +77,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         except conversions.ConversionFailed as exc:
             # The config stays as it was and the library runs on defaults, as for
             # any config it cannot load: the endpoints that repair it stay up.
+            # And /healthz says so, or a library with no folders reads as `ok`.
+            app.state.config_error = exc.plain
             log.error("%s Running on defaults; fix it via /v1/config and restart.", exc)
         # Bad config must never stop startup — see below.
         except Exception as exc:
