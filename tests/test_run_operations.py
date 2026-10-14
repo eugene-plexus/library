@@ -163,7 +163,16 @@ def test_cancel_fences_a_claim_before_the_next_stage(client):
     assert jobs.get("a")["step"] == "cancelled"
 
 
-def test_agent_grants_cannot_submit_edit_other_nodes_or_rewrite_profiles(app, install, tmp_path):
+@pytest.mark.parametrize(
+    "engine, proposed",
+    [
+        ("llama_cpp", {"contextSize": 4096}),
+        ("vllm", {"flags": {"maxModelLen": 4096}}),
+    ],
+)
+def test_agent_grants_cannot_submit_edit_other_nodes_or_rewrite_profiles(
+    app, install, tmp_path, engine, proposed
+):
     app.state.auth_state = install.auth_state()
     with TestClient(app) as client:
         model = _model(tmp_path / "model.gguf")
@@ -181,14 +190,14 @@ def test_agent_grants_cannot_submit_edit_other_nodes_or_rewrite_profiles(app, in
         claimed = client.post("/v1/run-operations/a/claim", headers=worker).json()
         lease = claimed["lease"]
         assert client.get("/v1/run-operations", headers=worker).status_code == 401
-        body = {"lease": lease, "engine": "llama_cpp", "contextSize": 4096}
+        body = {"lease": lease, "engine": engine, **proposed}
         assert (
             client.post("/v1/run-operations/a/profile", json=body, headers=worker).status_code
             == 409
         )
         response = client.post(
             "/v1/run-operations/a/checkpoint",
-            json={"lease": lease, "step": "settings", "engine": "llama_cpp"},
+            json={"lease": lease, "step": "settings", "engine": engine},
             headers=worker,
         )
         assert response.status_code == 200
@@ -196,6 +205,8 @@ def test_agent_grants_cannot_submit_edit_other_nodes_or_rewrite_profiles(app, in
         body["lease"] = lease
         first = client.post("/v1/run-operations/a/profile", json=body, headers=worker)
         assert first.status_code == 200, first.text
+        expected = proposed.get("flags", {"contextSize": 4096})
+        assert first.json()["profile"]["flags"] == expected
         # Crash between profile side effect and checkpoint: replay adopts it.
         again = client.post("/v1/run-operations/a/profile", json=body, headers=worker)
         assert again.json()["profile"] == first.json()["profile"]

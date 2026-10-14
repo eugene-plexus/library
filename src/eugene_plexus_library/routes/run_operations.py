@@ -187,7 +187,11 @@ def profile(
                     "name": name,
                     "engine": body.engine,
                     "default": not profiles,
-                    "flags": {"contextSize": body.contextSize} if body.contextSize else {},
+                    "flags": body.flags
+                    if body.flags is not None
+                    else {"contextSize": body.contextSize}
+                    if body.contextSize
+                    else {},
                     "extraArgs": [],
                     "env": {},
                 }

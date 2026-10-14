@@ -117,6 +117,11 @@ class ProfileRequest(BaseModel):
     lease: str
     engine: str
     contextSize: int | None = Field(default=None, gt=0)
+    flags: dict[str, Any] | None = Field(
+        default=None,
+        description="Engine-owned launch flags chosen by the assigned agent. When supplied, "
+        "these replace the legacy contextSize suggestion. Existing profiles are preserved.",
+    )
 
 
 class PreparedFileRequest(BaseModel):
