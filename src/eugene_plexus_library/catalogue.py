@@ -65,7 +65,7 @@ from ._generated.models import (
     ModelStatus,
     QuantSource,
 )
-from .formats import gguf, safetensors
+from .formats import gguf, kev, safetensors
 from .hub import FileMetadata, RepoInfo
 from .store import StateStore
 
@@ -119,6 +119,8 @@ class _Group:
 
 def _role_for(path: str, fmt: ModelFormat, *, index: int) -> ModelFileRole:
     name = PurePosixPath(path).name.lower()
+    if fmt is ModelFormat.kev_checkpoint:
+        return kev.file_role(name)
     if fmt is ModelFormat.gguf:
         return ModelFileRole.weights if index == 0 else ModelFileRole.shard
     if name.endswith(".safetensors"):
@@ -288,20 +290,22 @@ def _safetensors_groups(
 
     for meta in files:
         path = PurePosixPath(meta.path)
-        name = path.name.lower()
-        if (
-            name.endswith(".safetensors")
-            or name in _SAFETENSORS_SIDECARS
-            or name.endswith(".index.json")
-        ):
-            by_directory.setdefault(str(path.parent), []).append(meta)
-        elif name in _DOC_NAMES:
-            other.append(meta)
+        by_directory.setdefault(str(path.parent), []).append(meta)
 
     candidates: list[_Group] = []
     for directory, members in by_directory.items():
+        checkpoint = kev.is_checkpoint({PurePosixPath(m.path).name for m in members})
+        if not checkpoint:
+            other.extend(m for m in members if _name(m.path) in _DOC_NAMES)
+            members = [
+                m
+                for m in members
+                if _name(m.path).endswith(".safetensors")
+                or _name(m.path) in _SAFETENSORS_SIDECARS
+                or _name(m.path).endswith(".index.json")
+            ]
         weights = [m for m in members if m.path.lower().endswith(".safetensors")]
-        if not weights:
+        if not weights and not checkpoint:
             # Sidecars with no weights beside them: a tokenizer-only
             # directory, or a config for a variant published elsewhere.
             other.extend(members)
@@ -311,9 +315,9 @@ def _safetensors_groups(
         candidates.append(
             _Group(
                 label=label,
-                format=ModelFormat.safetensors,
+                format=ModelFormat.kev_checkpoint if checkpoint else ModelFormat.safetensors,
                 files=members,
-                shard_total=len(weights) if len(weights) > 1 else None,
+                shard_total=len(weights) if len(weights) > 1 and not checkpoint else None,
             )
         )
     return candidates, other
@@ -336,7 +340,7 @@ def _owned(group: _Group, store: StateStore) -> AlreadyOwned | None:
     if weights is None:
         return None
     wanted = _name(weights.path)
-    if group.format is ModelFormat.safetensors:
+    if group.format in (ModelFormat.safetensors, ModelFormat.kev_checkpoint):
         return _owned_folder(group, wanted, store)
     for model in store.list_models():
         if model.status is not ModelStatus.present:
@@ -361,7 +365,7 @@ def _owned_folder(group: _Group, wanted: str, store: StateStore) -> AlreadyOwned
     weights' total size, which leaves out tokenizer files a copy may lack."""
     want = sum(f.size for f in group.files if f.path.lower().endswith(".safetensors"))
     for model in store.list_models():
-        if model.status is not ModelStatus.present or model.format is not ModelFormat.safetensors:
+        if model.status is not ModelStatus.present or model.format is not group.format:
             continue
         names = {_name(f.path): f for f in model.files or []}
         if wanted not in names:
@@ -722,6 +726,19 @@ def build_search_result(
         or entry.get("library_name") in ("transformers", "mlx")
     ):
         formats.append(ModelFormat.safetensors)
+
+    siblings = entry.get("siblings")
+    if isinstance(siblings, list):
+        listed = [
+            FileMetadata(path=s["rfilename"], size=0)
+            for s in siblings
+            if isinstance(s, dict) and isinstance(s.get("rfilename"), str)
+        ]
+        groups, _ = _safetensors_groups(listed, repo=repo)
+        if any(g.format is ModelFormat.kev_checkpoint for g in groups):
+            if not any(g.format is ModelFormat.safetensors for g in groups):
+                formats = [fmt for fmt in formats if fmt is not ModelFormat.safetensors]
+            formats.append(ModelFormat.kev_checkpoint)
 
     gated_raw = entry.get("gated")
     gated = (

@@ -67,7 +67,7 @@ from ._generated.models import (
     SkipReason,
 )
 from ._generated.models import Status1 as ScanRootStatus
-from .formats import gguf, safetensors
+from .formats import gguf, kev, safetensors
 from .paths import display_name, model_id, normalize
 
 log = logging.getLogger(__name__)
@@ -154,25 +154,17 @@ def _mlx_quantization(config: safetensors.ModelConfig) -> MlxQuantization | None
     return MlxQuantization(bits=bits, groupSize=group)
 
 
-KEV_HEAD_NAME = "head.pt"
+KEV_HEAD_NAME = kev.HEAD_NAME
 
 
 def _is_kev_checkpoint(names: set[str]) -> bool:
     """`adapter_config.json` + `head.pt`: the decision head is the one
     positive marker separating a Kev checkpoint from an ordinary LoRA."""
-    return safetensors.ADAPTER_CONFIG_NAME in names and KEV_HEAD_NAME in names
+    return kev.is_checkpoint(names)
 
 
 def _kev_role(name: str) -> ModelFileRole:
-    if name.endswith(".safetensors"):
-        return ModelFileRole.weights
-    if name == KEV_HEAD_NAME:
-        return ModelFileRole.weights
-    if name in ("tokenizer.json", "tokenizer_config.json") or name in TOKENIZER_NAMES:
-        return ModelFileRole.tokenizer
-    if name.endswith(".json"):
-        return ModelFileRole.config
-    return ModelFileRole.other
+    return kev.file_role(name)
 
 
 def _timestamp(stat: os.stat_result) -> datetime:
