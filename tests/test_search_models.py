@@ -14,6 +14,7 @@ it as the wrong thing.
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
 import pytest
@@ -112,6 +113,28 @@ def test_the_cross_encoder_the_header_cannot_name_reads_as_an_embedder(tmp_path:
     the contract says so; `ModelProfileSpec.mode` is how a person says otherwise."""
     meta = _meta(tmp_path, cross_encoder_kv())
     assert (meta.is_embedding, meta.is_rerank) == (True, False)
+
+
+@pytest.mark.parametrize(
+    "causal, name, expected",
+    [
+        (False, "cls.output.weight", True),
+        (False, "cls.weight", True),
+        (True, "cls.output.weight", False),
+        (False, "blk.0.attn_output.weight", False),
+    ],
+)
+def test_classifier_tensors_identify_only_non_causal_rerankers(tmp_path, causal, name, expected):
+    kv = cross_encoder_kv()
+    kv["bert.attention.causal"] = causal
+    encoded = name.encode()
+    table = struct.pack("<Q", len(encoded)) + encoded + struct.pack("<I Q I Q", 1, 8, 0, 0)
+    path = write_gguf(tmp_path / "head.gguf", kv, tensor_count=1, payload=table)
+    for tensors in (False, True):
+        meta = gguf.read_metadata(path, tensors=tensors)
+        assert meta.is_rerank is expected
+    model = Scanner().scan([tmp_path]).models[0]
+    assert model.capabilities.rerank is expected
 
 
 def test_rerank_is_read_from_the_architectures_own_key(tmp_path: Path) -> None:

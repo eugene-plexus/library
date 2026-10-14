@@ -246,6 +246,9 @@ class GgufMetadata:
     """The MoE expert tensors' share of `tensor_bytes` (0 for a dense
     model), under the same conditions. See `read_tensor_table`."""
 
+    has_classifier_tensors: bool = False
+    """The tensor table names a `cls.*` classification head."""
+
     @property
     def architecture(self) -> str | None:
         value = self.kv.get("general.architecture")
@@ -339,20 +342,20 @@ class GgufMetadata:
 
     @property
     def is_rerank(self) -> bool:
-        """A reranker: rank pooling (type 4), or classifier output labels.
+        """Rank pooling, classifier labels, or a non-causal classifier head.
 
         It scores how well a passage answers a question, and needs
         `--reranking` the way an embedder needs `--embeddings`. The
-        agent reads the same two keys when it starts a model with `auto`
+        agent reads the same markers when it starts a model with `auto`
         (`engines/run_mode.py`), so what the console predicts from this
         and what the agent decides agree.
 
-        **The header can miss one.** The gpustack bge-reranker-v2-m3 file
-        is a non-causal `bert` with a classifier head and neither key, so
-        it reads as an embedding model here and in the agent, and the
-        profile's `mode` is how a person says otherwise.
+        The gpustack bge-reranker-v2-m3 names neither metadata key, but
+        carries a non-causal classifier head in its tensor table.
         """
         if self.arch_key("pooling_type") == POOLING_RANK:
+            return True
+        if self.arch_key("attention.causal") is False and self.has_classifier_tensors:
             return True
         labels = self.arch_key("classifier.output_labels")
         if isinstance(labels, list):
@@ -571,13 +574,15 @@ def is_expert_tensor(name: str) -> bool:
     return _EXPERT_TENSOR.search(name) is not None
 
 
-def _read_tensor_table(reader: _Reader, count: int) -> tuple[int | None, int | None]:
+def _read_tensor_table(reader: _Reader, count: int) -> tuple[int | None, int | None, bool]:
     """Sum every tensor's bytes and the experts' share, from the table alone."""
     total = 0
     experts = 0
     known = True
+    classifier = False
     for _ in range(min(count, _MAX_TENSORS)):
         name = reader.string()
+        classifier |= name.startswith("cls.")
         dims = int(reader.scalar(T_UINT32))
         if dims < 1 or dims > _MAX_DIMS:
             raise reader._fail(f"implausible dimension count {dims} for tensor {name!r}")
@@ -594,7 +599,7 @@ def _read_tensor_table(reader: _Reader, count: int) -> tuple[int | None, int | N
         total += nbytes
         if is_expert_tensor(name):
             experts += nbytes
-    return (total, experts) if known else (None, None)
+    return (total, experts, classifier) if known else (None, None, classifier)
 
 
 def read_metadata_stream(
@@ -638,8 +643,13 @@ def read_metadata_stream(
     # remote preflight's window is unchanged unless it asks for it.
     tensor_bytes: int | None = None
     expert_bytes: int | None = None
-    if tensors:
-        tensor_bytes, expert_bytes = _read_tensor_table(reader, tensor_count)
+    classifier = False
+    architecture = kv.get("general.architecture")
+    non_causal = kv.get(f"{architecture}.attention.causal") is False
+    if tensors or non_causal:
+        total, experts, classifier = _read_tensor_table(reader, tensor_count)
+        if tensors:
+            tensor_bytes, expert_bytes = total, experts
 
     return GgufMetadata(
         version=version,
@@ -650,6 +660,7 @@ def read_metadata_stream(
         array_lengths=lengths,
         tensor_bytes=tensor_bytes,
         expert_bytes=expert_bytes,
+        has_classifier_tensors=classifier,
     )
 
 
