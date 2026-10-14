@@ -382,7 +382,22 @@ def configured_client(settings: Settings, models_dir: Path) -> Iterator[TestClie
         encoding="utf-8",
     )
     with TestClient(create_app(settings=settings)) as c:
+        wait_for_scan(c)
         yield c
+
+
+def wait_for_scan(client: TestClient) -> dict[str, Any]:
+    """Wait for the active scan, with a duration bound and its last observed state."""
+    deadline = time.perf_counter() + 30
+    body: dict[str, Any] = {}
+    while time.perf_counter() < deadline:
+        response = client.get("/v1/scan")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        if body["state"] != "scanning":
+            return body
+        time.sleep(0.01)
+    raise AssertionError(f"scan did not finish within 30 seconds: {body}")
 
 
 def mock_hubs(app: FastAPI, http: Any) -> None:

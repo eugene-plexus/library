@@ -8,17 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from .conftest import projector_kv, qwen_like_kv, write_gguf, write_hf_model
-
-
-def _wait_for_scan(client: TestClient) -> dict:
-    """Poll until the walk settles. The endpoint is asynchronous by
-    design; a test that assumed otherwise would pass or fail on timing."""
-    for _ in range(200):
-        body = client.get("/v1/scan").json()
-        if body["state"] not in ("scanning",):
-            return body
-    raise AssertionError("scan never finished")
-
+from .conftest import wait_for_scan as _wait_for_scan
 
 # --- models -------------------------------------------------------------
 
