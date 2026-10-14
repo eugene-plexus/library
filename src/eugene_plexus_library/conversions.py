@@ -91,10 +91,16 @@ def keep_backup(path: Path, data: bytes) -> Path:
     raise OSError(f"{_MOST_BACKUPS} different copies of {path.name} are already kept beside it")
 
 
-def _plain_cause(exc: Exception) -> str:
+def plain_cause(exc: Exception, *paths: Path) -> str:
     """What `exc` says, without a path: for an `OSError` the system's words and
     the names (not the paths) of the files it was about; for anything else its
     type and message, which name no file."""
+    if isinstance(exc, yaml.YAMLError):
+        mark = getattr(exc, "problem_mark", None)
+        location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        return f"invalid YAML ({type(exc).__name__}){location}"
+    if isinstance(exc, UnicodeError):
+        return f"invalid text encoding ({type(exc).__name__})"
     if isinstance(exc, OSError) and exc.strerror:
         names = ", ".join(
             Path(os.fsdecode(named)).name
@@ -102,7 +108,10 @@ def _plain_cause(exc: Exception) -> str:
             if isinstance(named, str | bytes | os.PathLike)
         )
         return f"{type(exc).__name__}: {exc.strerror}" + (f" ({names})" if names else "")
-    return f"{type(exc).__name__}: {exc}"
+    message = f"{type(exc).__name__}: {exc}"
+    for path in paths:
+        message = message.replace(repr(str(path))[1:-1], path.name).replace(str(path), path.name)
+    return message
 
 
 def _failed(
@@ -132,7 +141,7 @@ def _guarded(path: Path, step: Callable[..., None], *args: Path) -> None:
     except ConversionFailed:
         raise
     except Exception as exc:
-        raise _failed(path, f"{type(exc).__name__}: {exc}", None, _plain_cause(exc)) from exc
+        raise _failed(path, f"{type(exc).__name__}: {exc}", None, plain_cause(exc, path)) from exc
 
 
 @contextmanager
@@ -143,7 +152,9 @@ def _after_backup(path: Path, backup: Path) -> Iterator[None]:
     except ConversionFailed:
         raise
     except Exception as exc:
-        raise _failed(path, f"{type(exc).__name__}: {exc}", backup, _plain_cause(exc)) from exc
+        raise _failed(
+            path, f"{type(exc).__name__}: {exc}", backup, plain_cause(exc, path, backup)
+        ) from exc
 
 
 def _read(path: Path) -> bytes | None:

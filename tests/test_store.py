@@ -380,6 +380,17 @@ def test_unreadable_owned_profile_is_preserved_and_read_only(tmp_path: Path) -> 
     assert owned.with_name(owned.name + ".preserved").read_bytes() == b"broken owned data"
 
 
+def test_profile_storage_error_keeps_paths_in_the_log_only(tmp_path, caplog):
+    path = tmp_path / "state.json"
+    owned = path.with_suffix(".profiles.json")
+    owned.write_text('{"version": 99}', encoding="utf-8")
+    recovered = StateStore(path)
+    recovered.load()
+    assert owned.name in recovered.storage_error
+    assert str(tmp_path) not in recovered.storage_error
+    assert str(owned) in caplog.text
+
+
 # --- forgetting --------------------------------------------------------------------
 
 

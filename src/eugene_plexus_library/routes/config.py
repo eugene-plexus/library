@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
+from .. import conversions
 from .._generated.models import (
     ConfigDocument,
     ConfigSchema,
@@ -51,7 +53,28 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
     # included, asks `HubClients.resolve` for its hub, which reads the
     # address, token and on/off from this store each time (LS4). A token
     # saved here once reached the next search but not the next download.
-    return store.apply_patch(body)
+    if getattr(request.app.state, "config_error", None):
+        path = request.app.state.settings.config_file
+        try:
+            try:
+                original = path.read_bytes()
+            except FileNotFoundError:
+                original = None
+            if original is not None:
+                conversions.keep_backup(path, original)
+        except OSError as exc:
+            logging.getLogger(__name__).error(
+                "Cannot back up %s before config repair: %s", path, exc
+            )
+            raise HTTPException(
+                409,
+                f"Cannot keep a backup of {path.name} before repair "
+                f"({conversions.plain_cause(exc, path)}). The original is unchanged.",
+            ) from exc
+    result = store.apply_patch(body)
+    if result.applied:
+        request.app.state.config_error = None
+    return result
 
 
 @router.post("/v1/config/test", response_model=ConfigTestResult)

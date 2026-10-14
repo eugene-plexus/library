@@ -70,6 +70,7 @@ from ._generated.models import (
     ModelStatus,
 )
 from ._private_files import write_private_text
+from .conversions import plain_cause
 from .paths import normalize
 from .profile_storage import StorageUnavailable
 from .scanner import CacheKey
@@ -148,11 +149,12 @@ class StateStore:
                         log.error("%s", self._storage_error)
                         return
                 except (OSError, ValueError) as exc:
+                    log.error("Cannot read state file %s: %s", self._path, exc)
                     self._preserve(self._path)
                     raw = {}
                     if not self._profiles_path.exists():
                         self._storage_error = self._storage_error or (
-                            f"Library state is unreadable: {exc}. "
+                            f"{self._path.name} is unreadable: {plain_cause(exc, self._path)}. "
                             "Restore its preserved copy before saving."
                         )
             for entry in raw.get("models") or []:
@@ -178,10 +180,12 @@ class StateStore:
                     for model_id, records in profiles.items()
                 }
             except (OSError, ValueError, KeyError, TypeError, StorageUnavailable) as exc:
+                log.error("Cannot read profiles file %s: %s", self._profiles_path, exc)
                 if self._profiles_path.exists():
                     self._preserve(self._profiles_path)
                 self._storage_error = self._storage_error or (
-                    f"Saved profiles are unreadable: {exc}. Restore matching data before saving."
+                    f"Saved profiles are unreadable: {plain_cause(exc, self._profiles_path)}. "
+                    "Restore matching data before saving."
                 )
                 self._profiles = {}
             for entry in raw.get("downloads") or []:

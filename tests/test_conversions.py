@@ -548,12 +548,14 @@ def test_a_failed_state_conversion_degrades_and_the_library_says_why(
         health = client.get("/healthz").json()
         assert health["status"] == "degraded"
         cause = health["details"]["storageError"]
-        assert "the profiles of 'm' are not records" in cause and str(state) in cause
+        assert "the profiles of 'm' are not records" in cause and state.name in cause
+        assert_no_path(cause, tmp_path)
         assert client.get("/v1/models").json()["models"] == []
         assert client.get("/v1/config/schema").status_code == 200
 
     assert state.read_bytes() == before
     assert "the profiles of 'm' are not records" in caplog.text
+    assert str(state) in caplog.text
 
 
 # --- the config of v0.1 ---------------------------------------------------------------
@@ -690,11 +692,33 @@ def test_a_config_that_cannot_be_converted_runs_on_defaults_and_names_the_cause(
         # Degraded, not dead: the library is up and the endpoints that repair it answer.
         assert client.get("/healthz").status_code == 200
         assert client.get("/v1/config").json()["modelRoots"] == []
-        result = client.patch("/v1/config", json={"modelRoots": ["/data/models"]}).json()
-        assert result["applied"] == ["modelRoots"]
+        result = client.patch("/v1/config", json={"modelRoots": ["/data/models"]})
+        assert result.status_code == 409
+        assert "backup" in result.json()["detail"]
+        assert_no_path(result.json()["detail"], tmp_path)
+        assert client.get("/v1/config").json()["modelRoots"] == []
 
     assert str(config) in caplog.text and "Running on defaults" in caplog.text
-    assert before != config.read_bytes(), "the repair is what replaced it"
+    assert before == config.read_bytes(), "a failed backup must not overwrite the original"
+
+
+def test_bad_yaml_degrades_and_a_repair_preserves_the_original(tmp_path, caplog):
+    config = tmp_path / "config.yaml"
+    before = b"modelRoots: [unfinished\n"
+    config.write_bytes(before)
+    caplog.set_level(logging.ERROR)
+    with TestClient(create_app(settings_in(tmp_path))) as client:
+        health = client.get("/healthz").json()
+        assert health["status"] == "degraded"
+        error = health["details"]["configError"]
+        assert "config.yaml" in error and "YAML" in error
+        assert_no_path(error, tmp_path)
+        response = client.patch("/v1/config", json={"modelRoots": ["/data/models"]})
+        assert response.status_code == 200
+        assert response.json()["applied"] == ["modelRoots"]
+        assert backups_of(config)[0].read_bytes() == before
+        assert "configError" not in client.get("/healthz").json()["details"]
+    assert str(config) in caplog.text
 
 
 def test_a_failed_config_conversion_shows_on_healthz_naming_the_file_and_not_where_it_is(

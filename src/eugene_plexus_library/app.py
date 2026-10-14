@@ -86,6 +86,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             # operator repairs a broken config file, so refusing to
             # start over one locks them out of the fix — the exact
             # failure mode this project exists to avoid.
+            app.state.config_error = (
+                f"{settings.config_file.name} could not be loaded "
+                f"({conversions.plain_cause(exc, settings.config_file)}). Running on defaults. "
+                "Repair the config and restart."
+            )
             log.error(
                 "config file %s could not be loaded (%s); running on defaults. "
                 "Fix it via /v1/config and restart.",
@@ -104,7 +109,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         conversions.convert_state(settings.state_file)
     except conversions.ConversionFailed as exc:
-        blocked = str(exc)
+        blocked = exc.plain
+        log.error("%s", exc)
     state_store.load(blocked=blocked)
     app.state.state_store = state_store
 
