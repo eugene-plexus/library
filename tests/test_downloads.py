@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -243,6 +244,57 @@ async def test_a_download_verifies_then_renames(tmp_path: Path) -> None:
     assert landed.read_bytes() == BODY
     assert not landed.with_name(landed.name + ".part").exists()
     assert entry.role is ModelFileRole.weights
+
+
+async def test_completion_waits_for_the_library_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A UI that stops polling on done must receive the launchable model id."""
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_scan(job: downloads.DownloadJob) -> None:
+        entered.set()
+        await release.wait()
+        job.record.modelId = "registered-model"
+
+    monkeypatch.setattr(downloads.DownloadJob, "_locate_model", delayed_scan)
+    manager, _ = build_manager(tmp_path, FakeHub())
+    try:
+        record = await manager.start(DownloadSpec(repo="org/repo", files=["model.gguf"]))
+        await asyncio.wait_for(entered.wait(), 2)
+        assert record.state is DownloadState.verifying
+        assert record.message == "Adding to your Library"
+        assert record.finishedAt is None
+        assert Path(record.files[0].destinationPath).exists()
+        release.set()
+        await drain(manager, record.id)
+        assert record.state is DownloadState.done
+        assert record.modelId == "registered-model"
+    finally:
+        release.set()
+        await manager.shutdown()
+
+
+async def test_a_later_scan_recovers_a_finished_download_without_redownloading(
+    tmp_path: Path,
+) -> None:
+    from .test_store import _model
+
+    manager, store = build_manager(tmp_path, FakeHub())
+    try:
+        record = await manager.start(DownloadSpec(repo="org/repo", files=["model.gguf"]))
+        await drain(manager, record.id)
+        assert record.modelId is None
+        path = Path(record.files[0].destinationPath)
+        model = _model(path)
+        store.add_model(model, seen_at=datetime.now(tz=UTC))
+        # The next list read joins the completed file to its new Library entry.
+        assert manager.records()[0].modelId == model.id
+        assert store.get_download(record.id).modelId == model.id
+        assert path.read_bytes() == BODY
+        assert manager.get(record.id).message == "Ready to run"
+    finally:
+        await manager.shutdown()
 
 
 async def test_the_destination_is_known_before_a_byte_moves(tmp_path: Path) -> None:

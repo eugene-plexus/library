@@ -373,11 +373,14 @@ class DownloadJob:
                 continue
             break
 
-        self.record.state = DownloadState.done
-        self.record.finishedAt = _now()
-        self.record.message = "complete"
+        # Consumers stop following a finished transfer. Keep it active until the
+        # scan has supplied the model id needed by Run (or an actionable reason).
+        self.record.state = DownloadState.verifying
+        self.record.message = "Adding to your Library"
         self.record.etaSeconds = 0
         await self._locate_model()
+        self.record.state = DownloadState.done
+        self.record.finishedAt = _now()
 
     async def _backoff(self, attempt: int, reason: str) -> None:
         delay = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
@@ -623,11 +626,10 @@ class DownloadJob:
         is incremental, so the cost is a stat per known file plus one
         header read for what just arrived.
         """
-        weights = next(
-            (f for f in self.record.files if f.role is ModelFileRole.weights),
-            self.record.files[0] if self.record.files else None,
-        )
-        if weights is None or self._scan_manager is None:
+        if self._scan_manager is None:
+            self.record.message = (
+                "Downloaded. Scan the Library to make this model available to run."
+            )
             return
 
         try:
@@ -636,20 +638,36 @@ class DownloadJob:
             await self._scan_manager.wait()
         except Exception as exc:  # a scan failure must not fail the download
             log.warning("download %s: post-download scan did not run (%s)", self.record.id, exc)
+            self.record.message = f"Downloaded, but the Library scan failed: {exc}"
 
+        if self.refresh_model_id():
+            return
+        if self.record.message == "Adding to your Library":
+            self.record.message = (
+                "Downloaded, but the Library has not recognized a runnable model. "
+                "Scan the Library again or inspect the downloaded files."
+            )
+        log.info("download %s: no library entry matched yet", self.record.id)
+
+    def refresh_model_id(self) -> bool:
+        """Reconnect a finished download after a later successful Library scan."""
+        if self.record.modelId:
+            return False
+        weights = next(
+            (f for f in self.record.files if f.role is ModelFileRole.weights),
+            self.record.files[0] if self.record.files else None,
+        )
+        if weights is None:
+            return False
         target = Path(weights.destinationPath)
         # A safetensors model is a directory; a GGUF is the file itself.
         for candidate in (target, target.parent):
             found = self._store.find_by_path(str(candidate))
             if found is not None:
                 self.record.modelId = found.id
-                return
-        log.info(
-            "download %s: %s is on disk but no library entry matched yet; the next scan "
-            "will pick it up",
-            self.record.id,
-            target,
-        )
+                self.record.message = "Ready to run"
+                return True
+        return False
 
 
 class DownloadManager:
@@ -716,6 +734,8 @@ class DownloadManager:
         class body, which silently turned `list[str]` into a reference
         to this method.
         """
+        for job in self._jobs.values():
+            self._refresh_finished(job)
         return sorted(
             (job.record for job in self._jobs.values()),
             key=lambda r: r.startedAt or _now(),
@@ -724,7 +744,13 @@ class DownloadManager:
 
     def get(self, download_id: str) -> Download | None:
         job = self._jobs.get(download_id)
+        if job:
+            self._refresh_finished(job)
         return job.record if job else None
+
+    def _refresh_finished(self, job: DownloadJob) -> None:
+        if job.record.state is DownloadState.done and job.refresh_model_id():
+            self._persist(job.record)
 
     def _persist(self, record: Download) -> None:
         self._store.put_download(record)
