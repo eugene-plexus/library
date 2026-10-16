@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "files": {
     "contracts/run-operations.json": {
-      "sha256": "f676ad8b19cbaea58803a094db70f4e3358e5f93058cbdd3d64a6a64d598af37"
+      "sha256": "3aae3c1ab248bcb2465a21707c66190e562d24b1fb868731edac6baf6162c18b"
     },
     "scripts/check-vendored.py": {
       "sha256": "e9427b74fb4194ecd1df1abf1d510a3df18606e3c07a2a60043e74bba7422d11"
@@ -13,7 +13,7 @@
       "sha256": "291d6e51414837e02dc776428d9952f1b181440c7f3b2a20ce88f0f6fcdbeb53"
     },
     "src/eugene_plexus_library/_http.py": {
-      "sha256": "ee22be0f2447177409157db458f90df9f1f5db7330b2590c535918d12cfaaed6"
+      "sha256": "5e412a0a37b730c667e7f88e133f73d9347d9b1c8161693fb7941e05a7377212"
     },
     "src/eugene_plexus_library/gpu_probe.py": {
       "sha256": "868db4ca2e2cd86a4b4da4a9cd2f4df57d3110f07a0cf540c110f1ddf7b32ec8"
@@ -22,7 +22,7 @@
       "sha256": "deda4bf520746046a6aab06a82e1b7e83b902cff748daf45c4d1df13299dd825"
     },
     "src/eugene_plexus_library/tokens.py": {
-      "sha256": "2a57191bad024d3420570f0c84d82aa083d670ba8e42c51646fa6f943f95a36a"
+      "sha256": "c0ee23ad15f5136a22eae251615e32f314d54c28fa62b7f7e3b65ae6b47e839b"
     }
   }
 }
