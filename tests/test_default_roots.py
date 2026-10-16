@@ -12,6 +12,7 @@ existed.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 from collections.abc import Iterator
@@ -247,3 +248,56 @@ def test_the_operators_own_directories_silence_the_default(
         ]
 
     assert "is not in use" in caplog.text
+
+
+@pytest.mark.parametrize("number", [errno.EACCES, errno.EIO])
+def test_unreachable_default_folder_keeps_the_repair_api_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    number: int,
+) -> None:
+    """A failed diagnostic stat must not prevent setup from choosing another folder."""
+    blocked = tmp_path / "private-home" / "Eugene Models"
+    original = Path.stat
+
+    def stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == blocked:
+            raise OSError(number, os.strerror(number), str(path))
+        return original(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    caplog.set_level(logging.INFO, logger="eugene_plexus_library.app")
+    replacement = tmp_path / "accessible"
+    replacement.mkdir()
+    for client in _client(_settings(tmp_path, default_model_roots=str(blocked))):
+        scan = _wait_for_scan(client)
+        assert scan["roots"][0]["status"] == "unreadable"
+        health = client.get("/healthz").json()
+        assert health["status"] == "degraded"
+        assert health["details"]["unreadableRoots"] == [str(blocked)]
+        assert client.get("/v1/directories").status_code == 200
+        # No invented root, silent permission changes or false 'missing' message.
+        assert client.get("/v1/config").json()["modelRoots"][0]["path"] == str(blocked)
+        assert (
+            client.patch("/v1/config", json={"modelRoots": [str(replacement)]}).status_code == 200
+        )
+        assert client.get("/v1/config").json()["modelRoots"][0]["path"] == str(replacement)
+
+    assert os.strerror(number) in caplog.text
+    assert str(blocked) in caplog.text
+    assert "nothing is mounted there" not in caplog.text
+
+
+def test_default_folder_that_is_a_file_is_reported_as_such(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    file = tmp_path / "not-a-folder"
+    file.write_text("keep this file", encoding="utf-8")
+    caplog.set_level(logging.INFO, logger="eugene_plexus_library.app")
+    for client in _client(_settings(tmp_path, default_model_roots=str(file))):
+        _wait_for_scan(client)
+        assert client.get("/healthz").json()["status"] == "degraded"
+        assert client.get("/v1/directories").status_code == 200
+    assert "not a directory" in caplog.text
+    assert file.read_text(encoding="utf-8") == "keep this file"

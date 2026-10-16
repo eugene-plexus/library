@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import stat
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -193,12 +194,32 @@ def _announce_default_roots(config_store: ConfigStore) -> None:
         DEFAULT_ROOTS_VARIABLE,
     )
     for root in roots:
-        if not Path(root).expanduser().is_dir():
+        # A system install runs as Eugene's account, which may not be able
+        # to traverse the person's home. This diagnostic must not kill the
+        # service that provides the folder picker and configuration repair.
+        try:
+            mode = Path(root).expanduser().stat().st_mode
+        except FileNotFoundError:
             log.warning(
                 "%s does not exist -- in a container that means nothing is mounted there. "
                 "The scan will report it missing until the directory is mounted.",
                 root,
             )
+        except OSError as exc:
+            log.warning(
+                "model directory %s could not be accessed: %s. "
+                "The Library will stay available. Check access for the account running "
+                "Eugene, including traversal of parent directories, or choose another "
+                "folder under Library -> Folders.",
+                root,
+                exc,
+            )
+        else:
+            if not stat.S_ISDIR(mode):
+                log.warning(
+                    "%s is not a directory. Choose a model folder under Library -> Folders.",
+                    root,
+                )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
