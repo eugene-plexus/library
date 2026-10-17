@@ -91,6 +91,22 @@ def test_the_intent_carries_the_engine_and_context():
         Intent(modelId="m", preparation={"engine": "strata", "contextSize": 0})
 
 
+@pytest.mark.parametrize("vision", ["off", "cpu", "gpu"])
+def test_image_mode_survives_a_durable_intent(prepared_client, vision):
+    record = _submit(prepared_client, preparation={"engine": "strata", "vision": vision})
+    assert record["intent"]["preparation"]["vision"] == vision
+    stored = prepared_client.get("/v1/run-operations/p")
+    assert stored.status_code == 200
+    assert stored.json()["intent"]["preparation"]["vision"] == vision
+
+
+def test_image_preparation_defaults_off_and_rejects_unknown_modes():
+    intent = Intent(modelId="m", preparation={"engine": "strata"})
+    assert intent.preparation.vision == "off"
+    with pytest.raises(ValueError):
+        Intent(modelId="m", preparation={"engine": "strata", "vision": "automatic"})
+
+
 def test_prepared_lists_the_model_and_the_run_goes_on_with_it(prepared_client, models_dir):
     record = _submit(prepared_client)
     original = record["model"]

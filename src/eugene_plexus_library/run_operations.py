@@ -27,6 +27,7 @@ from ._generated.models import (
     EngineKind,
     LibraryModel,
     ModelProfile,
+    PreparationVisionMode,
     PreparedProvenance,
 )
 
@@ -45,6 +46,10 @@ class PreparationIntent(BaseModel):
         gt=0,
         description="The context the engine prepares for. Absent: the engine's own "
         "recommendation for the node.",
+    )
+    vision: PreparationVisionMode = Field(
+        default=PreparationVisionMode.off,
+        description="Image encoder placement. Off preserves text-only preparation.",
     )
 
 
