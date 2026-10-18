@@ -123,6 +123,10 @@ def _role_for(path: str, *, index: int) -> ModelFileRole:
     name = PurePosixPath(path).name.lower()
     if "mmproj" in name:
         return ModelFileRole.projector
+    if name.endswith(".gguf") and name.startswith(("mtp-", "draft-")):
+        # A drafting companion (SD1), named as llama.cpp's own download
+        # names an MTP file; the scan reads its tensors to be sure.
+        return ModelFileRole.draft
     if name.endswith(".gguf") or name.endswith(".safetensors"):
         return ModelFileRole.weights if index == 0 else ModelFileRole.shard
     if name.endswith(".index.json"):

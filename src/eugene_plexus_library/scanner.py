@@ -9,7 +9,7 @@ earns trust or quietly loses a model somebody downloaded.
 
 | Format | The model is | Not a model |
 |---|---|---|
-| GGUF | one `.gguf` file | the `mmproj-*` projector; shards 2..N |
+| GGUF | one `.gguf` file | the `mmproj-*` projector; an MTP or draft companion; shards 2..N |
 | GGUF, split | the **first** shard | the other shards individually |
 | safetensors | the **directory** | `blobs/`, `refs/`, `.no_exist/`, adapters |
 | prepared | its `<name>.eugene-prepared.json` | nothing: the engine's files are not read |
@@ -52,7 +52,10 @@ from pathlib import Path
 
 from . import prepared
 from ._generated.models import (
+    DraftFile,
+    DraftKind,
     GgufDetail,
+    GgufSpeculation,
     KevCheckpointDetail,
     LibraryModel,
     MlxQuantization,
@@ -176,6 +179,72 @@ def _stat_size(entry: os.DirEntry[str]) -> int | None:
         return entry.stat().st_size
     except OSError:
         return None
+
+
+def _lacks_speculation(model: LibraryModel) -> bool:
+    """A GGUF entry cached before SD1 (2026-10-18), re-read once so it says
+    whether it carries its own MTP head. Same rule as `_lacks_expert_bytes`."""
+    return (
+        model.format is ModelFormat.gguf
+        and model.gguf is not None
+        and model.status is ModelStatus.present
+        and model.gguf.speculation is None
+    )
+
+
+@dataclass(frozen=True)
+class _Draft:
+    """A speculative-decoding companion found in a model folder."""
+
+    entry: os.DirEntry[str]
+    metadata: gguf.GgufMetadata
+    kind: DraftKind
+    size: int
+
+
+def _with_drafts(model: LibraryModel, drafts: list[_Draft], paired: set[str]) -> LibraryModel:
+    """The model with the companions beside it it can draft with, and only
+    those: its files' `draft` entries and `sizeBytes` are rebuilt from this
+    scan, so a companion deleted since the entry was cached is gone.
+
+    A companion pairs with every model of its architecture in its folder,
+    since one MTP file serves every quant of a model, and with none whose
+    vocabulary size differs from its own when both are known.
+    """
+    if model.format is not ModelFormat.gguf or model.gguf is None:
+        return model
+    detail = model.gguf
+    mine: list[_Draft] = []
+    for draft in drafts:
+        if draft.metadata.architecture != model.architecture:
+            continue
+        theirs = draft.metadata.vocab_size
+        if theirs is not None and detail.vocabSize is not None and theirs != detail.vocabSize:
+            continue
+        mine.append(draft)
+        paired.add(draft.entry.path)
+    old = [f for f in model.files or [] if f.role is ModelFileRole.draft]
+    if not mine and not old:
+        return model
+    kept = [f for f in model.files or [] if f.role is not ModelFileRole.draft]
+    files = kept + [
+        ModelFile(path=d.entry.path, role=ModelFileRole.draft, sizeBytes=d.size) for d in mine
+    ]
+    size = model.sizeBytes
+    if size is not None:
+        size = size - sum(f.sizeBytes or 0 for f in old) + sum(d.size for d in mine)
+    speculation = GgufSpeculation(
+        mtpHead=detail.speculation.mtpHead if detail.speculation is not None else False,
+        draftFiles=[DraftFile(path=d.entry.path, kind=d.kind, sizeBytes=d.size) for d in mine],
+    )
+    return model.model_copy(
+        update={
+            "files": files,
+            "fileCount": len(files),
+            "sizeBytes": size,
+            "gguf": detail.model_copy(update={"speculation": speculation}),
+        }
+    )
 
 
 def _lacks_expert_bytes(model: LibraryModel) -> bool:
@@ -726,6 +795,7 @@ class Scanner:
         cached_models: list[LibraryModel] = []
         metadata_by_path: dict[str, gguf.GgufMetadata] = {}
         projectors: list[tuple[os.DirEntry[str], gguf.GgufMetadata]] = []
+        drafts: list[_Draft] = []
 
         def consider(entry: os.DirEntry[str], shards: list[os.DirEntry[str]]) -> None:
             """Cache first, header only on a miss — see the module
@@ -748,7 +818,11 @@ class Scanner:
                 return
 
             cached = self._cache_lookup(cache_key(path, stat))
-            if cached is not None and not _lacks_expert_bytes(cached):
+            if (
+                cached is not None
+                and not _lacks_expert_bytes(cached)
+                and not _lacks_speculation(cached)
+            ):
                 cached_models.append(cached)
                 return
 
@@ -757,6 +831,10 @@ class Scanner:
                 return
             if metadata.is_projector:
                 projectors.append((entry, metadata))
+                return
+            kind = metadata.draft_kind(entry.name) if not shards else None
+            if kind is not None:
+                drafts.append(_Draft(entry, metadata, DraftKind(kind), stat.st_size))
                 return
             metadata_by_path[entry.path] = metadata
             candidates.append((entry, shards))
@@ -801,20 +879,43 @@ class Scanner:
                 )
             )
 
-        for model in cached_models:
+        found: list[LibraryModel] = list(cached_models)
+        for entry, shards in candidates:
+            built = self._build_gguf_model(
+                Path(entry.path), root, shards, metadata_by_path[entry.path], projectors
+            )
+            if built is not None:
+                found.append(built)
+
+        # Drafts are paired on every scan, cached models included, because a
+        # companion downloaded beside a model leaves the model's own file and
+        # so its cache entry unchanged.
+        paired: set[str] = set()
+        for model in found:
+            model = _with_drafts(model, drafts, paired)
             if model.id not in seen:
                 seen.add(model.id)
                 result.models.append(model)
                 self.counters.models_found += 1
 
-        for entry, shards in candidates:
-            built = self._build_gguf_model(
-                Path(entry.path), root, shards, metadata_by_path[entry.path], projectors
+        for draft in drafts:
+            what = (
+                "MTP head (draft-mtp)"
+                if draft.kind is DraftKind.mtp
+                else "draft model (draft-simple)"
             )
-            if built is not None and built.id not in seen:
-                seen.add(built.id)
-                result.models.append(built)
-                self.counters.models_found += 1
+            result.skipped.append(
+                SkippedPath(
+                    path=draft.entry.path,
+                    reason=SkipReason.draft,
+                    detail=(
+                        f"{what} for speculative decoding with the model beside it"
+                        if draft.entry.path in paired
+                        else f"{what} for speculative decoding, but no model of the same "
+                        "architecture is beside it"
+                    ),
+                )
+            )
 
     def _read_gguf(self, path: Path, result: ScanResult) -> gguf.GgufMetadata | None:
         try:
@@ -903,6 +1004,7 @@ class Scanner:
                 vocabSize=metadata.vocab_size,
                 expertBytes=expert_bytes,
                 projectorPath=projector.path if projector is not None else None,
+                speculation=GgufSpeculation(mtpHead=metadata.mtp_head, draftFiles=[]),
                 recommendedSampling=(
                     RecommendedSampling(
                         temperature=sampling.temperature,

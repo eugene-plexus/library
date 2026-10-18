@@ -267,6 +267,12 @@ async def get_model_fit(
             "This estimate excludes the separate vision projector. Loading it for "
             "images needs additional memory; finding it on disk does not load it.",
         ]
+    if model_fit.draft_bytes(model):
+        result.notes = [
+            *(result.notes or []),
+            "This estimate excludes the companion file for speculative decoding. "
+            "Drafting with it needs memory for its weights and cache as well.",
+        ]
     return ModelFit(
         modelId=model.id,
         path=model.path,

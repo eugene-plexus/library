@@ -249,6 +249,15 @@ class GgufMetadata:
     has_classifier_tensors: bool = False
     """The tensor table names a `cls.*` classification head."""
 
+    nextn_blocks: frozenset[int] | None = None
+    """Blocks whose `nextn.eh_proj` tensor the table names: where an MTP
+    head is. None when the table was not read."""
+
+    has_first_block: bool | None = None
+    """The table names a `blk.0.` tensor. A separate MTP file holds only
+    the last block, so this is what tells it from a model that carries its
+    own head (SD1). None when the table was not read."""
+
     @property
     def architecture(self) -> str | None:
         value = self.kv.get("general.architecture")
@@ -269,6 +278,41 @@ class GgufMetadata:
         `mmproj-` filename convention, so a renamed file still tells the
         truth — and these are 0.9-1.8 GB each, so being wrong is loud."""
         return self.general_type == "mmproj" or self.architecture == "clip"
+
+    @property
+    def mtp_tensors(self) -> bool:
+        """The last block carries an MTP head: llama.cpp's own test
+        (`common_speculative_types_from_gguf`, b11719) for a file that
+        drafts as `draft-mtp`. `<arch>.nextn_predict_layers` alone is not
+        enough, because a separate MTP file declares it too."""
+        blocks = self.arch_key("block_count")
+        if not isinstance(blocks, int) or self.nextn_blocks is None:
+            return False
+        return blocks - 1 in self.nextn_blocks
+
+    @property
+    def mtp_head(self) -> bool:
+        """This file is a whole model with its own MTP head."""
+        return self.mtp_tensors and self.has_first_block is True
+
+    def draft_kind(self, filename: str) -> str | None:
+        """`mtp` or `simple` when this file is a companion to draft with
+        rather than a model of its own, else None (SD1).
+
+        A separate MTP head is told by its tensors: the last block's
+        `nextn` tensors and no first block, so it cannot run alone. A whole
+        small model is a companion only when it is named as one
+        (`draft-*.gguf`), because any small model could otherwise be taken
+        for a draft.
+        """
+        if self.is_projector or self.nextn_blocks is None:
+            return None
+        if self.mtp_tensors and self.has_first_block is False:
+            return "mtp"
+        if self.has_first_block and DRAFT_NAME_RE.search(filename):
+            # llama.cpp drafts with any file that has the head as `draft-mtp`.
+            return "mtp" if self.mtp_tensors else "simple"
+        return None
 
     def arch_key(self, suffix: str) -> Any:
         """Read an architecture-prefixed key, e.g. `context_length` ->
@@ -570,19 +614,42 @@ _MAX_TENSORS = 1 << 20
 _MAX_DIMS = 8
 
 
+#: The tensor that holds an MTP head, by block (llama.cpp's
+#: `LLM_TENSOR_NEXTN_EH_PROJ`).
+_NEXTN_RE = re.compile(r"^blk\.(\d+)\.nextn\.eh_proj\.weight$")
+#: A small whole model named as a draft, as the catalogue sorts them.
+DRAFT_NAME_RE = re.compile(r"^draft[-_.]", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class _TensorTable:
+    total: int | None
+    experts: int | None
+    classifier: bool
+    nextn_blocks: frozenset[int]
+    has_first_block: bool
+
+
 def is_expert_tensor(name: str) -> bool:
     return _EXPERT_TENSOR.search(name) is not None
 
 
-def _read_tensor_table(reader: _Reader, count: int) -> tuple[int | None, int | None, bool]:
-    """Sum every tensor's bytes and the experts' share, from the table alone."""
+def _read_tensor_table(reader: _Reader, count: int) -> _TensorTable:
+    """Sum every tensor's bytes and the experts' share, from the table alone,
+    and note where any MTP head is."""
     total = 0
     experts = 0
     known = True
     classifier = False
+    nextn: set[int] = set()
+    first_block = False
     for _ in range(min(count, _MAX_TENSORS)):
         name = reader.string()
         classifier |= name.startswith("cls.")
+        first_block |= name.startswith("blk.0.")
+        head = _NEXTN_RE.match(name)
+        if head is not None:
+            nextn.add(int(head.group(1)))
         dims = int(reader.scalar(T_UINT32))
         if dims < 1 or dims > _MAX_DIMS:
             raise reader._fail(f"implausible dimension count {dims} for tensor {name!r}")
@@ -599,7 +666,13 @@ def _read_tensor_table(reader: _Reader, count: int) -> tuple[int | None, int | N
         total += nbytes
         if is_expert_tensor(name):
             experts += nbytes
-    return (total, experts, classifier) if known else (None, None, classifier)
+    return _TensorTable(
+        total if known else None,
+        experts if known else None,
+        classifier,
+        frozenset(nextn),
+        first_block,
+    )
 
 
 def read_metadata_stream(
@@ -644,12 +717,16 @@ def read_metadata_stream(
     tensor_bytes: int | None = None
     expert_bytes: int | None = None
     classifier = False
+    nextn_blocks: frozenset[int] | None = None
+    first_block: bool | None = None
     architecture = kv.get("general.architecture")
     non_causal = kv.get(f"{architecture}.attention.causal") is False
     if tensors or non_causal:
-        total, experts, classifier = _read_tensor_table(reader, tensor_count)
+        table = _read_tensor_table(reader, tensor_count)
+        classifier = table.classifier
         if tensors:
-            tensor_bytes, expert_bytes = total, experts
+            tensor_bytes, expert_bytes = table.total, table.experts
+            nextn_blocks, first_block = table.nextn_blocks, table.has_first_block
 
     return GgufMetadata(
         version=version,
@@ -661,6 +738,8 @@ def read_metadata_stream(
         tensor_bytes=tensor_bytes,
         expert_bytes=expert_bytes,
         has_classifier_tensors=classifier,
+        nextn_blocks=nextn_blocks,
+        has_first_block=first_block,
     )
 
 

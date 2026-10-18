@@ -18,14 +18,25 @@ def projector_bytes(model: LibraryModel) -> int:
     """A GGUF's separate vision projector, which finding it beside the model
     does not load: guidance covers the main model (catalogue candidates
     already exclude it)."""
+    return _role_bytes(model, ModelFileRole.projector)
+
+
+def draft_bytes(model: LibraryModel) -> int:
+    """A GGUF's speculative-decoding companions (SD1), loaded only when a
+    profile drafts with one. Same rule as the projector."""
+    return _role_bytes(model, ModelFileRole.draft)
+
+
+def _role_bytes(model: LibraryModel, role: ModelFileRole) -> int:
     if model.format is not ModelFormat.gguf:
         return 0
-    return sum(f.sizeBytes or 0 for f in model.files or [] if f.role is ModelFileRole.projector)
+    return sum(f.sizeBytes or 0 for f in model.files or [] if f.role is role)
 
 
 def weights_of(model: LibraryModel) -> int:
-    """The bytes an engine loads: the disk footprint less a projector."""
-    return max(0, (model.sizeBytes or 0) - projector_bytes(model))
+    """The bytes an engine loads: the disk footprint less a projector and
+    any drafting companion."""
+    return max(0, (model.sizeBytes or 0) - projector_bytes(model) - draft_bytes(model))
 
 
 def expert_bytes_of(model: LibraryModel) -> int | None:

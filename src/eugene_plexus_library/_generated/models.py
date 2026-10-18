@@ -1792,6 +1792,10 @@ class ModelFileRole(StrEnum):
     * `shard` — the second through Nth part of a split model.
     * `projector` — a vision projector (`general.type: mmproj`),
       which is why it is a role here and not a model of its own.
+    * `draft` — a speculative-decoding companion beside a GGUF model
+      (`GgufSpeculation.draftFiles`): a separate MTP head or a small
+      draft model. Like a projector, it belongs to the model beside
+      it, and several quants of one model can share it.
     * `config` / `tokenizer` / `index` — safetensors sidecars.
     * `other` — present in the model's directory, counted in
       `sizeBytes`, not classified.
@@ -1801,10 +1805,27 @@ class ModelFileRole(StrEnum):
     weights = 'weights'
     shard = 'shard'
     projector = 'projector'
+    draft = 'draft'
     config = 'config'
     tokenizer = 'tokenizer'
     index = 'index'
     other = 'other'
+
+
+class DraftKind(StrEnum):
+    """
+    How llama.cpp drafts with a companion file, read from the file
+    itself:
+
+    * `mtp` — a separate MTP head: the `nextn` tensors of the last
+      block and no first block (`--spec-type draft-mtp`).
+    * `simple` — a whole small model named as a draft (`draft-*.gguf`)
+      (`--spec-type draft-simple`).
+
+    """
+
+    mtp = 'mtp'
+    simple = 'simple'
 
 
 class MlxQuantization(BaseModel):
@@ -2003,6 +2024,10 @@ class SkipReason(StrEnum):
     * `projector` — a vision projector (`general.type: mmproj`),
       which belongs to the model beside it. Nearly a gigabyte each
       on current models, so getting this wrong is visible.
+    * `draft` — a speculative-decoding companion (`DraftFile`) that
+      belongs to the model beside it: a separate MTP head, which
+      holds only the last block and cannot run alone, or a small
+      model named as a draft.
     * `shard_member` — part 2..N of a split model, accounted for on
       the entry that owns part 1.
     * `adapter` — a LoRA or similar (`adapter_config.json` plus
@@ -2032,6 +2057,7 @@ class SkipReason(StrEnum):
     """
 
     projector = 'projector'
+    draft = 'draft'
     shard_member = 'shard_member'
     adapter = 'adapter'
     older_revision = 'older_revision'
@@ -2941,52 +2967,12 @@ class KeptModelFile(BaseModel):
     usedBy: list[ModelRef]
 
 
-class GgufDetail(BaseModel):
-    """
-    GGUF-specific metadata, read from the file's KV block. Present
-    iff `format` is `gguf`.
-
-    """
-
-    quantization: str | None = Field(
-        None,
-        description='Human-readable quant tier, e.g. `"Q4_K_M"`. The vocabulary\nthe operator\'s question is actually phrased in — "Q3_K_S vs\n2Q_K_M? No one knows" — and M3\'s guidance hangs off it.\n',
+class DraftFile(BaseModel):
+    path: str = Field(
+        ..., description='Absolute path, in the same folder as the model.'
     )
-    fileType: int | None = Field(
-        None,
-        description='Raw `general.file_type` enum value, reported alongside the\nlabel rather than instead of it. It **does** distinguish the\nK-quant mixtures (verified: 14 is `Q4_K_S`, 15 is `Q4_K_M`),\nso the label is machine-read rather than guessed from a\nfilename.\n\nReported raw because the quant families churn — imatrix\nvariants, MXFP4, whatever is next — and a reader will meet\nvalues it does not know. The rule for those is to surface\nthe number and the filename-derived label, never to map an\nunrecognised value onto a plausible neighbour: guidance\nbuilt on a guess is worse than no guidance.\n',
-    )
-    quantizationDisagrees: bool | None = Field(
-        None,
-        description='True when the label derived from `fileType` and the label in\nthe filename are not the same. Both are then reported and\nneither is silently preferred, because either one can be the\nwrong one — a requantized file keeps its old name more often\nthan a metadata field is wrong, but not always.\n',
-    )
-    ggufVersion: int | None = Field(
-        None, description='GGUF container version (3 for everything current).'
-    )
-    shardCount: int | None = Field(
-        None,
-        description='Number of `…-0000N-of-0000M.gguf` parts. 1 for a plain file.\nOnly the first is on the launch line; the rest are `shard`\nfiles.\n',
-        ge=1,
-    )
-    vocabSize: int | None = Field(
-        None,
-        description='Token count. Worth reporting for its own sake and because it\nexplains the scan cost: the tokenizer lives in the KV block,\nso a 248k-token vocab means ~10.9 MB of metadata to walk\npast before the quant can be read.\n',
-        ge=0,
-    )
-    expertBytes: int | None = Field(
-        None,
-        description='Bytes of mixture-of-experts expert tensors (names carrying\n`_exps`), summed from the tensor table that follows the KV\nblock: names, shapes and offsets, never a weight. 0 for a\ndense model. Null when the table was not read (a scan from\nbefore 2026-09-30, or a header cut short).\n\nThe number that tells a MoE model from a dense one of the\nsame size: on Qwen3-30B-A3B Q4_K_M it is 16.35 GiB of 17.28,\nand everything else is 0.93 GiB, so a small card holds all of\nthat plus the cache and llama.cpp moves only experts to system\nmemory (`docs/design/moe-aware-fit.md` §0).\n',
-        ge=0,
-    )
-    projectorPath: str | None = Field(
-        None,
-        description='Absolute path to the vision projector found beside this\nmodel, if any. Becomes `--mmproj` on the launch line.\nllama-server can also find it unaided, but it is reported\nbecause "this model can see" is a fact the browser should\nshow and a profile should be able to override.\n',
-    )
-    recommendedSampling: RecommendedSampling | None = None
-    metadata: dict[str, Any] | None = Field(
-        None,
-        description='Selected raw KV pairs, verbatim, minus the tokenizer arrays.\nAn escape hatch for the long tail — architecture-prefixed\nkeys grow with upstream, and a reader that only ever exposes\nthe fields it was written to understand goes blind on every\nmodel newer than itself.\n',
-    )
+    kind: DraftKind
+    sizeBytes: int | None = Field(None, ge=0)
 
 
 class SafetensorsDetail(BaseModel):
@@ -3669,100 +3655,6 @@ class DirectoryListing(BaseModel):
     )
 
 
-class LibraryModel(BaseModel):
-    """
-    One launchable model on this host.
-
-    The format-independent facts are here; exactly one of `gguf`,
-    `safetensors`, `kev` or `prepared` carries the rest. That split is not tidiness — a
-    quant tier is a GGUF concept and an exact parameter count is a
-    safetensors one, and flattening both into one object would
-    produce a schema half of whose fields are null for any given
-    model.
-
-    """
-
-    id: str = Field(
-        ...,
-        description='Stable handle for this model: the first 16 hex characters of\nthe SHA-256 of its normalized absolute path. Normalized\nmeans absolute, canonical separators, case-folded on\nWindows, and **symlinks left unresolved**.\n\nDerived rather than random so it survives restarts, since\nprofiles are keyed to it. **Opaque to callers** — the\nnormalization rules are fiddly enough that a client deriving\nit independently would sooner or later compute a handle the\nserver does not recognise and get an unexplained 404. Use\n`GET /v1/models?path=` instead.\n\nNot content addressing: no byte of the model is read to\nproduce it. Hashing 40 GB on every scan is not on the table,\nand a content-derived identity would change when nothing the\noperator did changed.\n',
-    )
-    path: str = Field(
-        ...,
-        description="Absolute path, verbatim, in the operator's own layout — the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors, the provenance file\n(`<name>.eugene-prepared.json`) for `prepared`. This is what\ngoes on a runtime's `modelPath`.\n\n**A path on the host this library runs on** — inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n",
-    )
-    root: str | None = Field(
-        None,
-        description='The configured root this model was found under. Two roots\ncan hold the same filename, so this is how the UI\ndisambiguates two entries that otherwise read alike — and\nhow it tells the operator which drive to go plug back in.\n',
-    )
-    format: ModelFormat
-    name: str = Field(
-        ...,
-        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
-    )
-    displayName: str | None = Field(
-        None,
-        description="The model's self-declared name from its metadata\n(`general.name` for GGUF), when it has one and it differs\nfrom `name`. Shown as a subtitle, never as the identity:\nmetadata names are frequently the training-run name and\ncollide across quants of one model.\n",
-    )
-    status: ModelStatus
-    sizeBytes: int | None = Field(
-        None,
-        description='Total size of every file belonging to this model — all\nshards, and the projector when there is one. The number\nthat answers "will this fit on the drive I am copying it\nto", which is why it is a sum rather than the weights file\nalone.\n\nAbsent for `prepared`: the engine\'s own files are not read,\nso their size is not known, and the provenance file\'s few\nbytes are not the model\'s size.\n',
-        ge=0,
-    )
-    fileCount: int | None = Field(
-        None,
-        description='How many files make up this model. 1 for a plain single-file GGUF.',
-        ge=1,
-    )
-    architecture: str | None = Field(
-        None,
-        description='Model architecture as the file declares it — `general.architecture`\nfor GGUF, `model_type` from `config.json` for safetensors.\nFree-form on purpose: new architectures ship constantly and\nan enum here would reject models that work fine.\n',
-    )
-    contextLength: int | None = Field(
-        None,
-        description='Context length the **model** declares. Not what an engine\nwill serve — that depends on the launch flags and available\nmemory, and is reported by the agent as\n`RuntimeCapabilities.contextLength`. Both numbers are real\nand a UI that shows only this one tells a comfortable lie.\n',
-        ge=0,
-    )
-    parameters: int | None = Field(
-        None,
-        description='Exact parameter count, when the format gives one. Safetensors\nheaders do (summed tensor shapes, from an ~11 KB read);\n**GGUF does not** — see `sizeLabel`. Optional because for\nmost local models it is genuinely unavailable, and a schema\nthat required it would be unfillable for every GGUF in\nexistence.\n',
-        ge=0,
-    )
-    sizeLabel: str | None = Field(
-        None,
-        description='The author\'s own size label, e.g. `"27B"`\n(`general.size_label`). A display string, not a number, and\nnot always present or accurate — it is what the person who\nuploaded the file typed. For GGUF it is usually the only\nanswer available to "how big is this model".\n',
-    )
-    capabilities: ModelCapabilities | None = None
-    files: list[ModelFile] | None = Field(
-        None,
-        description='Every file that belongs to this model, with its role. This\nis what makes a sharded model legible as one thing, and what\nshows the operator that the 900 MB projector next to their\nmodel is accounted for rather than missed.\n',
-    )
-    gguf: GgufDetail | None = None
-    safetensors: SafetensorsDetail | None = None
-    kev: KevCheckpointDetail | None = None
-    prepared: PreparedDetail | None = None
-    profileCount: int | None = Field(
-        None,
-        description='How many launch profiles are saved against this model. On\nthe list so the browser can badge a tuned model without\nfetching every profile collection.\n',
-        ge=0,
-    )
-    firstSeenAt: AwareDatetime | None = Field(
-        None, description='When a scan first found this model.'
-    )
-    lastSeenAt: AwareDatetime | None = Field(
-        None,
-        description='When a scan last found it on disk. For a `missing` entry\nthis is when it was last there, which is the only clue to\nwhat happened.\n',
-    )
-    modifiedAt: AwareDatetime | None = Field(
-        None,
-        description='Filesystem mtime of the weights. Part of the incremental-rescan key.',
-    )
-    error: str | None = Field(
-        None,
-        description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
-    )
-
-
 class ModelDeletion(BaseModel):
     """
     What deleting a model would do, read now (LS8).
@@ -3788,6 +3680,28 @@ class ModelDeletion(BaseModel):
     )
     token: str = Field(
         ..., description='Names this plan; `deleteModel` refuses another.'
+    )
+
+
+class GgufSpeculation(BaseModel):
+    """
+    What this model can draft with when it runs with speculative
+    decoding (docs/design/speculative-decoding.md, SD1). Read from
+    the tensor table, by llama.cpp's own rule (b11719,
+    `common_speculative_types_from_gguf`): a file carries an MTP head
+    when it has `blk.<block_count-1>.nextn.eh_proj.weight`.
+
+    Absent on an entry scanned before SD1, which a rescan fills in.
+
+    """
+
+    mtpHead: bool = Field(
+        ...,
+        description='The model carries its own multi-token prediction head in this\nfile, beside every other block. Its profile can then draft\nwith "Model\'s own prediction head" (`--spec-type draft-mtp`\nwith no draft file), which runs on the main weights and costs\nonly a small context.\n\n`<arch>.nextn_predict_layers` is not enough on its own: a\nseparate MTP file (ggml-org\'s `mtp-*.gguf`) declares it too,\nand holds only the last block.\n',
+    )
+    draftFiles: list[DraftFile] = Field(
+        ...,
+        description="Companion files in this model's folder that it can draft\nwith (`--spec-draft-model`). Also listed in `files` with the\nrole `draft`, and skipped as models with the reason `draft`.\nEmpty when there are none.\n",
     )
 
 
@@ -4180,11 +4094,52 @@ class EngineFitModel(BaseModel):
     )
 
 
-class LibraryModelList(BaseModel):
-    models: list[LibraryModel]
-    lastScanAt: AwareDatetime | None = Field(
+class GgufDetail(BaseModel):
+    """
+    GGUF-specific metadata, read from the file's KV block. Present
+    iff `format` is `gguf`.
+
+    """
+
+    quantization: str | None = Field(
         None,
-        description='When the walk that produced this list finished. Omitted\nbefore the first scan. Present here as well as on `Scan` so\na browser rendering the list can say how stale it is\nwithout a second call.\n',
+        description='Human-readable quant tier, e.g. `"Q4_K_M"`. The vocabulary\nthe operator\'s question is actually phrased in — "Q3_K_S vs\n2Q_K_M? No one knows" — and M3\'s guidance hangs off it.\n',
+    )
+    fileType: int | None = Field(
+        None,
+        description='Raw `general.file_type` enum value, reported alongside the\nlabel rather than instead of it. It **does** distinguish the\nK-quant mixtures (verified: 14 is `Q4_K_S`, 15 is `Q4_K_M`),\nso the label is machine-read rather than guessed from a\nfilename.\n\nReported raw because the quant families churn — imatrix\nvariants, MXFP4, whatever is next — and a reader will meet\nvalues it does not know. The rule for those is to surface\nthe number and the filename-derived label, never to map an\nunrecognised value onto a plausible neighbour: guidance\nbuilt on a guess is worse than no guidance.\n',
+    )
+    quantizationDisagrees: bool | None = Field(
+        None,
+        description='True when the label derived from `fileType` and the label in\nthe filename are not the same. Both are then reported and\nneither is silently preferred, because either one can be the\nwrong one — a requantized file keeps its old name more often\nthan a metadata field is wrong, but not always.\n',
+    )
+    ggufVersion: int | None = Field(
+        None, description='GGUF container version (3 for everything current).'
+    )
+    shardCount: int | None = Field(
+        None,
+        description='Number of `…-0000N-of-0000M.gguf` parts. 1 for a plain file.\nOnly the first is on the launch line; the rest are `shard`\nfiles.\n',
+        ge=1,
+    )
+    vocabSize: int | None = Field(
+        None,
+        description='Token count. Worth reporting for its own sake and because it\nexplains the scan cost: the tokenizer lives in the KV block,\nso a 248k-token vocab means ~10.9 MB of metadata to walk\npast before the quant can be read.\n',
+        ge=0,
+    )
+    expertBytes: int | None = Field(
+        None,
+        description='Bytes of mixture-of-experts expert tensors (names carrying\n`_exps`), summed from the tensor table that follows the KV\nblock: names, shapes and offsets, never a weight. 0 for a\ndense model. Null when the table was not read (a scan from\nbefore 2026-09-30, or a header cut short).\n\nThe number that tells a MoE model from a dense one of the\nsame size: on Qwen3-30B-A3B Q4_K_M it is 16.35 GiB of 17.28,\nand everything else is 0.93 GiB, so a small card holds all of\nthat plus the cache and llama.cpp moves only experts to system\nmemory (`docs/design/moe-aware-fit.md` §0).\n',
+        ge=0,
+    )
+    projectorPath: str | None = Field(
+        None,
+        description='Absolute path to the vision projector found beside this\nmodel, if any. Becomes `--mmproj` on the launch line.\nllama-server can also find it unaided, but it is reported\nbecause "this model can see" is a fact the browser should\nshow and a profile should be able to override.\n',
+    )
+    speculation: GgufSpeculation | None = None
+    recommendedSampling: RecommendedSampling | None = None
+    metadata: dict[str, Any] | None = Field(
+        None,
+        description='Selected raw KV pairs, verbatim, minus the tokenizer arrays.\nAn escape hatch for the long tail — architecture-prefixed\nkeys grow with upstream, and a reader that only ever exposes\nthe fields it was written to understand goes blind on every\nmodel newer than itself.\n',
     )
 
 
@@ -4348,6 +4303,100 @@ class EligibilityRequest(BaseModel):
     )
 
 
+class LibraryModel(BaseModel):
+    """
+    One launchable model on this host.
+
+    The format-independent facts are here; exactly one of `gguf`,
+    `safetensors`, `kev` or `prepared` carries the rest. That split is not tidiness — a
+    quant tier is a GGUF concept and an exact parameter count is a
+    safetensors one, and flattening both into one object would
+    produce a schema half of whose fields are null for any given
+    model.
+
+    """
+
+    id: str = Field(
+        ...,
+        description='Stable handle for this model: the first 16 hex characters of\nthe SHA-256 of its normalized absolute path. Normalized\nmeans absolute, canonical separators, case-folded on\nWindows, and **symlinks left unresolved**.\n\nDerived rather than random so it survives restarts, since\nprofiles are keyed to it. **Opaque to callers** — the\nnormalization rules are fiddly enough that a client deriving\nit independently would sooner or later compute a handle the\nserver does not recognise and get an unexplained 404. Use\n`GET /v1/models?path=` instead.\n\nNot content addressing: no byte of the model is read to\nproduce it. Hashing 40 GB on every scan is not on the table,\nand a content-derived identity would change when nothing the\noperator did changed.\n',
+    )
+    path: str = Field(
+        ...,
+        description="Absolute path, verbatim, in the operator's own layout — the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors, the provenance file\n(`<name>.eugene-prepared.json`) for `prepared`. This is what\ngoes on a runtime's `modelPath`.\n\n**A path on the host this library runs on** — inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n",
+    )
+    root: str | None = Field(
+        None,
+        description='The configured root this model was found under. Two roots\ncan hold the same filename, so this is how the UI\ndisambiguates two entries that otherwise read alike — and\nhow it tells the operator which drive to go plug back in.\n',
+    )
+    format: ModelFormat
+    name: str = Field(
+        ...,
+        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
+    )
+    displayName: str | None = Field(
+        None,
+        description="The model's self-declared name from its metadata\n(`general.name` for GGUF), when it has one and it differs\nfrom `name`. Shown as a subtitle, never as the identity:\nmetadata names are frequently the training-run name and\ncollide across quants of one model.\n",
+    )
+    status: ModelStatus
+    sizeBytes: int | None = Field(
+        None,
+        description='Total size of every file belonging to this model — all\nshards, and the projector when there is one. The number\nthat answers "will this fit on the drive I am copying it\nto", which is why it is a sum rather than the weights file\nalone.\n\nAbsent for `prepared`: the engine\'s own files are not read,\nso their size is not known, and the provenance file\'s few\nbytes are not the model\'s size.\n',
+        ge=0,
+    )
+    fileCount: int | None = Field(
+        None,
+        description='How many files make up this model. 1 for a plain single-file GGUF.',
+        ge=1,
+    )
+    architecture: str | None = Field(
+        None,
+        description='Model architecture as the file declares it — `general.architecture`\nfor GGUF, `model_type` from `config.json` for safetensors.\nFree-form on purpose: new architectures ship constantly and\nan enum here would reject models that work fine.\n',
+    )
+    contextLength: int | None = Field(
+        None,
+        description='Context length the **model** declares. Not what an engine\nwill serve — that depends on the launch flags and available\nmemory, and is reported by the agent as\n`RuntimeCapabilities.contextLength`. Both numbers are real\nand a UI that shows only this one tells a comfortable lie.\n',
+        ge=0,
+    )
+    parameters: int | None = Field(
+        None,
+        description='Exact parameter count, when the format gives one. Safetensors\nheaders do (summed tensor shapes, from an ~11 KB read);\n**GGUF does not** — see `sizeLabel`. Optional because for\nmost local models it is genuinely unavailable, and a schema\nthat required it would be unfillable for every GGUF in\nexistence.\n',
+        ge=0,
+    )
+    sizeLabel: str | None = Field(
+        None,
+        description='The author\'s own size label, e.g. `"27B"`\n(`general.size_label`). A display string, not a number, and\nnot always present or accurate — it is what the person who\nuploaded the file typed. For GGUF it is usually the only\nanswer available to "how big is this model".\n',
+    )
+    capabilities: ModelCapabilities | None = None
+    files: list[ModelFile] | None = Field(
+        None,
+        description='Every file that belongs to this model, with its role. This\nis what makes a sharded model legible as one thing, and what\nshows the operator that the 900 MB projector next to their\nmodel is accounted for rather than missed.\n',
+    )
+    gguf: GgufDetail | None = None
+    safetensors: SafetensorsDetail | None = None
+    kev: KevCheckpointDetail | None = None
+    prepared: PreparedDetail | None = None
+    profileCount: int | None = Field(
+        None,
+        description='How many launch profiles are saved against this model. On\nthe list so the browser can badge a tuned model without\nfetching every profile collection.\n',
+        ge=0,
+    )
+    firstSeenAt: AwareDatetime | None = Field(
+        None, description='When a scan first found this model.'
+    )
+    lastSeenAt: AwareDatetime | None = Field(
+        None,
+        description='When a scan last found it on disk. For a `missing` entry\nthis is when it was last there, which is the only clue to\nwhat happened.\n',
+    )
+    modifiedAt: AwareDatetime | None = Field(
+        None,
+        description='Filesystem mtime of the weights. Part of the incremental-rescan key.',
+    )
+    error: str | None = Field(
+        None,
+        description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
+    )
+
+
 class Message(BaseModel):
     """
     A single message in a conversation. Deliberately close to the
@@ -4375,4 +4424,12 @@ class Message(BaseModel):
     )
     timestamp: AwareDatetime | None = Field(
         None, description='When the message was produced. Server-assigned if omitted.'
+    )
+
+
+class LibraryModelList(BaseModel):
+    models: list[LibraryModel]
+    lastScanAt: AwareDatetime | None = Field(
+        None,
+        description='When the walk that produced this list finished. Omitted\nbefore the first scan. Present here as well as on `Scan` so\na browser rendering the list can say how stale it is\nwithout a second call.\n',
     )
