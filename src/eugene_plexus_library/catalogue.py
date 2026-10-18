@@ -39,7 +39,7 @@ import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from . import fit as fit_mod
 from . import quants
@@ -58,6 +58,7 @@ from ._generated.models import (
     FitVerdict,
     GateKind,
     KvCacheType,
+    LibraryModel,
     MatchedOn,
     MemoryBudget,
     ModelFileRole,
@@ -96,6 +97,10 @@ _DOC_NAMES = {"readme.md", "license", "license.txt", ".gitattributes", "notice"}
 _PROJECTOR_RE = re.compile(r"(^|[/_-])mmproj", re.IGNORECASE)
 _IMATRIX_RE = re.compile(r"imatrix", re.IGNORECASE)
 _DRAFT_RE = re.compile(r"(^|/)(mtp|draft)[-_/]|(^|[/_-])(mtp|draft)\.", re.IGNORECASE)
+# Drafters of kinds Eugene does not launch yet (llama.cpp's `draft-dflash`,
+# `draft-eagle3`, `draft-dspark`): ggml-org ships `dflash-*.gguf` beside the
+# MTP file. Never a version of the model, so never a candidate.
+_OTHER_DRAFTER_RE = re.compile(r"(^|/)(dflash|eagle3?|dspark)[-_]", re.IGNORECASE)
 # Does a label look like a quant tier at all? Loose on purpose: the
 # point is to tell `Q4_K_XL` and `UD-IQ2_S` (tiers we have never heard
 # of) from `instruct` or a bare model name, not to validate a list.
@@ -210,10 +215,11 @@ def quant_label(filename: str) -> str | None:
 
 def _gguf_groups(
     files: Iterable[FileMetadata],
-) -> tuple[list[_Group], list[FileMetadata], list[FileMetadata]]:
-    """`(candidates, projectors, other)` for the `.gguf` half of a repo."""
+) -> tuple[list[_Group], list[FileMetadata], list[FileMetadata], list[FileMetadata]]:
+    """`(candidates, projectors, drafts, other)` for the `.gguf` half of a repo."""
     candidates: dict[str, _Group] = {}
     projectors: list[FileMetadata] = []
+    drafts: list[FileMetadata] = []
     other: list[FileMetadata] = []
 
     for meta in files:
@@ -232,11 +238,14 @@ def _gguf_groups(
         if _IMATRIX_RE.search(meta.path):
             other.append(meta)
             continue
-        # Multi-token-prediction / speculative-draft weights, usually in
-        # their own subdirectory. Launchable only as a `--model-draft`
-        # alongside something else, which is not a choice this screen is
-        # offering.
+        # Multi-token-prediction / speculative-draft weights, sometimes in
+        # their own subdirectory. Like a projector, a companion belongs to
+        # the model beside it (SD1), and a repo commonly ships several
+        # precisions of one (library#13).
         if _DRAFT_RE.search(meta.path):
+            drafts.append(meta)
+            continue
+        if _OTHER_DRAFTER_RE.search(meta.path):
             other.append(meta)
             continue
 
@@ -271,7 +280,7 @@ def _gguf_groups(
         # the only one whose header carries the metadata.
         group.files.sort(key=lambda m: m.path)
 
-    return list(candidates.values()), projectors, other
+    return list(candidates.values()), projectors, drafts, other
 
 
 def _safetensors_groups(
@@ -353,7 +362,7 @@ def _owned(group: _Group, store: StateStore) -> AlreadyOwned | None:
             # claiming it were would talk an operator out of a download
             # they need.
             continue
-        return AlreadyOwned(modelId=model.id, path=model.path, matchedOn=MatchedOn.name_and_size)
+        return _already_owned(model, folder=Path(model.path).parent)
     return None
 
 
@@ -373,8 +382,29 @@ def _owned_folder(group: _Group, wanted: str, store: StateStore) -> AlreadyOwned
         held = sum(f.sizeBytes or 0 for n, f in names.items() if n.endswith(".safetensors"))
         if held and abs(held - want) > 1024 * 1024:
             continue
-        return AlreadyOwned(modelId=model.id, path=model.path, matchedOn=MatchedOn.name_and_size)
+        return _already_owned(model, folder=Path(model.path))
     return None
+
+
+def _already_owned(model: LibraryModel, *, folder: Path) -> AlreadyOwned:
+    """The match, with where a file meant to land beside it goes: its
+    configured root and its folder under it (library#13), or neither when
+    it sits outside every root."""
+    root: str | None = None
+    relative: str | None = None
+    if model.root:
+        try:
+            relative = folder.relative_to(model.root).as_posix()
+            root = model.root
+        except ValueError:
+            pass
+    return AlreadyOwned(
+        modelId=model.id,
+        path=model.path,
+        matchedOn=MatchedOn.name_and_size,
+        root=root,
+        folder=relative,
+    )
 
 
 # -- facts for the judge (LS2) ----------------------------------------------
@@ -600,7 +630,7 @@ def build_model(
 
     `configs` are the safetensors folders' remote `config.json`s by path, as
     the route read them (`config_paths`); a missing one is not known."""
-    gguf_groups, projectors, gguf_other = _gguf_groups(files)
+    gguf_groups, projectors, drafts, gguf_other = _gguf_groups(files)
     st_groups, st_other = _safetensors_groups(files, repo=info.repo)
 
     shape = _shape_from_repo(info)
@@ -690,6 +720,7 @@ def build_model(
         chatTemplate=info.chat_template,
         candidates=candidates,
         projectors=[_to_catalogue_file(f, ModelFileRole.projector) for f in projectors],
+        draftFiles=[_to_catalogue_file(f, ModelFileRole.draft) for f in drafts],
         otherFiles=other,
         totalSizeBytes=sum(f.size for f in files),
         recommended=recommendation,
@@ -857,7 +888,7 @@ def candidate_size(files: list[FileMetadata], path: str) -> int | None:
     candidate by every other shard — 46.55 GiB against a real 50.90 GiB
     on the one verified example.
     """
-    groups, _, _ = _gguf_groups(files)
+    groups, _, _, _ = _gguf_groups(files)
     for group in groups:
         if any(f.path == path for f in group.files):
             return group.size

@@ -698,7 +698,7 @@ async def _pick_repo_and_quant(client: HubClient, candidate: Candidate) -> tuple
         except HubError as exc:
             log.warning("%s: could not read the repo (%s)", repo, exc)
             continue
-        groups, _projectors, _other = catalogue_mod._gguf_groups(files)
+        groups, _projectors, _drafts, _other = catalogue_mod._gguf_groups(files)
         chosen = _choose_quant(groups, parameters=info.parameters or candidate.parameter_count)
         if chosen is None:
             continue

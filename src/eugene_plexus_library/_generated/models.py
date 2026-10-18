@@ -2340,6 +2340,14 @@ class AlreadyOwned(BaseModel):
         None,
         description="`digest` is certain — the local file's hash was known and\nmatched. `name_and_size` is a strong guess and labelled as\none, because the library deliberately never hashes model\ncontent (a 40 GB read per scan is not on the table), so for\nmost entries name and size is all there is to compare.\n",
     )
+    root: str | None = Field(
+        None,
+        description="The configured model directory that holds it: a download's\n`root` for a file meant to land beside it, such as a drafting\ncompanion fetched later (library#13). Absent when it sits\noutside every configured directory.\n",
+    )
+    folder: str | None = Field(
+        None,
+        description='Its folder relative to `root` (`.` when it sits in `root`\nitself): the matching download `subdirectory`.\n',
+    )
 
 
 class StarterSetSource(StrEnum):
@@ -2418,7 +2426,7 @@ class DownloadSpec(BaseModel):
     )
     files: list[str] = Field(
         ...,
-        description='Repo-relative paths. Every shard of a split candidate, the\nprojector if the operator wants vision, and for safetensors\nthe sidecars as well as the weights. Take these from\n`CatalogueCandidate.files` and `CatalogueModel.projectors`.\n',
+        description='Repo-relative paths. Every shard of a split candidate, the\nprojector if the operator wants vision, and for safetensors\nthe sidecars as well as the weights. Take these from\n`CatalogueCandidate.files`, `CatalogueModel.projectors` and\n`CatalogueModel.draftFiles`.\n',
         min_length=1,
     )
     root: str | None = Field(
@@ -4196,9 +4204,13 @@ class CatalogueModel(BaseModel):
         None,
         description="Vision projectors offered by this repo, as their own list\nbecause a multimodal repo ships more than one precision of\nthem and the operator picks — and because a projector is\nnever a candidate on its own. Add the chosen one to the\ndownload's `files`.\n",
     )
+    draftFiles: list[CatalogueFile] | None = Field(
+        None,
+        description="Speculative-decoding companions offered by this repo (role\n`draft`, library#13): `mtp-*` or `draft-*` GGUFs, as their own\nlist for the reasons `projectors` is one. A repo commonly\nships several precisions of one MTP file, and each pairs with\nevery quant of the model. Add the chosen one to the download's\n`files`; downloaded beside the model, the scan lists it in\n`GgufSpeculation.draftFiles`. To fetch one later beside a\nversion already on the disk, download it alone to that\nversion's `alreadyOwned.root` and `alreadyOwned.folder`.\n",
+    )
     otherFiles: list[CatalogueFile] | None = Field(
         None,
-        description='Files in the repo that are neither candidates nor\nprojectors: the imatrix calibration file, an MTP or draft\nmodel, documentation. Reported rather than hidden, for the\nsame reason the scan reports `skipped` — a listing that\nsilently drops files it did not understand is\nindistinguishable from one that is broken.\n',
+        description='Files in the repo that are neither candidates nor\nprojectors or companions: the imatrix calibration file, a\ndrafter of a kind Eugene does not launch yet (`dflash-*`),\ndocumentation. Reported rather than hidden, for the\nsame reason the scan reports `skipped` — a listing that\nsilently drops files it did not understand is\nindistinguishable from one that is broken.\n',
     )
     totalSizeBytes: int | None = Field(
         None,

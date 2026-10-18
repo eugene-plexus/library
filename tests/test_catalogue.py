@@ -143,7 +143,36 @@ def test_thirty_gguf_files_are_twenty_five_choices(info, files, store, budget) -
     assert len(model.projectors or []) == 2
     other = {f.path for f in model.otherFiles or []}
     assert "imatrix_unsloth.gguf" in other
-    assert "MTP/mtp-Qwen3.8-27B-Q4_0.gguf" in other
+    assert [(f.path, f.role) for f in model.draftFiles or []] == [
+        ("MTP/mtp-Qwen3.8-27B-Q4_0.gguf", ModelFileRole.draft)
+    ]
+
+
+def test_drafting_companions_are_offered_and_other_drafters_are_not_versions(
+    info, store, budget
+) -> None:
+    """library#13, from ggml-org/Qwen3.6-27B-GGUF's listing (2026-10-18):
+    three MTP precisions are offered as companions, and the DFlash drafters
+    beside them are neither companions nor versions of the model."""
+    listing = [
+        ("Qwen3.6-27B-Q4_K_M.gguf", 19_095_766_304),
+        ("Qwen3.6-27B-Q8_0.gguf", 28_595_762_464),
+        ("dflash-Qwen3.6-27B-BF16.gguf", 3_471_497_440),
+        ("dflash-Qwen3.6-27B-Q8_0.gguf", 1_849_481_440),
+        ("mmproj-Qwen3.6-27B-Q8_0.gguf", 629_247_104),
+        ("mtp-Qwen3.6-27B-BF16.gguf", 5_946_008_800),
+        ("mtp-Qwen3.6-27B-Q4_0.gguf", 1_680_270_560),
+        ("mtp-Qwen3.6-27B-Q8_0.gguf", 3_164_005_600),
+    ]
+    model = build(info, [FileMetadata(path=p, size=n) for p, n in listing], store, budget)
+    assert sorted(c.label for c in model.candidates) == ["Q4_K_M", "Q8_0"]
+    assert sorted(f.path for f in model.draftFiles or []) == [
+        "mtp-Qwen3.6-27B-BF16.gguf",
+        "mtp-Qwen3.6-27B-Q4_0.gguf",
+        "mtp-Qwen3.6-27B-Q8_0.gguf",
+    ]
+    other = {f.path for f in model.otherFiles or []}
+    assert {"dflash-Qwen3.6-27B-BF16.gguf", "dflash-Qwen3.6-27B-Q8_0.gguf"} <= other
 
 
 def test_every_label_is_distinct(info, files, store, budget) -> None:
@@ -316,6 +345,41 @@ def test_a_file_already_on_disk_is_flagged(info, files, store, budget, tmp_path)
     assert flagged[0].alreadyOwned.modelId == "abc123"
 
 
+def test_an_owned_version_says_where_a_companion_lands_beside_it(
+    info, files, store, budget, tmp_path
+) -> None:
+    """library#13: a companion fetched later goes to the owned file's own
+    folder, named as a download's `root` and `subdirectory`; a file outside
+    every root names neither."""
+    folder = tmp_path / "unsloth" / "Qwen3.8-27B-GGUF"
+    folder.mkdir(parents=True)
+    owned = folder / "Qwen3.8-27B-UD-Q4_K_M.gguf"
+    owned.write_bytes(b"x")
+    entry = LibraryModel(
+        id="abc123",
+        path=str(owned),
+        root=str(tmp_path),
+        format=ModelFormat.gguf,
+        name="Qwen3.8-27B-UD-Q4_K_M",
+        status=ModelStatus.present,
+        sizeBytes=16_464_440_224,
+    )
+    store.replace_models([entry], scanned_at=datetime.now(tz=UTC))
+    found = next(
+        c.alreadyOwned for c in build(info, files, store, budget).candidates if c.alreadyOwned
+    )
+    assert (found.root, found.folder) == (str(tmp_path), "unsloth/Qwen3.8-27B-GGUF")
+
+    store.replace_models(
+        [entry.model_copy(update={"root": str(tmp_path / "elsewhere")})],
+        scanned_at=datetime.now(tz=UTC),
+    )
+    found = next(
+        c.alreadyOwned for c in build(info, files, store, budget).candidates if c.alreadyOwned
+    )
+    assert (found.root, found.folder) == (None, None)
+
+
 def test_a_same_named_file_of_a_different_size_is_not_the_same_file(
     info, files, store, budget, tmp_path
 ) -> None:
@@ -403,7 +467,7 @@ def test_a_single_candidate_repo_keeps_its_filename_as_a_label() -> None:
     """With one candidate there is no shared prefix to strip, and an
     empty label would be worse than a long one."""
     one = [FileMetadata(path="model.gguf", size=1000)]
-    groups, _, _ = catalogue._gguf_groups(one)
+    groups, _, _, _ = catalogue._gguf_groups(one)
     assert len(groups) == 1
     assert groups[0].label == "model"
 
