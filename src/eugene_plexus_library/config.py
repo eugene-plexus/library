@@ -15,8 +15,8 @@ where other machines find the same directory, one per OS shape -- so
 the reach of a folder is stated once here and every node inherits it,
 instead of each node's agent carrying a row per folder. A bare string
 in a PATCH body means a folder with no mounts; the file itself holds only the
-object form (`conversions.py` rewrote what v0.1 wrote). `folders.py` holds the
-coercion and the validation.
+object form (a v0.1 file's bare strings are skipped with a warning, no longer
+rewritten). `folders.py` holds the coercion and the validation.
 
 `catalogueSources` (LS4) is where Discover finds models, and holds the
 one secret: each hub's token, redacted in `GET`, accepted in `PATCH`, and
@@ -462,8 +462,8 @@ class ConfigStore:
                 if self._roots_defaulted:
                     merged[ROOTS_KEY] = folders_from_paths(self._default_roots)
                 else:
-                    # The file holds folders (a v0.1 file's bare strings were
-                    # rewritten before this read); a junk entry is skipped.
+                    # The file holds folders; a junk entry, a v0.1 file's bare
+                    # string included, is skipped with a warning.
                     merged[ROOTS_KEY] = coerce_folders(merged.get(ROOTS_KEY))
                 self._values = merged
             else:

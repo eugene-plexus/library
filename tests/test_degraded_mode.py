@@ -49,6 +49,44 @@ def test_unparseable_yaml_still_starts(settings_at: Settings) -> None:
         assert client.get("/healthz").status_code == 200
 
 
+def test_repairing_a_broken_config_keeps_the_original_as_a_bak(settings_at: Settings) -> None:
+    broken = "modelRoots: [unclosed\n"
+    settings_at.config_file.write_text(broken, encoding="utf-8")
+    backup = settings_at.config_file.with_name("config.yaml.bak")
+
+    for client in _client(settings_at):
+        assert "configError" in client.get("/healthz").json()["details"]
+        assert client.patch("/v1/config", json={"scanOnStartup": False}).status_code == 200
+        assert backup.read_text(encoding="utf-8") == broken
+        assert "configError" not in client.get("/healthz").json()["details"]
+
+
+def test_a_second_repair_never_overwrites_a_different_bak(settings_at: Settings) -> None:
+    backup = settings_at.config_file.with_name("config.yaml.bak")
+    backup.write_text("the first one", encoding="utf-8")
+    settings_at.config_file.write_text("modelRoots: [unclosed\n", encoding="utf-8")
+
+    for client in _client(settings_at):
+        assert client.patch("/v1/config", json={"scanOnStartup": False}).status_code == 200
+
+    assert backup.read_text(encoding="utf-8") == "the first one"
+    second = settings_at.config_file.with_name("config.yaml.bak.1")
+    assert second.read_text(encoding="utf-8") == "modelRoots: [unclosed\n"
+
+
+def test_a_v0_1_state_starts_degraded_and_names_the_fix(settings_at: Settings) -> None:
+    before = '{"version": 1, "models": [], "profiles": {}}'
+    settings_at.state_file.write_text(before, encoding="utf-8")
+
+    for client in _client(settings_at):
+        body = client.get("/healthz").json()
+        assert body["status"] == "degraded"
+        assert "start Eugene v0.3.0 once" in body["details"]["storageError"]
+        assert client.get("/v1/models").json()["models"] == []
+
+    assert settings_at.state_file.read_text(encoding="utf-8") == before
+
+
 def test_a_root_that_is_not_a_string_does_not_stop_the_scan(
     settings_at: Settings, models_dir: Path
 ) -> None:

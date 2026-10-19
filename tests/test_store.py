@@ -329,10 +329,10 @@ def test_profiles_survive_corruption_and_replacement_of_cache(tmp_path: Path) ->
     assert path.with_name(path.name + ".preserved").read_bytes() == b"broken cache"
 
 
-def test_the_state_of_v0_1_is_not_read_here_and_is_not_touched(tmp_path: Path) -> None:
-    """What v0.1 saved is converted before this load (`conversions.py`). A
-    store that is handed it anyway reads nothing from it, refuses writes, and
-    leaves the bytes as they were: version 1 is not a format this reads."""
+def test_the_state_of_v0_1_is_refused_by_name_and_is_not_touched(tmp_path: Path) -> None:
+    """What v0.1 saved was converted by v0.3.0 and no longer is. The store
+    reads nothing from it, says what it found and the way out, refuses writes,
+    and leaves the bytes as they were."""
     from eugene_plexus_library.profile_storage import StorageUnavailable
 
     path = tmp_path / "state.json"
@@ -341,27 +341,38 @@ def test_the_state_of_v0_1_is_not_read_here_and_is_not_touched(tmp_path: Path) -
     store = StateStore(path)
     store.load()
 
-    assert store.storage_error is not None and "version 1" in store.storage_error
-    with pytest.raises(StorageUnavailable):
+    assert store.storage_error == (
+        "state.json holds version 1 state (profiles kept inside it), which v0.1 wrote and "
+        "v0.3.0 converted. This version no longer converts it: start Eugene v0.3.0 once to "
+        "convert it, then update."
+    )
+    with pytest.raises(StorageUnavailable, match=r"start Eugene v0\.3\.0 once"):
         store.create_profile("model", _spec("one"))
     assert path.read_text(encoding="utf-8") == before
 
 
-def test_a_reason_given_to_load_is_the_reason_writes_are_refused(tmp_path: Path) -> None:
-    """`blocked` is why the conversion could not finish; it is what health
-    reports, and a state file left at version 1 does not replace it."""
+def test_the_profiles_of_v0_1_are_refused_by_name_and_are_not_touched(tmp_path: Path) -> None:
+    """A profile document at version 1 (flash attention as a checkbox) is not
+    read as version 2: the store says what it found, refuses writes, keeps the
+    bytes, and makes no `.preserved` copy of a file that is intact."""
     from eugene_plexus_library.profile_storage import StorageUnavailable
 
     path = tmp_path / "state.json"
-    path.write_text(json.dumps({"version": 1, "models": []}), encoding="utf-8")
+    owned = path.with_suffix(".profiles.json")
+    before = json.dumps({"version": 1, "profiles": {"model": []}, "models": []})
+    owned.write_text(before, encoding="utf-8")
     store = StateStore(path)
-    store.load(blocked="could not convert: disk full")
-
-    assert store.storage_error == "could not convert: disk full"
-    with pytest.raises(StorageUnavailable, match="disk full"):
-        store.replace_models([], scanned_at=datetime.now(UTC))
     store.load()
-    assert store.storage_error is not None and "disk full" not in store.storage_error
+
+    assert store.storage_error == (
+        "state.profiles.json holds version 1 profiles (flash attention saved as a checkbox), "
+        "which v0.1 wrote and v0.3.0 converted. This version no longer converts it: start "
+        "Eugene v0.3.0 once to convert it, then update."
+    )
+    with pytest.raises(StorageUnavailable, match=r"start Eugene v0\.3\.0 once"):
+        store.create_profile("model", _spec("one"))
+    assert owned.read_text(encoding="utf-8") == before
+    assert not owned.with_name(owned.name + ".preserved").exists()
 
 
 def test_unreadable_owned_profile_is_preserved_and_read_only(tmp_path: Path) -> None:

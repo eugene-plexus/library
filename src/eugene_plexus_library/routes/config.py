@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .. import conversions
+from .._causes import keep_backup, plain_cause
 from .._generated.models import (
     ConfigDocument,
     ConfigSchema,
@@ -61,7 +61,7 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
             except FileNotFoundError:
                 original = None
             if original is not None:
-                conversions.keep_backup(path, original)
+                keep_backup(path, original)
         except OSError as exc:
             logging.getLogger(__name__).error(
                 "Cannot back up %s before config repair: %s", path, exc
@@ -69,7 +69,7 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
             raise HTTPException(
                 409,
                 f"Cannot keep a backup of {path.name} before repair "
-                f"({conversions.plain_cause(exc, path)}). The original is unchanged.",
+                f"({plain_cause(exc, path)}). The original is unchanged.",
             ) from exc
     result = store.apply_patch(body)
     if result.applied:

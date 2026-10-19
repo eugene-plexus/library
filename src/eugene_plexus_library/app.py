@@ -12,7 +12,8 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import __version__, conversions
+from . import __version__
+from ._causes import plain_cause
 from .auth_state import load_auth_state
 from .catalogue_sources import HubClients
 from .config import DEFAULT_ROOTS_VARIABLE, ConfigStore
@@ -59,9 +60,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         master_key=app.state.auth_state.master_key,
         default_roots=settings.default_roots(),
     )
-    # Why the config was not read, when it was not: a conversion that failed.
-    # `/healthz` says it (`configError`) in the sentence that names the file by
-    # its name; the log has the same with the path.
+    # Why the config was not read, when it was not. `/healthz` says it
+    # (`configError`) in a sentence that names the file by its name, not its path.
     app.state.config_error = None
     if settings.safe_mode:
         log.warning(
@@ -72,15 +72,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     else:
         try:
-            # What v0.1 saved is converted once, before anything reads it.
-            conversions.convert_config(settings.config_file)
             config_store.load()
-        except conversions.ConversionFailed as exc:
-            # The config stays as it was and the library runs on defaults, as for
-            # any config it cannot load: the endpoints that repair it stay up.
-            # And /healthz says so, or a library with no folders reads as `ok`.
-            app.state.config_error = exc.plain
-            log.error("%s Running on defaults; fix it via /v1/config and restart.", exc)
         # Bad config must never stop startup — see below.
         except Exception as exc:
             # Degraded, not dead. The config endpoints are how an
@@ -89,7 +81,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             # failure mode this project exists to avoid.
             app.state.config_error = (
                 f"{settings.config_file.name} could not be loaded "
-                f"({conversions.plain_cause(exc, settings.config_file)}). Running on defaults. "
+                f"({plain_cause(exc, settings.config_file)}). Running on defaults. "
                 "Repair the config and restart."
             )
             log.error(
@@ -102,17 +94,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.safe_mode = settings.safe_mode
     _announce_default_roots(config_store)
 
-    # What v0.1 saved is converted once, before the store reads it. A conversion
-    # that cannot finish leaves the files as they were and the store refusing
-    # writes, naming why on /healthz (storageError): never a crash.
+    # A state the store cannot read (v0.1's included) leaves it refusing writes
+    # and naming why on /healthz (storageError): never a crash.
     state_store = StateStore(settings.state_file)
-    blocked: str | None = None
-    try:
-        conversions.convert_state(settings.state_file)
-    except conversions.ConversionFailed as exc:
-        blocked = exc.plain
-        log.error("%s", exc)
-    state_store.load(blocked=blocked)
+    state_store.load()
     app.state.state_store = state_store
 
     manager = ScanManager(

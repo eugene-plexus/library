@@ -5,9 +5,9 @@ validation belongs to its caller; changing generated API models does not
 implicitly change this format.
 
 Only the current version is read. Version 1 (flash attention saved as a
-checkbox) is what v0.1 and the first v0.2 builds wrote; `conversions.py`
-rewrites it as version 2 at start, with a backup, and that rewrite is the
-record that it happened.
+checkbox) is what v0.1 and the first v0.2 builds wrote and v0.3.0 converted;
+this version no longer converts it, so it is refused by name (`V01Data`) with
+the way out, and never read as if it were version 2.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ._causes import v01_data
 from ._private_files import write_private_text
 
 VERSION = 2
@@ -25,6 +26,11 @@ class StorageUnavailable(RuntimeError):
     """Stored user data cannot safely be changed by this version."""
 
 
+class V01Data(StorageUnavailable):
+    """The data is what v0.1 wrote. The message is already the whole sentence
+    for the health report: it names the file by its name and the fix."""
+
+
 def path_for(state_file: Path) -> Path:
     """Where the profile document lives: beside the state file it belongs to."""
     return state_file.with_suffix(".profiles.json")
@@ -32,6 +38,10 @@ def path_for(state_file: Path) -> Path:
 
 def read(path: Path) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and type(raw.get("version")) is int and raw["version"] == 1:
+        raise V01Data(
+            v01_data(path.name, "version 1 profiles (flash attention saved as a checkbox)")
+        )
     if (
         not isinstance(raw, dict)
         or type(raw.get("version")) is not int

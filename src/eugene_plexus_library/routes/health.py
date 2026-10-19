@@ -15,10 +15,11 @@ router = APIRouter(tags=["meta"])
 
 @router.get("/healthz", response_model=Health)
 async def healthz(request: Request) -> Health:
-    """Degraded when a *configured* root could not be read, or when what v0.1
-    saved could not be converted at start (`storageError` for the state, which
-    then refuses writes; `configError` for the config, which then runs on
-    defaults, with no folders, until it is repaired and the library restarted).
+    """Degraded when a *configured* root could not be read, or when saved data
+    could not be read at start (`storageError` for the state, which then
+    refuses writes, v0.1's version-1 files included; `configError` for the
+    config, which then runs on defaults, with no folders, until it is repaired
+    and the library restarted).
 
     The distinction that matters: having **no** roots configured is
     `ok`. That is a fresh install waiting for the wizard, not a fault,
@@ -63,7 +64,7 @@ async def healthz(request: Request) -> Health:
 
     if state.storage_error:
         details["storageError"] = state.storage_error
-    # The failed conversion's own sentence, naming the file and not where it is.
+    # Why the config was not read, naming the file and not where it is.
     config_error: str | None = getattr(request.app.state, "config_error", None)
     if config_error:
         details["configError"] = config_error

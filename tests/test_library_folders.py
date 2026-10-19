@@ -3,8 +3,8 @@
 The claims: a bare string is a folder with no mounts where a person or a
 script says one (a PATCH body, the Test button, the default variable) and
 the wire always answers in the object form; a config file holds only that
-form, and a bare string in one is skipped like any junk (what v0.1 wrote is
-rewritten once at start: `test_conversions.py`); a mount must be absolute and
+form, and a bare string in one is skipped with a warning that names v0.1 (what
+v0.3.0 converted is no longer converted); a mount must be absolute and
 shaped, and two mounts of one shape are refused because a node takes the
 first of its shape; the folders' own paths are what the scanner and the Test
 button use, never a mount.
@@ -77,12 +77,16 @@ def test_objects_keep_their_mounts_and_junk_is_skipped_not_raised() -> None:
 
 
 def test_a_config_file_is_read_as_folders_only(caplog: pytest.LogCaptureFixture) -> None:
-    """A bare string is what v0.1 wrote and what `conversions.convert_config`
-    rewrites. It is no longer read here: it is skipped, and named."""
+    """A bare string is what v0.1 wrote and v0.3.0 converted. It is no longer
+    read here: it is skipped, and the warning names v0.1 and the way out."""
     assert coerce_folders(["/models", {"path": "/archive", "mounts": []}]) == [
         {"path": "/archive", "mounts": []}
     ]
-    assert "modelRoots entry 0 is malformed ('/models')" in caplog.text
+    assert (
+        "config.yaml holds modelRoots entry 0 as a bare string ('/models'), which v0.1 wrote "
+        "and v0.3.0 converted. This version no longer converts it: start Eugene v0.3.0 once "
+        "to convert it, then update. The entry is skipped."
+    ) in caplog.text
 
 
 # --- validation -------------------------------------------------------------
@@ -154,15 +158,15 @@ def test_a_config_file_of_folders_loads_and_is_not_rewritten_by_the_load(tmp_pat
 def test_a_bare_string_in_a_loaded_file_is_not_a_folder(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The file was not converted (it is read here without the start that
-    converts it), so what v0.1 wrote is junk to this reader: skipped, with
-    the entry named."""
+    """v0.3.0 converted what v0.1 wrote and this version does not, so a bare
+    string in the file is skipped, with the entry named and the way out."""
     (tmp_path / "config.yaml").write_text("modelRoots:\n  - /data/mine\n", encoding="utf-8")
     store = ConfigStore(tmp_path / "config.yaml")
     store.load()
 
     assert store.model_roots() == []
-    assert "modelRoots entry 0 is malformed ('/data/mine')" in caplog.text
+    assert "modelRoots entry 0 as a bare string ('/data/mine'), which v0.1 wrote" in caplog.text
+    assert "start Eugene v0.3.0 once to convert it, then update" in caplog.text
 
 
 def test_a_patch_may_still_say_a_folder_by_its_path(tmp_path: Path) -> None:

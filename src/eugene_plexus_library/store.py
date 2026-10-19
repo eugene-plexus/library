@@ -34,10 +34,10 @@ parse time and gain nothing. `config.yaml` — the part an operator does
 edit — stays YAML.
 
 Only the current version is read. What v0.1 saved (the profiles inside the state
-file, flash attention as a checkbox) is converted once at start, with a backup,
-by `conversions.py`. Unsupported versions, invalid profile documents and a
-conversion that failed make writes unavailable and appear on health; loading
-never silently discards them. A corrupt cache is rebuilt by a scan, because the
+file, flash attention as a checkbox) was converted by v0.3.0 and is no longer:
+it is refused by name, with the way out. That, unsupported versions and invalid
+profile documents make writes unavailable and appear on health; loading never
+silently discards them. A corrupt cache is rebuilt by a scan, because the
 profiles are in a document of their own.
 
 Writes are atomic (fsynced temp file, then `os.replace`) so a crash mid-write
@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any
 
 from . import profile_storage
+from ._causes import plain_cause, v01_data
 from ._generated.models import (
     Download,
     DownloadState,
@@ -70,9 +71,8 @@ from ._generated.models import (
     ModelStatus,
 )
 from ._private_files import write_private_text
-from .conversions import plain_cause
 from .paths import normalize
-from .profile_storage import StorageUnavailable
+from .profile_storage import StorageUnavailable, V01Data
 from .scanner import CacheKey
 
 log = logging.getLogger(__name__)
@@ -121,16 +121,14 @@ class StateStore:
                 handle.flush()
                 os.fsync(handle.fileno())
 
-    def load(self, *, blocked: str | None = None) -> None:
+    def load(self) -> None:
         """Load caches independently; refuse writes if user data is unreadable.
 
-        `blocked` is why what v0.1 saved could not be converted
-        (`conversions.ConversionFailed`). It is the reason writes are refused,
-        and it is not replaced by whatever else this load finds wrong with the
-        files it left as they were.
+        The first thing found wrong is the reason writes are refused, and it is
+        not replaced by whatever else this load finds wrong after it.
         """
         with self._lock:
-            self._storage_error = blocked
+            self._storage_error = None
             self._models = {}
             self._profiles = {}
             self._downloads = {}
@@ -141,6 +139,12 @@ class StateStore:
                     if not isinstance(raw, dict):
                         raise ValueError("state must be an object")
                     version = raw.get("version")
+                    if type(version) is int and version == 1:
+                        self._storage_error = v01_data(
+                            self._path.name, "version 1 state (profiles kept inside it)"
+                        )
+                        log.error("%s", self._storage_error)
+                        return
                     if type(version) is not int or version != STATE_VERSION:
                         self._storage_error = self._storage_error or (
                             f"Unsupported library state version {version!r}; "
@@ -179,6 +183,10 @@ class StateStore:
                     model_id: [ModelProfile.model_validate(p) for p in records]
                     for model_id, records in profiles.items()
                 }
+            except V01Data as exc:
+                # v0.1's file is intact and v0.3.0 converts it: no copy to keep.
+                self._storage_error = self._storage_error or str(exc)
+                self._profiles = {}
             except (OSError, ValueError, KeyError, TypeError, StorageUnavailable) as exc:
                 log.error("Cannot read profiles file %s: %s", self._profiles_path, exc)
                 if self._profiles_path.exists():
