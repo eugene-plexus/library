@@ -1,10 +1,8 @@
 """Library folders carry their mounts (2026-09-14).
 
 The claims: a bare string is a folder with no mounts where a person or a
-script says one (a PATCH body, the Test button, the default variable) and
-the wire always answers in the object form; a config file holds only that
-form, and a bare string in one is skipped with a warning that names v0.1 (what
-v0.3.0 converted is no longer converted); a mount must be absolute and
+script says one (a PATCH body, the Test button, the default variable, a
+config file) and the wire always answers in the object form; a mount must be absolute and
 shaped, and two mounts of one shape are refused because a node takes the
 first of its shape; the folders' own paths are what the scanner and the Test
 button use, never a mount.
@@ -14,7 +12,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 import yaml
 from fastapi.testclient import TestClient
 
@@ -76,17 +73,13 @@ def test_objects_keep_their_mounts_and_junk_is_skipped_not_raised() -> None:
     assert coerce_folders(None) == []
 
 
-def test_a_config_file_is_read_as_folders_only(caplog: pytest.LogCaptureFixture) -> None:
-    """A bare string is what v0.1 wrote and v0.3.0 converted. It is no longer
-    read here: it is skipped, and the warning names v0.1 and the way out."""
-    assert coerce_folders(["/models", {"path": "/archive", "mounts": []}]) == [
-        {"path": "/archive", "mounts": []}
+def test_a_bare_path_in_a_config_file_is_a_folder_with_no_mounts() -> None:
+    """Scripts and people write a folder by its path in the file too; it is read
+    as that folder, as a PATCH body's is."""
+    assert coerce_folders(["/models", " ", {"path": "/archive", "mounts": []}]) == [
+        {"path": "/models", "mounts": []},
+        {"path": "/archive", "mounts": []},
     ]
-    assert (
-        "config.yaml holds modelRoots entry 0 as a bare string ('/models'), which v0.1 wrote "
-        "and v0.3.0 converted. This version no longer converts it: start Eugene v0.3.0 once "
-        "to convert it, then update. The entry is skipped."
-    ) in caplog.text
 
 
 # --- validation -------------------------------------------------------------
@@ -155,18 +148,16 @@ def test_a_config_file_of_folders_loads_and_is_not_rewritten_by_the_load(tmp_pat
     assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == written
 
 
-def test_a_bare_string_in_a_loaded_file_is_not_a_folder(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """v0.3.0 converted what v0.1 wrote and this version does not, so a bare
-    string in the file is skipped, with the entry named and the way out."""
-    (tmp_path / "config.yaml").write_text("modelRoots:\n  - /data/mine\n", encoding="utf-8")
-    store = ConfigStore(tmp_path / "config.yaml")
+def test_a_bare_path_in_a_loaded_file_is_a_folder(tmp_path: Path) -> None:
+    """Read as the folder, and the file is not rewritten."""
+    path = tmp_path / "config.yaml"
+    path.write_text("modelRoots:\n  - /data/mine\n", encoding="utf-8")
+    before = path.read_bytes()
+    store = ConfigStore(path)
     store.load()
 
-    assert store.model_roots() == []
-    assert "modelRoots entry 0 as a bare string ('/data/mine'), which v0.1 wrote" in caplog.text
-    assert "start Eugene v0.3.0 once to convert it, then update" in caplog.text
+    assert store.model_roots() == [Path("/data/mine")]
+    assert path.read_bytes() == before
 
 
 def test_a_patch_may_still_say_a_folder_by_its_path(tmp_path: Path) -> None:

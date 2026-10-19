@@ -12,12 +12,11 @@ states them.
 
 Two rules this module enforces, and one it deliberately does not:
 
-* **A bare string is a folder with no mounts, where a person or a script
-  says one**: a PATCH body (the setup wizard sends them) and the default
-  variable. `GET /v1/config` always answers in the object form, so a reader
-  sees one shape, and a config file holds only that shape: what v0.1 wrote as
-  bare strings was rewritten by v0.3.0 and no longer is, so a bare string found
-  in the file is skipped, with a warning that names v0.1 and the way out.
+* **A bare string is a folder with no mounts, wherever a person or a script
+  says one**: a PATCH body (the setup wizard sends them), the default
+  variable, and a config file written by hand or by a script. It is read as
+  that folder, never rewritten. `GET /v1/config` always answers in the object
+  form, so a reader sees one shape.
 * **A mount is absolute and shaped.** A drive letter or UNC prefix means
   Windows nodes, a leading `/` means POSIX nodes; that shape is how a
   node picks its entry, so an unshaped mount could never be picked and
@@ -36,7 +35,6 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
-from ._causes import v01_data
 from ._generated.models import LibraryFolder
 from .paths import normalize
 
@@ -81,8 +79,8 @@ def folders_from_body(value: Any) -> Any:
 def coerce_folders(value: Any) -> list[dict[str, Any]]:
     """The folders a config file holds, leniently.
 
-    Objects keep their `path` and a cleaned `mounts`; anything else, a bare
-    string included, is skipped with a log line rather than raised, because a
+    Objects keep their `path` and a cleaned `mounts`, and a bare path is a folder
+    with no mounts; anything else is skipped with a log line rather than raised, because a
     hand-edited config file must not stop the component from starting --
     `validate_folders` is the strict half, applied at PATCH time.
     """
@@ -102,11 +100,8 @@ def coerce_folders(value: Any) -> list[dict[str, Any]]:
             )
             out.append({"path": item["path"].strip(), "mounts": mounts})
             continue
-        if isinstance(item, str):
-            log.warning(
-                "%s The entry is skipped.",
-                v01_data("config.yaml", f"modelRoots entry {index} as a bare string ({item!r})"),
-            )
+        if isinstance(item, str) and item.strip():
+            out.append({"path": item.strip(), "mounts": []})
             continue
         log.warning("modelRoots entry %d is malformed (%r); ignoring it", index, item)
     return out
