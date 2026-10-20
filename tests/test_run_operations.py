@@ -244,6 +244,25 @@ def test_install_answer_survives_restart_and_is_idempotent(client):
     assert client.post("/v1/run-operations/a/answer", json={"answer": "install"}).status_code == 409
 
 
+def test_an_install_agreed_at_the_click_is_not_asked_again(client):
+    """CX3: the engine named at the click goes straight on to installing;
+    another engine still waits for the person's answer."""
+    jobs = client.app.state.run_operations
+    model = {"id": "m", "path": "/m.gguf", "name": "m", "format": "gguf", "status": "present"}
+    jobs.create("a", Intent(modelId="m", installEngine="llama_cpp"), model)
+    lease = jobs.claim("a", None)["lease"]
+    jobs.checkpoint("a", None, Checkpoint(lease=lease, step="awaiting-install", engine="llama_cpp"))
+    record = Journal(jobs.path).get("a")
+    assert (record["step"], record["answer"]) == ("installing", "install")
+    assert client.post("/v1/run-operations/a/answer", json={"answer": "install"}).status_code == 200
+
+    jobs.create("b", Intent(modelId="m2", installEngine="llama_cpp"), {**model, "id": "m2"})
+    lease = jobs.claim("b", None)["lease"]
+    jobs.checkpoint("b", None, Checkpoint(lease=lease, step="awaiting-install", engine="vllm"))
+    record = Journal(jobs.path).get("b")
+    assert (record["step"], record["answer"]) == ("awaiting-install", None)
+
+
 def test_an_unjoined_agent_claims_the_run_its_console_named_null(app, tmp_path):
     """library#7: an agent that has not joined a root signs as `local`, and
     its console, with no node name to send, submits `node: null`."""

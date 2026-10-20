@@ -59,6 +59,14 @@ class Intent(BaseModel):
     modelId: str | None = None
     download: DownloadSpec | None = None
     preparation: PreparationIntent | None = None
+    installEngine: EngineKind | None = Field(
+        default=None,
+        description=(
+            "The engine the person agreed, at the click, to install if the node lacks it "
+            "(CX3). Checking that stops for this engine goes straight on to installing; "
+            "any other engine still waits for an answer."
+        ),
+    )
 
     @model_validator(mode="after")
     def one_source(self) -> Intent:
@@ -409,6 +417,16 @@ class Journal:
                 # The run goes on with the prepared model, never the original.
                 raise HTTPException(409, "The prepared model is not listed yet")
             record.update(patch.model_dump(exclude={"lease"}, exclude_unset=True))
+            approved = record["intent"].get("installEngine")
+            if (
+                record["step"] == "awaiting-install"
+                and record["answer"] is None
+                and approved is not None
+                and record.get("engine") == approved
+            ):
+                # Answered at the click (CX3): the same change `POST /answer`
+                # makes, so a long download ends in a running model, not a question.
+                record.update(answer="install", step="installing")
             record.update(lease=None, leaseUntil=0)
 
         return self.change(id, update)
