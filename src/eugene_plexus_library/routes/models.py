@@ -34,7 +34,7 @@ from ..store import StateStore
 router = APIRouter(tags=["models"])
 
 
-@router.get("/v1/folders", response_model=LibraryFolderList)
+@router.get("/v1/folders", response_model=LibraryFolderList, response_model_exclude_none=True)
 async def list_folders(request: Request) -> LibraryFolderList:
     """`modelRoots` as a resource, readable with a service token.
 
@@ -127,11 +127,30 @@ async def _fit_question(request: Request, asked: FitQuestion) -> engine_fit.Ques
     )
 
 
-def _write_provenance(body: PreparedModelRequest, roots: list[Path]) -> tuple[Path, Path]:
+def _read_only_folder(path: str, stores: list[Path]) -> HTTPException | None:
+    """The refusal for a path in an Ollama store: the Library never writes there."""
+    if any(is_within(path, store) for store in stores):
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "Ollama manages this folder",
+            f"{path} is in an Ollama model store. The Library reads it and never writes there, "
+            "so no provenance file goes into it.",
+        )
+    return None
+
+
+def _write_provenance(
+    body: PreparedModelRequest, roots: list[Path], stores: list[Path]
+) -> tuple[Path, Path]:
     """Choose the folder, check the entry where it can be checked, and
     create the file: `(provenance file, its Library folder)`. Blocking,
-    so the route runs it in a thread: a folder can be on a dead share."""
+    so the route runs it in a thread: a folder can be on a dead share.
+
+    `roots` are the folders that may be written; `stores` the Ollama stores,
+    which never are (CX9)."""
     entry = body.provenance.entry
+    if body.root is not None and (refused := _read_only_folder(body.root, stores)):
+        raise refused
     if body.root is None and body.subdirectory is None:
         # Beside what it describes, when that is in a Library folder.
         holder = next(
@@ -159,6 +178,10 @@ def _write_provenance(body: PreparedModelRequest, roots: list[Path]) -> tuple[Pa
                 "Outside the Library folder",
                 f"{body.subdirectory!r} resolves outside {root}.",
             )
+    # Where it comes to, not the folder named: a store can sit inside a writable
+    # folder, and the entry's own folder is where the file goes.
+    if refused := _read_only_folder(str(folder), stores):
+        raise refused
     target = folder / f"{body.name}{prepared.SUFFIX}"
     written = prepared.written_entry(entry, folder)
     resolved = prepared.entry_path(target, written)
@@ -218,7 +241,7 @@ async def add_prepared_model(request: Request, body: PreparedModelRequest) -> Li
     """
     config: ConfigStore = request.app.state.config_store
     store: StateStore = request.app.state.state_store
-    roots = config.model_roots()
+    roots = config.writable_roots()
     if not roots:
         raise _problem(
             status.HTTP_400_BAD_REQUEST,
@@ -226,7 +249,7 @@ async def add_prepared_model(request: Request, body: PreparedModelRequest) -> Li
             "No Library folders are configured, so there is nowhere to keep the provenance "
             "file. Add one under Library → Folders.",
         )
-    target, root = await asyncio.to_thread(_write_provenance, body, roots)
+    target, root = await asyncio.to_thread(_write_provenance, body, roots, config.ollama_roots())
     scans: ScanManager | None = getattr(request.app.state, "scan_manager", None)
     if scans is not None:
         await scans.wait()
@@ -255,6 +278,21 @@ def _present(store: StateStore, model_id: str) -> LibraryModel:
     return model
 
 
+def _refuse_ollama(model: LibraryModel, stores: list[Path]) -> None:
+    """An Ollama model is Ollama's file: the Library lists it and never deletes it.
+
+    By where its files are, not only by what the scan called it: a store can sit
+    inside a writable folder."""
+    paths = [model.path, *(f.path for f in model.files or [])]
+    if model.ollama is not None or any(is_within(p, s) for p in paths for s in stores):
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "Ollama manages this model",
+            f"{model.name} is Ollama's file, in Ollama's own store, and the Library does not "
+            "delete it. Nothing was deleted.",
+        )
+
+
 @router.get(
     "/v1/models/{model_id}/deletion",
     response_model=ModelDeletion,
@@ -266,6 +304,7 @@ async def plan_model_deletion(request: Request, model_id: str) -> ModelDeletion:
     is removed."""
     store: StateStore = request.app.state.state_store
     model = _present(store, model_id)
+    _refuse_ollama(model, request.app.state.config_store.ollama_roots())
     listed = store.list_models()
     context = _deletion_context(request)
 
@@ -291,6 +330,7 @@ async def delete_model(request: Request, model_id: str, body: ModelDeleteRequest
         # A walk in flight could list the files again after they go.
         await scans.wait()
     model = _present(store, model_id)
+    _refuse_ollama(model, config.ollama_roots())
     listed = store.list_models()
     context = _deletion_context(request)
     also = list(dict.fromkeys(body.alsoDelete or []))
@@ -327,7 +367,9 @@ async def delete_model(request: Request, model_id: str, body: ModelDeleteRequest
             plans.append(theirs)
         paths = list(dict.fromkeys(f.path for p in plans for f in p.files))
         try:
-            deleted = deletion.remove(paths, config.model_roots())
+            deleted = deletion.remove(
+                paths, config.writable_roots(), protected=config.ollama_roots()
+            )
         except deletion.DeleteRefused as exc:
             raise _problem(status.HTTP_409_CONFLICT, "A file is in use", str(exc)) from exc
         for p in plans:
@@ -378,6 +420,7 @@ async def forget_model(request: Request, model_id: str) -> None:
             status.HTTP_404_NOT_FOUND, "Unknown model", f"No model with id {model_id!r}."
         )
     if model.status == ModelStatus.present:
+        _refuse_ollama(model, request.app.state.config_store.ollama_roots())
         raise _problem(
             status.HTTP_409_CONFLICT,
             "Model is present",

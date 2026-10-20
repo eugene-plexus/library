@@ -66,6 +66,19 @@ def _no_gpus_from_the_operating_system(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_probe, "adapters", lambda os_name=None: [])
 
 
+@pytest.fixture(autouse=True)
+def _no_ollama_store_from_the_machine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """No Ollama store is found unless a test makes one.
+
+    The Library looks in `OLLAMA_MODELS` and the user's home on its own machine
+    (CX9), so on a development box with Ollama every test would list its models.
+    Pointing the variable at a folder with no store leaves nothing to find.
+    """
+    monkeypatch.setenv("OLLAMA_MODELS", str(tmp_path_factory.getbasetemp() / "no-ollama-here"))
+
+
 def make_symlink(link: Path, target: Path, *, directory: bool = False) -> None:
     try:
         link.symlink_to(target, target_is_directory=directory)

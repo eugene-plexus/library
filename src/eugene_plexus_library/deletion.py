@@ -232,10 +232,21 @@ def as_answer(p: Plan, listed: Sequence[LibraryModel], **context: Any) -> ModelD
     )
 
 
-def remove(paths: Sequence[str], roots: Sequence[Path]) -> list[str]:
+def remove(
+    paths: Sequence[str], roots: Sequence[Path], *, protected: Sequence[Path] = ()
+) -> list[str]:
     """Move every file aside, then remove them; or move them back and
     refuse, naming the file that could not be moved. Folders left empty go,
-    up to the Library folder holding them."""
+    up to the Library folder holding them.
+
+    A file inside a `protected` folder (an Ollama store, CX9) is never touched:
+    the whole call is refused before anything moves."""
+    for path in paths:
+        if any(is_within(path, store) for store in protected):
+            raise DeleteRefused(
+                f"{path} is in an Ollama model store. It is Ollama's file and the Library "
+                "does not delete it. Nothing was deleted."
+            )
     moved: list[tuple[str, str]] = []
     tag = secrets.token_hex(4)
     for path in paths:

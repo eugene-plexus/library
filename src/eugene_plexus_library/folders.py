@@ -35,7 +35,7 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
-from ._generated.models import LibraryFolder
+from ._generated.models import LibraryFolder, LibraryFolderKind
 from .paths import normalize
 
 log = logging.getLogger(__name__)
@@ -53,6 +53,15 @@ def is_windows_shaped(path: str) -> bool:
 
 def is_absolute_path(path: str) -> bool:
     return is_windows_shaped(path) or path.startswith("/") or path.startswith("~")
+
+
+KINDS = frozenset(kind.value for kind in LibraryFolderKind)
+OLLAMA = LibraryFolderKind.ollama.value
+
+
+def folder_kind(folder: dict[str, Any]) -> str:
+    """`folder` (the default) or `ollama`, of a folder as `coerce_folders` gives it."""
+    return OLLAMA if folder.get("kind") == OLLAMA else LibraryFolderKind.folder.value
 
 
 def folders_from_paths(paths: Sequence[str]) -> list[dict[str, Any]]:
@@ -98,7 +107,19 @@ def coerce_folders(value: Any) -> list[dict[str, Any]]:
                 if isinstance(raw_mounts, list)
                 else []
             )
-            out.append({"path": item["path"].strip(), "mounts": mounts})
+            entry: dict[str, Any] = {"path": item["path"].strip(), "mounts": mounts}
+            kind = item.get("kind")
+            if kind == OLLAMA:
+                # Written only when it is not the default, so a plain folder
+                # keeps the two-key shape every reader has had.
+                entry["kind"] = OLLAMA
+            elif kind not in (None, LibraryFolderKind.folder.value):
+                log.warning(
+                    "modelRoots entry %d has an unknown kind %r; reading it as a folder",
+                    index,
+                    kind,
+                )
+            out.append(entry)
             continue
         if isinstance(item, str) and item.strip():
             out.append({"path": item.strip(), "mounts": []})
@@ -125,9 +146,15 @@ def validate_folders(value: Any) -> str | None:
         path: Any
         mounts: list[Any]
         if isinstance(item, dict):
-            extra = sorted(set(item) - {"path", "mounts"})
+            extra = sorted(set(item) - {"path", "mounts", "kind"})
             if extra:
-                return f"entry {index} has unknown key(s) {extra}; a folder is `path` and `mounts`"
+                return (
+                    f"entry {index} has unknown key(s) {extra}; "
+                    "a folder is `path`, `mounts` and `kind`"
+                )
+            kind = item.get("kind")
+            if kind is not None and (not isinstance(kind, str) or kind not in KINDS):
+                return f"entry {index}: `kind` must be one of {sorted(KINDS)}, got {kind!r}"
             path = item.get("path")
             raw_mounts = item.get("mounts", [])
             if raw_mounts is None:
@@ -171,8 +198,11 @@ def validate_folders(value: Any) -> str | None:
 
 
 __all__ = [
+    "KINDS",
+    "OLLAMA",
     "as_models",
     "coerce_folders",
+    "folder_kind",
     "folder_paths",
     "folders_from_body",
     "folders_from_paths",

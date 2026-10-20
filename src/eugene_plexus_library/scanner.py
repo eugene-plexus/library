@@ -45,7 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -64,6 +64,7 @@ from ._generated.models import (
     ModelFileRole,
     ModelFormat,
     ModelStatus,
+    OllamaDetail,
     RecommendedSampling,
     SafetensorsDetail,
     SkippedPath,
@@ -71,6 +72,7 @@ from ._generated.models import (
 )
 from ._generated.models import Status1 as ScanRootStatus
 from .formats import gguf, kev, safetensors
+from .formats import ollama as ollama_store
 from .paths import display_name, model_id, normalize
 
 log = logging.getLogger(__name__)
@@ -172,6 +174,13 @@ def _kev_role(name: str) -> ModelFileRole:
 
 def _timestamp(stat: os.stat_result) -> datetime:
     return datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+
+
+def _path_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
 
 
 def _stat_size(entry: os.DirEntry[str]) -> int | None:
@@ -302,20 +311,29 @@ class Scanner:
         self._should_cancel = should_cancel or (lambda: False)
         self.counters = counters or ScanCounters()
         self._follow_symlinks = follow_symlinks
+        self._stores: set[str] = set()
 
     # -- entry point ----------------------------------------------------
 
-    def scan(self, roots: list[Path]) -> ScanResult:
+    def scan(self, roots: list[Path], *, ollama_roots: Sequence[Path] = ()) -> ScanResult:
+        """Walk `roots`. Those also in `ollama_roots` are Ollama stores, read
+        through their manifests rather than walked (CX9)."""
         result = ScanResult()
         seen: set[str] = set()
+        stores = {normalize(r) for r in ollama_roots}
+        self._stores = stores
         for root in roots:
             if self._should_cancel():
                 break
-            result.roots.append(self._scan_root(root, result, seen))
+            result.roots.append(
+                self._scan_root(root, result, seen, store=normalize(root) in stores)
+            )
         result.models = prepared.link_sources(result.models)
         return result
 
-    def _scan_root(self, root: Path, result: ScanResult, seen: set[str]) -> RootResult:
+    def _scan_root(
+        self, root: Path, result: ScanResult, seen: set[str], *, store: bool = False
+    ) -> RootResult:
         text = str(root)
         try:
             if not root.exists():
@@ -340,10 +358,13 @@ class Scanner:
         models_before = len(result.models)
         files_before = result.files_scanned
 
-        for directory in self._walk(root, result):
-            if self._should_cancel():
-                break
-            self._scan_directory(directory, root, result, seen)
+        if store:
+            self._scan_ollama_store(root, result, seen)
+        else:
+            for directory in self._walk(root, result):
+                if self._should_cancel():
+                    break
+                self._scan_directory(directory, root, result, seen)
 
         return RootResult(
             path=text,
@@ -408,6 +429,17 @@ class Scanner:
             for entry in children:
                 name = entry.name
                 if name in SKIP_DIR_NAMES:
+                    continue
+                if normalize(entry.path) in self._stores:
+                    # An Ollama store inside this folder is read through its manifests
+                    # as its own folder (CX9), never walked as files.
+                    result.skipped.append(
+                        SkippedPath(
+                            path=entry.path,
+                            reason=SkipReason.not_a_model,
+                            detail="an Ollama model store, listed as its own folder",
+                        )
+                    )
                     continue
                 if safetensors.HF_DATASET_DIR_RE.match(name):
                     result.skipped.append(
@@ -484,6 +516,116 @@ class Scanner:
             return
 
         self._handle_loose_files(directory, root, entries, result, seen)
+
+    # -- an Ollama store ------------------------------------------------
+
+    def _scan_ollama_store(self, root: Path, result: ScanResult, seen: set[str]) -> None:
+        """List what an Ollama store's manifests name (CX9), read-only.
+
+        One model per GGUF blob, named by its first `model:tag`, with the
+        header read as for any GGUF (and cached the same way). What Ollama
+        keeps that llama.cpp cannot load is skipped with its reason.
+        """
+        if not ollama_store.is_store(root):
+            result.skipped.append(
+                SkippedPath(
+                    path=str(root),
+                    reason=SkipReason.not_a_model,
+                    detail="not an Ollama model store: it needs `blobs` and `manifests` folders",
+                )
+            )
+            return
+        found, skipped = ollama_store.read_store(root)
+        for skip in skipped:
+            result.skipped.append(
+                SkippedPath(
+                    path=skip.path, reason=SkipReason.unsupported_format, detail=skip.detail
+                )
+            )
+        for entry in found:
+            if self._should_cancel():
+                return
+            result.files_scanned += 1
+            self.counters.files_scanned += 1
+            self.counters.current_path = str(entry.blob)
+            model = self._ollama_model(entry, root, result)
+            if model is not None and model.id not in seen:
+                seen.add(model.id)
+                result.models.append(model)
+                self.counters.models_found += 1
+
+    def _ollama_model(
+        self, entry: ollama_store.StoreModel, root: Path, result: ScanResult
+    ) -> LibraryModel | None:
+        try:
+            stat = entry.blob.stat()
+        except OSError as exc:
+            result.skipped.append(
+                SkippedPath(
+                    path=str(entry.blob),
+                    reason=SkipReason.unreadable_header,
+                    detail=f"cannot stat: {exc}",
+                )
+            )
+            return None
+        cached = self._cache_lookup(cache_key(entry.blob, stat))
+        built: LibraryModel | None = None
+        if (
+            cached is not None
+            and cached.ollama is not None
+            and not _lacks_expert_bytes(cached)
+            and not _lacks_speculation(cached)
+        ):
+            built = cached
+        else:
+            metadata = self._read_gguf(entry.blob, result)
+            if metadata is None:
+                return None
+            built = self._build_gguf_model(entry.blob, root, [], metadata, [])
+        if built is None:
+            return None
+        projector_file = (
+            ModelFile(
+                path=str(entry.projector),
+                role=ModelFileRole.projector,
+                sizeBytes=_path_size(entry.projector),
+            )
+            if entry.projector is not None
+            else None
+        )
+        files = [f for f in built.files or [] if f.role is not ModelFileRole.projector]
+        total = built.sizeBytes
+        if projector_file is not None:
+            files.append(projector_file)
+            if built.sizeBytes is not None:
+                total = built.sizeBytes + (projector_file.sizeBytes or 0)
+        update: dict[str, object] = {
+            "name": entry.tags[0],
+            "displayName": None,
+            "files": files,
+            "fileCount": len(files),
+            "sizeBytes": total,
+            "ollama": OllamaDetail(
+                tags=entry.tags,
+                needsMigration=(
+                    True
+                    if entry.legacy_layout
+                    and (built.architecture or "") in ollama_store.MIGRATED_ARCHITECTURES
+                    else None
+                ),
+            ),
+        }
+        if built.gguf is not None:
+            update["gguf"] = built.gguf.model_copy(
+                update={
+                    "projectorPath": str(entry.projector) if entry.projector is not None else None
+                }
+            )
+        if built.capabilities is not None:
+            update["capabilities"] = built.capabilities.model_copy(
+                update={"vision": entry.projector is not None}
+            )
+        return built.model_copy(update=update)
 
     # -- safetensors -----------------------------------------------------
 

@@ -53,7 +53,7 @@ async def healthz(request: Request) -> Health:
     ]
 
     details: dict[str, object] = {
-        "rootsConfigured": len(config.model_roots()),
+        "rootsConfigured": len(config.configured_roots()),
         "modelsKnown": len(state.list_models()),
         "scanState": scan.state.value,
     }

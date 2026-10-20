@@ -352,7 +352,8 @@ def _owned(group: _Group, store: StateStore) -> AlreadyOwned | None:
     if group.format in (ModelFormat.safetensors, ModelFormat.kev_checkpoint):
         return _owned_folder(group, wanted, store)
     for model in store.list_models():
-        if model.status is not ModelStatus.present:
+        if model.status is not ModelStatus.present or model.ollama is not None:
+            # Ollama's models are read in place and never a place to put a file.
             continue
         if _name(model.path) != wanted:
             continue
@@ -374,7 +375,11 @@ def _owned_folder(group: _Group, wanted: str, store: StateStore) -> AlreadyOwned
     weights' total size, which leaves out tokenizer files a copy may lack."""
     want = sum(f.size for f in group.files if f.path.lower().endswith(".safetensors"))
     for model in store.list_models():
-        if model.status is not ModelStatus.present or model.format is not group.format:
+        if (
+            model.status is not ModelStatus.present
+            or model.format is not group.format
+            or model.ollama is not None
+        ):
             continue
         names = {_name(f.path): f for f in model.files or []}
         if wanted not in names:

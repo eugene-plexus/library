@@ -138,6 +138,20 @@ def _role_for(path: str, *, index: int) -> ModelFileRole:
     return ModelFileRole.other
 
 
+def _in_store(path: Path, stores: list[Path] | None) -> Path | None:
+    """The Ollama store `path` is, or is inside, if any (CX9)."""
+    return next((s for s in stores or [] if path_utils.is_within(path, s)), None)
+
+
+def _refuse_store(path: Path, store: Path) -> DownloadError:
+    return DownloadError(
+        f"{path} is in the Ollama model store {store}. Ollama manages the files in it and "
+        "the Library never writes there, so a download cannot land in it. Choose another folder.",
+        status=409,
+        code="ReadOnlyFolder",
+    )
+
+
 def resolve_destination(
     *,
     repo: str,
@@ -145,6 +159,35 @@ def resolve_destination(
     root: str | None,
     subdirectory: str | None,
     layout: str,
+    read_only: list[Path] | None = None,
+) -> tuple[Path, Path]:
+    """`(root, directory)` for a download, never in or inside a `read_only` store.
+
+    The check is on the directory it comes to, not on the root named: a store can
+    sit inside a writable folder, and `subdirectory` can lead into it.
+    """
+    chosen, directory = _resolve_destination(
+        repo=repo,
+        roots=roots,
+        root=root,
+        subdirectory=subdirectory,
+        layout=layout,
+        read_only=read_only,
+    )
+    store = _in_store(directory, read_only)
+    if store is not None:
+        raise _refuse_store(directory, store)
+    return chosen, directory
+
+
+def _resolve_destination(
+    *,
+    repo: str,
+    roots: list[Path],
+    root: str | None,
+    subdirectory: str | None,
+    layout: str,
+    read_only: list[Path] | None = None,
 ) -> tuple[Path, Path]:
     """`(root, directory)` for a download. Refuses anything outside a root.
 
@@ -153,7 +196,18 @@ def resolve_destination(
     the whole of the rule the milestone exists to honour. The default is
     the first configured root, which the `path_list` config type has
     promised since M2.
+
+    `roots` are the folders that may be written; `read_only` are the ones that
+    may not (an Ollama store, CX9), so a download that names one is refused
+    with that reason rather than as an unknown folder.
     """
+    if root is not None and any(path_utils.same_path(r, root) for r in read_only or []):
+        raise DownloadError(
+            f"{root} is an Ollama model store. Ollama manages the files in it and the Library "
+            "never writes there, so a download cannot land in it. Choose another folder.",
+            status=409,
+            code="ReadOnlyFolder",
+        )
     if not roots:
         # Where, precisely, and on which machine. The first operator to hit
         # this was browsing from a GPU worker while the library ran in a
@@ -203,7 +257,9 @@ def resolve_destination(
     return chosen, chosen / owner / name
 
 
-def resolve_file(*, directory: Path, root: Path, name: str) -> Path:
+def resolve_file(
+    *, directory: Path, root: Path, name: str, read_only: list[Path] | None = None
+) -> Path:
     """Where one file of a download lands. Refuses anything outside `root`.
 
     **The rule is calling #3 and it was stated rather than enforced.**
@@ -250,6 +306,9 @@ def resolve_file(*, directory: Path, root: Path, name: str) -> Path:
             "name that leaves the folder is refused rather than quietly changed.",
             code="PathTraversal",
         )
+    store = _in_store(candidate, read_only)
+    if store is not None:
+        raise _refuse_store(candidate, store)
     return candidate
 
 
@@ -694,6 +753,7 @@ class DownloadManager:
         roots: Callable[[], list[Path]],
         layout: Callable[[], str],
         concurrency: Callable[[], int],
+        read_only_roots: Callable[[], list[Path]] | None = None,
     ) -> None:
         if clients is None and client is None:
             raise ValueError("a download manager needs a hub client or the hub sources")
@@ -702,6 +762,7 @@ class DownloadManager:
         self._store = store
         self._scan_manager = scan_manager
         self._roots = roots
+        self._read_only_roots = read_only_roots or (lambda: [])
         self._layout = layout
         self._concurrency = concurrency
         self._jobs: dict[str, DownloadJob] = {}
@@ -779,6 +840,7 @@ class DownloadManager:
             root=spec.root,
             subdirectory=spec.subdirectory,
             layout=self._layout(),
+            read_only=self._read_only_roots(),
         )
 
         if spec.filename and len(spec.files) > 1:
@@ -793,7 +855,12 @@ class DownloadManager:
         # that arrives after `_file_metadata` is a refusal an operator
         # waits for.
         if spec.filename:
-            resolve_file(directory=directory, root=root, name=spec.filename)
+            resolve_file(
+                directory=directory,
+                root=root,
+                name=spec.filename,
+                read_only=self._read_only_roots(),
+            )
 
         revision = spec.revision or "main"
         # The hub, resolved once and recorded, so a resume asks the same one
@@ -809,7 +876,14 @@ class DownloadManager:
             entries.append(
                 DownloadFile(
                     path=repo_path,
-                    destinationPath=str(resolve_file(directory=directory, root=root, name=name)),
+                    destinationPath=str(
+                        resolve_file(
+                            directory=directory,
+                            root=root,
+                            name=name,
+                            read_only=self._read_only_roots(),
+                        )
+                    ),
                     sizeBytes=meta.size,
                     bytesDownloaded=0,
                     state=DownloadState.queued,

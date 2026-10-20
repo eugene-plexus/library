@@ -142,8 +142,8 @@ def test_a_config_file_of_folders_loads_and_is_not_rewritten_by_the_load(tmp_pat
     store.load()
 
     assert store.model_roots() == [Path("/data/mine")]
-    assert [f.model_dump() for f in store.library_folders()] == [
-        {"path": "/data/mine", "mounts": []}
+    assert [f.model_dump(exclude_none=True) for f in store.library_folders()] == [
+        {"path": "/data/mine", "mounts": [], "kind": "folder"}
     ]
     assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == written
 
@@ -251,4 +251,6 @@ def test_the_folders_are_a_resource_a_service_token_can_read(
 
     body = client.get("/v1/folders").json()
 
-    assert body == {"folders": [{"path": str(models_dir), "mounts": ["\\\\NAS\\models"]}]}
+    assert body == {
+        "folders": [{"path": str(models_dir), "mounts": ["\\\\NAS\\models"], "kind": "folder"}]
+    }

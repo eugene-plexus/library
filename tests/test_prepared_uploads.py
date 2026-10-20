@@ -282,7 +282,7 @@ def test_a_run_whose_library_folder_is_gone_writes_nothing(
     lease = _to_preparing(prepared_client)
     other = tmp_path / "another-folder"
     other.mkdir()
-    monkeypatch.setattr(prepared_client.app.state.config_store, "model_roots", lambda: [other])
+    monkeypatch.setattr(prepared_client.app.state.config_store, "writable_roots", lambda: [other])
     response = prepared_client.put(
         "/v1/run-operations/p/files",
         params={"path": "Strata-data/x.bin", "offset": 0, "lease": lease},

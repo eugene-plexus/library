@@ -202,10 +202,35 @@ def profile(
     return public(journal(request).change(id, ensure))
 
 
-def _adopt(roots: list[FilePath], body: PreparedRequest) -> tuple[FilePath, FilePath]:
+def _no_writable_folder() -> HTTPException:
+    return HTTPException(
+        409,
+        "The model is in an Ollama store, which the Library never writes to, and no other "
+        "Library folder is set up to hold what is prepared from it. Add a folder under "
+        "Library, Folders, then prepare it again.",
+    )
+
+
+def _adopt(
+    roots: list[FilePath], body: PreparedRequest, stores: list[FilePath] | None = None
+) -> tuple[FilePath, FilePath]:
     """Write the provenance file beside the prepared entry: `(file, its Library
-    folder)`. Blocking, so the route runs it in a thread."""
+    folder)`. Blocking, so the route runs it in a thread.
+
+    `roots` are the folders that may be written. A model from an Ollama store
+    (`stores`, CX9) is prepared on its node under the store's own path, and its
+    files were received into the first writable folder (`_preparing_folder`): the
+    entry is that folder's, at the same place under it."""
     entry = body.provenance.entry
+    for store in stores or []:
+        if prepared.is_absolute(entry) and is_within(entry, store):
+            if not roots:
+                raise _no_writable_folder()
+            entry = os.path.join(roots[0], os.path.relpath(entry, store))
+            body = body.model_copy(
+                update={"provenance": body.provenance.model_copy(update={"entry": entry})}
+            )
+            break
     root = next((r for r in roots if prepared.is_absolute(entry) and is_within(entry, r)), None)
     if root is None:
         raise HTTPException(
@@ -214,6 +239,12 @@ def _adopt(roots: list[FilePath], body: PreparedRequest) -> tuple[FilePath, File
             f"({', '.join(str(r) for r in roots) or 'none configured'}).",
         )
     folder = FilePath(entry).parent
+    if any(is_within(folder, store) for store in stores or []):
+        raise HTTPException(
+            409,
+            f"{folder} is in an Ollama model store, which the Library never writes to. "
+            "Nothing was written.",
+        )
     target = folder / f"{body.name}{prepared.SUFFIX}"
     written = prepared.written_entry(entry, folder)
     if not os.path.isfile(prepared.entry_path(target, written)):
@@ -253,8 +284,10 @@ async def prepared_model(
         raise HTTPException(409, "Run is not preparing a model")
     if body.provenance.engine.value != preparation["engine"]:
         raise HTTPException(409, "Run prepares for another engine")
-    roots = request.app.state.config_store.model_roots()
-    target, root = await asyncio.to_thread(_adopt, roots, body)
+    config = request.app.state.config_store
+    target, root = await asyncio.to_thread(
+        _adopt, config.writable_roots(), body, config.ollama_roots()
+    )
     store = request.app.state.state_store
     scans = getattr(request.app.state, "scan_manager", None)
     if scans is not None:
@@ -287,8 +320,17 @@ async def _preparing_folder(request: Request, id: str, node: str | None, lease: 
     if record["step"] != "preparing" or not record["intent"].get("preparation"):
         raise HTTPException(409, "Run is not preparing a model")
     root = (record.get("model") or {}).get("root")
-    roots = request.app.state.config_store.model_roots()
-    folder = next((r for r in roots if root and normalize(r) == normalize(root)), None)
+    config = request.app.state.config_store
+    if root and any(normalize(r) == normalize(root) for r in config.ollama_roots()):
+        # Ollama's store is never written to: what is prepared from its model goes to
+        # the first writable folder.
+        writable = config.writable_roots()
+        if not writable:
+            raise _no_writable_folder()
+        return FilePath(writable[0])
+    folder = next(
+        (r for r in config.writable_roots() if root and normalize(r) == normalize(root)), None
+    )
     if folder is None:
         raise HTTPException(
             409, f"The run's Library folder {root} is not one of the Library's folders now."

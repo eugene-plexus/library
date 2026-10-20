@@ -40,13 +40,14 @@ import copy
 import logging
 import re
 import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from . import _private_files, security
+from . import _private_files, ollama_detect, security
 from . import catalogue_sources as sources_mod
 from ._generated.models import (
     CatalogueSource,
@@ -58,15 +59,18 @@ from ._generated.models import (
     ConfigUpdateResult,
     ConfigValueType,
     LibraryFolder,
+    LibraryFolderKind,
 )
 from .folders import (
     as_models,
     coerce_folders,
+    folder_kind,
     folder_paths,
     folders_from_body,
     folders_from_paths,
     validate_folders,
 )
+from .paths import is_within, normalize
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +96,8 @@ FIELDS: list[ConfigField] = [
             "searched, and nothing is moved or copied. Downloads go to the first "
             "folder by default, and a node runs a model only from one of these "
             "folders.\n\n"
+            "A folder's `kind` is `folder`, or `ollama` for an Ollama model store, which "
+            "is never written to.\n\n"
             "Each folder can list its **mounts**, where other machines find it: one "
             "path for Linux and macOS nodes (`/mnt/models`) and one for Windows nodes "
             "(`\\\\NAS\\models`). A folder with no mounts is reached at its own path on other "
@@ -101,6 +107,20 @@ FIELDS: list[ConfigField] = [
         category="library",
         valueType=ConfigValueType.library_folders,
         default=[],
+    ),
+    ConfigField(
+        key="findOllama",
+        label="Show Ollama's models",
+        description=(
+            "The Library looks for Ollama's model store on its own machine and lists its "
+            "models, read-only.\n\n"
+            "They stay where Ollama keeps them, and Ollama still manages them. Turn this "
+            "off to hide them. A store somewhere else is added under Folders with the "
+            "kind `ollama`."
+        ),
+        category="library",
+        valueType=ConfigValueType.boolean,
+        default=True,
     ),
     ConfigField(
         key="scanOnStartup",
@@ -258,6 +278,7 @@ FIELDS: list[ConfigField] = [
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
 ROOTS_KEY = "modelRoots"
+DETECTION_SECONDS = 10.0
 DEFAULT_ROOTS_VARIABLE = "EUGENE_PLEXUS_LIBRARY_DEFAULT_MODEL_ROOTS"
 
 
@@ -429,6 +450,7 @@ class ConfigStore:
         # differs, and the schema says so (settings never lie, 2026-09-30).
         self._started: dict[str, Any] = dict(self._values)
         self._master_key = master_key
+        self._detected: tuple[float, Path | None] | None = None
 
     def _field_defaults(self) -> dict[str, Any]:
         return _defaults(default_roots=self._default_roots)
@@ -615,8 +637,8 @@ class ConfigStore:
         with self._lock:
             return self._values.get(key)
 
-    def model_roots(self) -> list[Path]:
-        """Configured folders as paths on this host.
+    def configured_roots(self) -> list[Path]:
+        """What `modelRoots` holds, as paths on this host.
 
         Junk is filtered rather than raised on: validation rejects it at
         PATCH time, and a hand-edited config file must not stop the
@@ -625,9 +647,73 @@ class ConfigStore:
         """
         return [Path(item).expanduser() for item in folder_paths(self.get(ROOTS_KEY))]
 
+    def found_ollama(self) -> Path | None:
+        """Ollama's own store on this machine, when `findOllama` is on and no
+        folder of kind `ollama` is configured (CX9-C2). Never written to the
+        config: turning the setting off is all it takes to remove it."""
+        if not self.get("findOllama"):
+            return None
+        configured = coerce_folders(self.get(ROOTS_KEY))
+        if any(folder_kind(f) == "ollama" for f in configured):
+            return None
+        found = self._detected_store()
+        if found is None:
+            return None
+        taken = {normalize(f["path"]) for f in configured}
+        return None if normalize(found) in taken else found
+
+    def _detected_store(self) -> Path | None:
+        """What detection found, kept for a few seconds: the roots are asked for
+        on every route, and a store on a share that has gone away must not be
+        stat'ed each time."""
+        now = time.perf_counter()
+        with self._lock:
+            cached = self._detected
+            if cached is not None and now - cached[0] < DETECTION_SECONDS:
+                return cached[1]
+        found = ollama_detect.find_store()
+        with self._lock:
+            self._detected = (now, found)
+        return found
+
+    def model_roots(self) -> list[Path]:
+        """Every folder the Library reads: the configured ones, then Ollama's
+        own store when it was found. For scanning and for "is this path in a
+        Library folder"; a place to *write* is `writable_roots`."""
+        found = self.found_ollama()
+        return [*self.configured_roots(), *([found] if found is not None else [])]
+
+    def ollama_roots(self) -> list[Path]:
+        """The folders that are Ollama stores: read-only, never written to."""
+        roots = [
+            Path(f["path"]).expanduser()
+            for f in coerce_folders(self.get(ROOTS_KEY))
+            if folder_kind(f) == "ollama"
+        ]
+        found = self.found_ollama()
+        return [*roots, *([found] if found is not None else [])]
+
+    def writable_roots(self) -> list[Path]:
+        """Where a download, a provenance file or a prepared model may be
+        written: every folder but an Ollama store, and none inside one."""
+        stores = self.ollama_roots()
+        roots: list[Path] = []
+        for f in coerce_folders(self.get(ROOTS_KEY)):
+            root = Path(f["path"]).expanduser()
+            if folder_kind(f) != "ollama" and not any(is_within(root, s) for s in stores):
+                roots.append(root)
+        return roots
+
     def library_folders(self) -> list[LibraryFolder]:
-        """The folders with their mounts, as the wire carries them."""
-        return as_models(self.get(ROOTS_KEY))
+        """The folders with their mounts, as the wire carries them: the
+        configured ones, then Ollama's own store when it was found."""
+        folders = as_models(self.get(ROOTS_KEY))
+        found = self.found_ollama()
+        if found is not None:
+            folders.append(
+                LibraryFolder(path=str(found), mounts=[], kind=LibraryFolderKind.ollama, found=True)
+            )
+        return folders
 
     def catalogue_enabled(self) -> bool:
         return bool(self.get("catalogueEnabled"))

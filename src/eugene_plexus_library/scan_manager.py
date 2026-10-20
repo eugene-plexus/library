@@ -33,6 +33,7 @@ import logging
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 from ._generated.models import Scan, ScanRoot, ScanState, SkippedPath
@@ -58,11 +59,13 @@ class ScanManager:
         *,
         roots: Callable[[], list[Path]],
         follow_symlinks: Callable[[], bool] | None = None,
+        ollama_roots: Callable[[], list[Path]] | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._store = store
         self._resolve_roots = roots
         self._resolve_follow_symlinks = follow_symlinks or (lambda: False)
+        self._resolve_ollama_roots = ollama_roots or (lambda: [])
         self._timeout = timeout_seconds
 
         self._lock = asyncio.Lock()
@@ -140,7 +143,9 @@ class ScanManager:
                 return self.snapshot()
 
             self._state = ScanState.scanning
-            self._task = asyncio.create_task(self._run(roots, full=full))
+            self._task = asyncio.create_task(
+                self._run(roots, full=full, ollama_roots=self._resolve_ollama_roots())
+            )
             return self.snapshot()
 
     async def cancel(self) -> Scan:
@@ -180,7 +185,7 @@ class ScanManager:
 
     # -- the walk -----------------------------------------------------------
 
-    async def _run(self, roots: list[Path], *, full: bool) -> None:
+    async def _run(self, roots: list[Path], *, full: bool, ollama_roots: list[Path]) -> None:
         try:
             scanner = Scanner(
                 cache_lookup=(None if full else self._store.lookup),
@@ -189,7 +194,8 @@ class ScanManager:
                 follow_symlinks=self._resolve_follow_symlinks(),
             )
             result = await asyncio.wait_for(
-                asyncio.to_thread(scanner.scan, roots), timeout=self._timeout
+                asyncio.to_thread(partial(scanner.scan, roots, ollama_roots=ollama_roots)),
+                timeout=self._timeout,
             )
         except TimeoutError:
             self._state = ScanState.failed

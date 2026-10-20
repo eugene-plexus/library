@@ -104,6 +104,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         state_store,
         roots=config_store.model_roots,
         follow_symlinks=lambda: bool(config_store.get("followSymlinks")),
+        ollama_roots=config_store.ollama_roots,
     )
     app.state.scan_manager = manager
 
@@ -118,7 +119,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         clients=hub_clients,
         store=state_store,
         scan_manager=manager,
-        roots=config_store.model_roots,
+        roots=config_store.writable_roots,
+        read_only_roots=config_store.ollama_roots,
         layout=config_store.download_layout,
         concurrency=config_store.max_concurrent_downloads,
     )
@@ -169,7 +171,7 @@ def _announce_default_roots(config_store: ConfigStore) -> None:
     if not config_store.roots_are_defaulted():
         log.info(
             "model directories are configured (%s); the environment's default (%s) is not in use",
-            ", ".join(str(r) for r in config_store.model_roots()),
+            ", ".join(str(r) for r in config_store.configured_roots()),
             ", ".join(roots),
         )
         return
