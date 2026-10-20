@@ -202,18 +202,19 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="guidanceContextLength",
-        label="Assumed context length",
+        label="Context to plan for",
         description=(
-            "The context size quant recommendations are calculated at, "
-            "when nothing else says. This is the number that decides "
-            "which quant gets recommended: the KV cache grows linearly "
-            "with it, so a model that fits comfortably at 8k may not fit "
-            "at all at 128k. A config field rather than a constant "
-            "because both answers are correct for different people."
+            "The context every fit verdict is judged at.\n\nIt applies to "
+            "Home's first model, Discover's list and the Library. Run on llama.cpp "
+            "never starts a model below it (or below the model's own, when that is "
+            "smaller), putting what the GPU cannot hold in system memory, as the "
+            "verdict said. The KV cache grows linearly with it, so a model that fits "
+            "comfortably at 8k may not fit at all at 128k. Discover can try another "
+            "number without changing this one."
         ),
         category="guidance",
         valueType=ConfigValueType.integer,
-        default=8192,
+        default=16384,
         minimum=256,
         maximum=1048576,
     ),
@@ -652,7 +653,7 @@ class ConfigStore:
 
     def guidance_context_length(self) -> int:
         value = self.get("guidanceContextLength")
-        return value if isinstance(value, int) and value > 0 else 8192
+        return value if isinstance(value, int) and value > 0 else 16384
 
     def _sealed(self, value: str | None) -> Any:
         """A secret as the file holds it: sealed when there is a master key."""
