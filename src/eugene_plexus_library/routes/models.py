@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -403,6 +404,7 @@ async def get_model(request: Request, model_id: str) -> LibraryModel:
 #: it is read once per file; a model replaced on disk is read again.
 _SPECIAL_CACHE: dict[tuple[str, int, int], list[str]] = {}
 _SPECIAL_CACHE_MAX = 64
+_SPECIAL_LOCK = threading.Lock()
 
 
 @router.get("/v1/models/{model_id}/special-tokens", response_model=SpecialTokens)
@@ -422,24 +424,30 @@ async def get_model_special_tokens(request: Request, model_id: str) -> SpecialTo
     path = Path(model.path)
 
     def read() -> list[str]:
-        try:
-            stat = path.stat()
-        except OSError:
-            return []
+        # A file that cannot be read is an error, never an empty list: the
+        # gateway would take "no spellings" as an answer and send this
+        # model's requests unescaped without a word (DI4 review).
+        stat = path.stat()
         key = (str(path), stat.st_mtime_ns, stat.st_size)
-        cached = _SPECIAL_CACHE.get(key)
+        with _SPECIAL_LOCK:
+            cached = _SPECIAL_CACHE.get(key)
         if cached is not None:
             return cached
-        try:
-            found = gguf.special_tokens(path)
-        except (OSError, gguf.GgufError):
-            return []
-        if len(_SPECIAL_CACHE) >= _SPECIAL_CACHE_MAX:
-            _SPECIAL_CACHE.pop(next(iter(_SPECIAL_CACHE)))
-        _SPECIAL_CACHE[key] = found
+        found = gguf.special_tokens(path)
+        with _SPECIAL_LOCK:
+            while len(_SPECIAL_CACHE) >= _SPECIAL_CACHE_MAX:
+                _SPECIAL_CACHE.pop(next(iter(_SPECIAL_CACHE)))
+            _SPECIAL_CACHE[key] = found
         return found
 
-    return SpecialTokens(tokens=await asyncio.to_thread(read))
+    try:
+        return SpecialTokens(tokens=await asyncio.to_thread(read))
+    except (OSError, gguf.GgufError) as exc:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Vocabulary unreadable",
+            f"Could not read the vocabulary of {path.name}: {exc}",
+        ) from exc
 
 
 @router.delete(

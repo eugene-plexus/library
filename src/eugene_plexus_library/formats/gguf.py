@@ -792,6 +792,30 @@ _SPECIAL_TYPES = frozenset({2, 3, 4})
 #: What a markup spelling holds: `< > [ ] |`, or DeepSeek's full-width bar.
 _MARKUP = frozenset("<>[]|\uff5c")
 _VOCAB = frozenset({"tokenizer.ggml.tokens", "tokenizer.ggml.token_type"})
+#: Turn and end-of-generation spellings llama.cpp treats as control tokens at
+#: load whatever type a GGUF gives them (`llama-vocab.cpp`, the end-of-turn
+#: override): a community GGUF that types them normal is still read with
+#: them as specials. Listed whenever the vocabulary holds them.
+_TURN_SPELLINGS = frozenset(
+    {
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "<|eot_id|>",
+        "<|eom_id|>",
+        "<|start_header_id|>",
+        "<|end_header_id|>",
+        "<|end|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|system|>",
+        "<|return|>",
+        "<|call|>",
+        "<start_of_turn>",
+        "<end_of_turn>",
+    }
+)
 
 
 def special_tokens(path: Path) -> list[str]:
@@ -813,9 +837,14 @@ def special_tokens(path: Path) -> list[str]:
         token
         for token, kind in zip(tokens, types, strict=False)
         if isinstance(token, str)
-        and kind in _SPECIAL_TYPES
-        and len(token) >= 3
-        and not token.isspace()
-        and any(c in _MARKUP for c in token)
+        and (
+            token in _TURN_SPELLINGS
+            or (
+                kind in _SPECIAL_TYPES
+                and len(token) >= 3
+                and not token.isspace()
+                and any(c in _MARKUP for c in token)
+            )
+        )
     }
     return sorted(found, key=lambda t: (-len(t), t))

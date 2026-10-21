@@ -83,12 +83,25 @@ def test_the_route_answers_a_models_spellings(client: TestClient, tmp_path: Path
     assert client.get("/v1/models/nope/special-tokens").status_code == 404
 
 
-def test_a_file_that_is_not_a_readable_gguf_has_none(client: TestClient, tmp_path: Path) -> None:
+def test_a_turn_spelling_typed_normal_is_still_listed(tmp_path: Path) -> None:
+    """llama.cpp makes `<|im_end|>` a control token at load whatever the GGUF
+    says, so a mis-typed community file is escaped all the same."""
+    path = write_gguf(
+        tmp_path / "m.gguf",
+        {
+            "tokenizer.ggml.tokens": [f"tok{i}" for i in range(600)] + ["<|im_end|>", "<b>"],
+            "tokenizer.ggml.token_type": [NORMAL] * 602,
+        },
+    )
+    assert gguf.special_tokens(path) == ["<|im_end|>"]
+
+
+def test_a_file_that_is_not_a_readable_gguf_is_an_error(client: TestClient, tmp_path: Path) -> None:
     path = tmp_path / "models" / "broken.gguf"
     path.parent.mkdir(parents=True)
     path.write_bytes(b"not a gguf")
     model = _model(path, size=10)
     client.app.state.state_store.replace_models([model], scanned_at=datetime.now(UTC))  # type: ignore[attr-defined]
     response = client.get(f"/v1/models/{model.id}/special-tokens")
-    assert response.status_code == 200, response.text
-    assert response.json() == {"tokens": []}
+    assert response.status_code == 503, response.text
+    assert "broken.gguf" in response.text
