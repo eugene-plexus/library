@@ -1670,11 +1670,9 @@ class OllamaDetail(BaseModel):
     """
     A model read from an Ollama store (CX9): which of Ollama's names
     point at this file. Present only for a model in a folder of kind
-    `ollama`. Its `name` is the tag it was first listed under,
-    while that tag exists. If it disappears, take the first remaining
-    tag and log the change. Adding a tag never renames a model.
-    `Runtime.modelAlias` is set to `name`, since the file's own name
-    is a hash. Ollama manages the file: the library never writes or
+    `ollama`. Its `name` is the first of `tags`, and is what
+    `Runtime.modelAlias` is set to, since the file's own name is a
+    hash. Ollama manages the file: the library never writes or
     deletes it.
 
     """
@@ -1687,162 +1685,6 @@ class OllamaDetail(BaseModel):
     needsMigration: bool | None = Field(
         None,
         description='Its family is one Ollama rewrites for llama.cpp\n(`compatmigrate`) and this file is the older layout, so\nupstream llama.cpp may not load it until Ollama has updated\nit. Run is not refused for it.\n',
-    )
-
-
-class Method(StrEnum):
-    link = 'link'
-    copy = 'copy'
-
-
-class OllamaKept(BaseModel):
-    """
-    Provenance stored against the kept file's path and reapplied on
-    scans. The ordinary Library model keeps `servedName` as `name`
-    and `Runtime.modelAlias`, even if Ollama removes every tag.
-    The Library never opens a kept file for writing: a link shares
-    Ollama's bytes. A node only holds a copy of this Library file.
-
-    """
-
-    servedName: str
-    tags: list[str] = Field(..., min_length=1)
-    digest: str = Field(
-        ...,
-        description="Ollama's weights digest, used to verify copies and match a node's blob.",
-        pattern='^sha256:[0-9a-f]{64}$',
-    )
-    store: str = Field(
-        ..., description='Absolute path of the source Ollama store on its machine.'
-    )
-    node: str | None = Field(
-        None,
-        description="Source machine for a remote Keep; absent for the Library's own machine.",
-    )
-    keptAt: AwareDatetime
-    method: Method
-
-
-class KeepRequest(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    folder: str | None = Field(
-        None,
-        description="A configured writable Library folder's path. Omit for the\nfirst writable folder. Neither its lexical path nor its\nreal path, including the target's existing parents, may be\ninside an Ollama store.\n",
-    )
-
-
-class NodeOllamaKeepRequest(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    digest: str = Field(
-        ...,
-        description="The weights digest from this machine's reported model.",
-        pattern='^sha256:[0-9a-f]{64}$',
-    )
-    folder: str | None = Field(
-        None,
-        description='Configured writable Library folder; omitted means the first writable folder.',
-    )
-
-
-class State(StrEnum):
-    running = 'running'
-    done = 'done'
-    failed = 'failed'
-    cancelled = 'cancelled'
-
-
-class Method1(StrEnum):
-    """
-    Actual method; copy if any file needs copying, including every remote Keep.
-    """
-
-    link = 'link'
-    copy = 'copy'
-
-
-class Role1(StrEnum):
-    """
-    A file selected by the job's accepted report, never a supplied path.
-    """
-
-    weights = 'weights'
-    projector = 'projector'
-
-
-class KeepFileRequest(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    role: Role1 = Field(
-        ...,
-        description="A file selected by the job's accepted report, never a supplied path.",
-    )
-
-
-class Role2(StrEnum):
-    weights = 'weights'
-    projector = 'projector'
-
-
-class KeepFileState(BaseModel):
-    role: Role2
-    receivedBytes: int = Field(
-        ..., description='Contiguous partial bytes received; 0 after completion.', ge=0
-    )
-    sizeBytes: int | None = Field(
-        ...,
-        description="Complete verified file's size; null while still arriving.",
-        ge=0,
-    )
-    sha256: str | None = Field(
-        ...,
-        description="Complete verified file's SHA-256, without the prefix; null while arriving.",
-        pattern='^[0-9a-f]{64}$',
-    )
-
-
-class OllamaReportedModel(BaseModel):
-    """
-    Metadata from a worker's manifest. This is not a Library model
-    and cannot be run until Keep creates one. Size is the weights
-    blob alone; add projectorSizeBytes for the whole transfer.
-
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    tags: list[str] = Field(
-        ...,
-        description='Sorted Ollama tags for this blob, including namespace or registry when present.',
-        min_length=1,
-    )
-    digest: str = Field(..., pattern='^sha256:[0-9a-f]{64}$')
-    sizeBytes: int = Field(..., ge=0)
-    runner: str = Field(..., description="The manifest reader's runner classification.")
-    projectorDigest: str | None = Field(None, pattern='^sha256:[0-9a-f]{64}$')
-    projectorSizeBytes: int | None = Field(None, ge=0)
-    architecture: str | None = Field(
-        None, description='Architecture read from the GGUF header, when available.'
-    )
-    needsMigration: bool | None = None
-    libraryModel: str | None = Field(
-        None,
-        description='Added by the Library on reads when it already holds this\ndigest; the id of that Library model. Not trusted from a report.\n',
-    )
-
-
-class OllamaSkippedModel(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    name: str
-    detail: str = Field(
-        ..., description='The observed cause for skipping this manifest or model.'
     )
 
 
@@ -2096,24 +1938,15 @@ class PreparedFactMissing(BaseModel):
     reason: str
 
 
-class RecommendedSampling(BaseModel):
+class RecommendedSamplingSource(StrEnum):
     """
-    Sampling parameters the model's author put in the file
-    (`general.sampling.*` in GGUF). **Reported, never applied.**
-
-    The locked rule is that the gateway owns every
-    LLM-output-affecting parameter and no component substitutes a
-    local default; that rule is unchanged. But the file having an
-    opinion is real information, and dropping it means the operator
-    has to go read the model card to find out. Whether anything can
-    adopt these with one click is a gateway decision, not a library
-    one.
+    Where the author stated the sampling values: `general.sampling.*`
+    in a GGUF file, or a safetensors model's `generation_config.json`.
 
     """
 
-    temperature: float | None = None
-    topK: int | None = None
-    topP: float | None = None
+    gguf = 'gguf'
+    generation_config = 'generation_config'
 
 
 class SpecialTokens(BaseModel):
@@ -3235,29 +3068,6 @@ class DirectoryEntry(BaseModel):
     )
 
 
-class OllamaReportedStore(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    path: str
-    models: list[OllamaReportedModel] = Field(..., max_length=2000)
-    skipped: list[OllamaSkippedModel]
-    error: str | None = Field(
-        None,
-        description='Why this store could not be read. Keep it listed with empty models and this cause.',
-    )
-
-
-class NodeOllamaReport(BaseModel):
-    node: str
-    readAt: AwareDatetime
-    stores: list[OllamaReportedStore]
-
-
-class NodeOllamaList(BaseModel):
-    nodes: list[NodeOllamaReport]
-
-
 class ModelFile(BaseModel):
     """
     One file belonging to a model, and what part it plays.
@@ -3284,41 +3094,6 @@ class DraftFile(BaseModel):
     )
     kind: DraftKind
     sizeBytes: int | None = Field(None, ge=0)
-
-
-class SafetensorsDetail(BaseModel):
-    """
-    Safetensors-specific metadata. Present iff `format` is
-    `safetensors`. **No quant tier** — a safetensors model is
-    sized, not tiered. The one exception to "no quant fields" is
-    `mlxQuantization` below, which is a conversion marker rather
-    than a tier: it says which loader the directory was prepared
-    for, not how good the weights are.
-
-    """
-
-    mlxQuantization: MlxQuantization | None = None
-    dtype: str | None = Field(
-        None,
-        description='Dominant tensor dtype as the header declares it, e.g.\n`"BF16"`, `"F16"`, `"F32"`. The nearest thing to a quant\ntier here, and it is a precision rather than a scheme.\n',
-    )
-    shardCount: int | None = Field(
-        None,
-        description='Number of `model-0000N-of-0000M.safetensors` files. Unlike\nGGUF, all of them are loaded together and none is "the"\nfile — the directory is the model.\n',
-        ge=1,
-    )
-    repoId: str | None = Field(
-        None,
-        description='HuggingFace repo this came from, e.g.\n`"sentence-transformers/all-MiniLM-L6-v2"`, when the layout\nsays so (a `models--<org>--<name>` cache directory, or\n`config.json` naming it).\n',
-    )
-    revision: str | None = Field(
-        None,
-        description="Snapshot revision, when the model sits in a HuggingFace\ncache. Those caches hold **one directory per revision**, so\nwithout this two snapshots of one model are two\nindistinguishable entries. The revision named by the\ncache's own `refs/main` is the current one; the others are\nreported as skipped older revisions rather than as models.\n",
-    )
-    configPath: str | None = Field(
-        None,
-        description='Absolute path to `config.json`, the file that made this a model.',
-    )
 
 
 class PreparedDetail(BaseModel):
@@ -3420,6 +3195,30 @@ class PreparedModelRequest(BaseModel):
     )
 
 
+class RecommendedSampling(BaseModel):
+    """
+    Sampling parameters the model's author put in the file
+    (`general.sampling.*` in GGUF or `generation_config.json` for
+    safetensors), applied by the gateway as defaults when neither
+    the request nor the default profile sets a value. Author values
+    also apply when the model has no profile. A default profile with
+    `authorSampling: false` turns them off.
+
+    The Library only reports these values. The gateway owns and
+    sends every sampling value, falling back to its own defaults
+    when no request, profile or enabled author value exists. An
+    inference driver never substitutes its own defaults. The author's
+    repeat penalty is not applied.
+
+    """
+
+    temperature: float | None = None
+    topK: int | None = None
+    topP: float | None = None
+    minP: float | None = Field(None, ge=0.0, le=1.0)
+    source: RecommendedSamplingSource | None = None
+
+
 class ProfileBuiltBy(BaseModel):
     """
     What the settings builder set on a profile, and what it measured,
@@ -3481,9 +3280,15 @@ class ModelProfile(BaseModel):
     )
     name: str
     default: bool
+    authorSampling: bool | None = Field(
+        True,
+        description="Whether to use the model author's sampling for omitted\nvalues, as saved (`ModelProfileSpec.authorSampling`). Absent\nmeans true for stored profiles.\n",
+    )
     maxTokens: int | None = Field(None, ge=1)
     temperature: float | None = Field(None, ge=0.0, le=2.0)
     topP: float | None = Field(None, ge=0.0, le=1.0)
+    topK: int | None = Field(None, ge=0)
+    minP: float | None = Field(None, ge=0.0, le=1.0)
     engine: EngineKind
     mode: ProfileMode | None = Field(
         None,
@@ -3735,19 +3540,15 @@ class QuantTable(BaseModel):
     )
 
 
-class LibraryFolderStatus(LibraryFolder):
-    readOnly: bool | None = Field(
-        None,
-        description='Effective write protection. True for Ollama stores and\nfolders whose real path resolves inside a store,\nincluding symlinks and Windows junctions. They are\nexcluded from the writable folder list.\n',
-    )
-    readOnlyReason: str | None = Field(
-        None,
-        description="The same sentence as ReadOnlyFolder's detail: names\nthe configured path, the Ollama store it resolves into,\nand says to choose another folder. Ollama manages its\nfiles and the Library never writes there.\n",
-    )
-    error: str | None = Field(
-        None,
-        description='Observed cause when a detected store cannot be read; it stays listed.',
-    )
+class LibraryFolderList(BaseModel):
+    """
+    The folders the library catalogues, as `GET /v1/folders` answers
+    them — the same objects `modelRoots` holds, one shape on the
+    wire whatever shape the config was given in.
+
+    """
+
+    folders: list[LibraryFolder]
 
 
 class InputAudioContentPart(BaseModel):
@@ -3981,20 +3782,6 @@ class DirectoryListing(BaseModel):
     )
 
 
-class OllamaReport(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    stores: list[OllamaReportedStore] = Field(
-        ...,
-        description='All detected stores; at most 2,000 models in total across this list.',
-    )
-    readAt: AwareDatetime = Field(
-        ...,
-        description='When the agent read this listing, never when the UI last fetched it.',
-    )
-
-
 class ModelDeletion(BaseModel):
     """
     What deleting a model would do, read now (LS8).
@@ -4045,6 +3832,45 @@ class GgufSpeculation(BaseModel):
     )
 
 
+class SafetensorsDetail(BaseModel):
+    """
+    Safetensors-specific metadata. Present iff `format` is
+    `safetensors`. **No quant tier** — a safetensors model is
+    sized, not tiered. The one exception to "no quant fields" is
+    `mlxQuantization` below, which is a conversion marker rather
+    than a tier: it says which loader the directory was prepared
+    for, not how good the weights are.
+
+    """
+
+    mlxQuantization: MlxQuantization | None = None
+    dtype: str | None = Field(
+        None,
+        description='Dominant tensor dtype as the header declares it, e.g.\n`"BF16"`, `"F16"`, `"F32"`. The nearest thing to a quant\ntier here, and it is a precision rather than a scheme.\n',
+    )
+    shardCount: int | None = Field(
+        None,
+        description='Number of `model-0000N-of-0000M.safetensors` files. Unlike\nGGUF, all of them are loaded together and none is "the"\nfile — the directory is the model.\n',
+        ge=1,
+    )
+    repoId: str | None = Field(
+        None,
+        description='HuggingFace repo this came from, e.g.\n`"sentence-transformers/all-MiniLM-L6-v2"`, when the layout\nsays so (a `models--<org>--<name>` cache directory, or\n`config.json` naming it).\n',
+    )
+    revision: str | None = Field(
+        None,
+        description="Snapshot revision, when the model sits in a HuggingFace\ncache. Those caches hold **one directory per revision**, so\nwithout this two snapshots of one model are two\nindistinguishable entries. The revision named by the\ncache's own `refs/main` is the current one; the others are\nreported as skipped older revisions rather than as models.\n",
+    )
+    configPath: str | None = Field(
+        None,
+        description='Absolute path to `config.json`, the file that made this a model.',
+    )
+    recommendedSampling: RecommendedSampling | None = Field(
+        None,
+        description='Author sampling from `generation_config.json`, reported only\nwhen `do_sample` is true. Greedy decoding contributes no\nsampling defaults.\n',
+    )
+
+
 class ModelProfileList(BaseModel):
     profiles: list[ModelProfile]
 
@@ -4068,7 +3894,11 @@ class ModelProfileSpec(BaseModel):
     )
     default: bool | None = Field(
         False,
-        description='The profile offered first when launching this model.\nIts maxTokens, temperature and topP also supply omitted\ngeneration parameters at the gateway, without restarting\nan existing runtime. Explicit request values always win.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
+        description='The profile offered first when launching this model.\nIts maxTokens, temperature, topP, topK and minP also supply\nomitted generation parameters at the gateway, without\nrestarting an existing runtime. Explicit request values\nalways win.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
+    )
+    authorSampling: bool | None = Field(
+        True,
+        description="Use the model author's sampling where this default profile\nand the request set none. Absent means true, including for\nstored profiles; no storage migration is needed. Author\nvalues also apply when the model has no profile. False skips\nauthor values, so the gateway uses its own defaults where\nthe request and profile set none.\n",
     )
     maxTokens: int | None = Field(
         None,
@@ -4083,7 +3913,18 @@ class ModelProfileSpec(BaseModel):
     )
     topP: float | None = Field(
         None,
-        description='Nucleus sampling cutoff when omitted by the caller. Absent leaves it unspecified.',
+        description='Nucleus sampling cutoff when omitted by the caller. Absent uses enabled author values, then the gateway default.',
+        ge=0.0,
+        le=1.0,
+    )
+    topK: int | None = Field(
+        None,
+        description='Sample from only the K most likely tokens when omitted by\nthe caller; 0 disables the cut. Absent uses enabled author\nvalues, then the gateway default.\n',
+        ge=0,
+    )
+    minP: float | None = Field(
+        None,
+        description='Discard tokens less likely than this fraction of the most\nlikely token when omitted by the caller. Absent uses enabled\nauthor values, then the gateway default.\n',
         ge=0.0,
         le=1.0,
     )
@@ -4414,18 +4255,6 @@ class Download(BaseModel):
     )
 
 
-class LibraryFolderList(BaseModel):
-    """
-    The folders the library catalogues, as `GET /v1/folders` answers
-    them: `modelRoots` and detected stores, with effective read-only
-    status and any observed read error. Derived status is never saved
-    in config.
-
-    """
-
-    folders: list[LibraryFolderStatus]
-
-
 class EngineFitModel(BaseModel):
     """
     How one engine uses memory, declared by its adapter beside `accepts`
@@ -4691,7 +4520,7 @@ class LibraryModel(BaseModel):
     format: ModelFormat
     name: str = Field(
         ...,
-        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. An Ollama model keeps\nthe tag it was first listed under while that tag exists;\nif it disappears, use the first remaining tag and log the\nchange. A kept copy retains `keptFrom.servedName`.\n**Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
+        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`, or the first Ollama tag\nfor a model in an Ollama store. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
     )
     displayName: str | None = Field(
         None,
@@ -4736,7 +4565,6 @@ class LibraryModel(BaseModel):
     kev: KevCheckpointDetail | None = None
     prepared: PreparedDetail | None = None
     ollama: OllamaDetail | None = None
-    keptFrom: OllamaKept | None = None
     profileCount: int | None = Field(
         None,
         description='How many launch profiles are saved against this model. On\nthe list so the browser can badge a tuned model without\nfetching every profile collection.\n',
@@ -4764,46 +4592,6 @@ class LibraryModel(BaseModel):
     error: str | None = Field(
         None,
         description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
-    )
-
-
-class KeepJob(BaseModel):
-    """
-    One Keep, with progress across the weights and any projector.
-    `done` means the files are verified, scanned and have `keptFrom`.
-    Local profiles move automatically only after a `same` fingerprint
-    match; Keep is the consent, and the served name stays unchanged.
-    Failure names its observed cause in `error`; a failed or cancelled
-    job never removes Ollama's file. Records contain no credentials.
-
-    """
-
-    id: str
-    model: LibraryModel | None = Field(
-        ...,
-        description='The ordinary Library model when done; null before it has been listed.',
-    )
-    state: State
-    method: Method1 = Field(
-        ...,
-        description='Actual method; copy if any file needs copying, including every remote Keep.',
-    )
-    bytesDone: int = Field(..., ge=0)
-    bytesTotal: int = Field(..., ge=0)
-    target: str = Field(
-        ..., description="Absolute destination weights path on the Library's machine."
-    )
-    error: str | None = Field(
-        ..., description='Observed cause when failed; null otherwise.'
-    )
-    note: str | None = Field(
-        None,
-        description='Why a copy was needed after a link failed; names the observed cause.',
-    )
-    digest: str = Field(..., pattern='^sha256:[0-9a-f]{64}$')
-    node: str | None = Field(
-        None,
-        description='Source agent assigned to a remote transfer; absent for a local Keep.',
     )
 
 
