@@ -33,6 +33,13 @@ the redirect *body* to disk. Non-LFS files answer **307** to an internal
 `Temporary Redirect. Redirecting to …` is what lands where `config.json`
 was meant to be.
 
+A renamed repo is a third redirect, in front of both: the old name
+answers **307** to the same path under the new name, with none of the
+metadata, for the API calls and for `resolve` alike (`ggml-org/models`
+became `ggml-org/models-moved` on 2026-10-20). The hub's own redirects
+carry `X-Repo-Commit` and a rename's does not, so a same-hub redirect
+without it is followed (`_send`) and every other one is left alone.
+
 ## Trap 3 — the CDN URL expires
 
 `…?Expires=1788926395&Policy=…&Signature=…`. A downloader that stores
@@ -87,6 +94,8 @@ UI re-rendering a screen does not re-spend the API budget."""
 CACHE_MAX_ENTRIES = 256
 
 REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+
+RENAME_HOPS = 3
 
 TRANSFER_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0)
 """Separate from `REQUEST_TIMEOUT`: a stalled *transfer* needs a longer
@@ -417,6 +426,28 @@ class HubClient:
             headers.update(extra)
         return headers
 
+    async def _send(self, method: str, url: str, headers: dict[str, str]) -> httpx.Response:
+        """One request, past a renamed repo's redirect (Trap 2's third
+        redirect) and no other: the hub's own carry `X-Repo-Commit`."""
+        response = await self._client.request(method, url, headers=headers)
+        for _ in range(RENAME_HOPS):
+            location = response.headers.get("Location")
+            if (
+                response.status_code not in (301, 302, 307, 308)
+                or not location
+                or "X-Repo-Commit" in response.headers
+            ):
+                break
+            target = response.url.join(location)
+            if (target.scheme, target.host, target.port) != (
+                response.url.scheme,
+                response.url.host,
+                response.url.port,
+            ):
+                break
+            response = await self._client.request(method, str(target), headers=headers)
+        return response
+
     def _require_enabled(self) -> None:
         if not self._enabled:
             raise CatalogueDisabled()
@@ -474,7 +505,7 @@ class HubClient:
             if hit is not None:
                 return hit[0]
         try:
-            response = await self._client.get(url, headers=self._headers())
+            response = await self._send("GET", url, self._headers())
         except httpx.HTTPError as exc:
             raise HubError(
                 f"Could not reach {self._base_url} for {what} ({exc}). The catalogue needs "
@@ -736,7 +767,7 @@ class HubClient:
         self._require_enabled()
         url = self.resolve_url(repo, revision=revision, path=path)
         try:
-            response = await self._client.head(url, headers=self._headers())
+            response = await self._send("HEAD", url, self._headers())
         except httpx.HTTPError as exc:
             raise HubError(f"Could not resolve {path!r} in {repo!r} ({exc}).", status=503) from exc
 

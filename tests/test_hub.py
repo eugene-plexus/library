@@ -130,6 +130,58 @@ async def test_head_reads_the_metadata_off_the_302() -> None:
     assert resolved.accept_ranges is True
 
 
+async def test_a_renamed_repo_is_followed_to_its_new_name() -> None:
+    """`ggml-org/models` became `ggml-org/models-moved` (2026-10-20): the
+    old name answers 307 with none of the metadata, for the API and for
+    `resolve`. Reading it as the answer failed the CX3 run's download."""
+    digest = "9aec857937849d976f30397e97eb1cabb53eb9dcb1ce4611ba8247fb5f44c65d"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "/old/" in path:
+            moved = path.replace("/old/", "/old-moved/")
+            return httpx.Response(307, headers={"Location": moved}, text="Temporary Redirect.")
+        if path.startswith("/api/"):
+            return httpx.Response(200, json=TREE)
+        return httpx.Response(
+            302,
+            headers={
+                "Location": "https://cdn.example/abc",
+                "X-Linked-Size": "19077344",
+                "X-Linked-ETag": f'"{digest}"',
+                "X-Repo-Commit": "499bc8821c6b12b4e53c5bffcb21ec206f212d81",
+            },
+        )
+
+    client = client_for(handler)
+    assert len(await client.tree("org/old")) == 2
+    resolved = await client.head_file(repo="org/old", revision="main", path="m.gguf")
+    assert resolved.size == 19_077_344
+    assert resolved.sha256 == digest
+    assert resolved.commit == "499bc8821c6b12b4e53c5bffcb21ec206f212d81"
+
+
+async def test_only_a_rename_on_the_same_hub_is_followed() -> None:
+    """The hub's own redirects carry `X-Repo-Commit` (Trap 2), and a
+    redirect to another host is not a rename."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if request.url.path.endswith("cache.json"):
+            return httpx.Response(
+                307,
+                headers={"Location": "/api/resolve-cache/x", "X-Repo-Commit": "abc"},
+            )
+        return httpx.Response(307, headers={"Location": "https://elsewhere.example/m.gguf"})
+
+    client = client_for(handler)
+    cached = await client.head_file(repo="org/repo", revision="main", path="cache.json")
+    assert cached.commit == "abc"
+    await client.head_file(repo="org/repo", revision="main", path="m.gguf")
+    assert all(url.startswith("https://hub.example/org/repo/") for url in seen)
+
+
 async def test_a_cdn_style_etag_is_not_mistaken_for_a_digest() -> None:
     """Only a 64-hex `X-Linked-ETag` is the sha256. Anything else is some
     other hash of some other thing."""
