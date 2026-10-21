@@ -4,7 +4,9 @@ import errno
 import hashlib
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -74,6 +76,7 @@ def test_keep_links_same_volume(kept_setup):
     assert job["method"] == "link"
     target = Path(job["target"])
     assert os.path.samefile(source, target)
+    assert not list(target.parent.glob("*.partial.keep"))
     source.unlink()
     assert target.is_file()
 
@@ -89,6 +92,7 @@ def test_keep_copies_and_checks_digest(kept_setup, monkeypatch):
     assert job["state"] == "done", job
     assert job["method"] == "copy"
     assert Path(job["target"]).read_bytes() == source.read_bytes()
+    assert not list(Path(job["target"]).parent.glob("*.partial.keep"))
     assert "different drives" in job["note"]
 
 
@@ -100,6 +104,7 @@ def test_keep_bad_digest_keeps_nothing(kept_setup):
     assert "SHA-256" in job["error"]
     assert not list(root.rglob("*.gguf"))
     assert not list(root.rglob("*.partial"))
+    assert not list(root.rglob("*.partial.keep"))
 
 
 def test_keep_moves_profiles_and_keeps_name(kept_setup):
@@ -260,6 +265,7 @@ def test_worker_upload_uses_only_reserved_role_and_own_token(remote_setup, insta
     )
     done = client.get(f"/v1/keep-jobs/{job['id']}", headers=session).json()
     assert done["state"] == "done", done
+    assert not list(root.rglob("*.partial.keep"))
     assert done["model"]["keptFrom"]["node"] == "far"
     assert done["model"]["name"] == "llama3:8b"
     assert Path(done["target"]).is_relative_to(root)
@@ -282,6 +288,7 @@ def test_worker_upload_digest_mismatch_fails_without_publishing(remote_setup):
     assert "SHA-256" in response.text
     assert client.get(f"/v1/keep-jobs/{job['id']}", headers=session).json()["state"] == "failed"
     assert not list(root.rglob("*.gguf")) and not list(root.rglob("*.partial"))
+    assert not list(root.rglob("*.partial.keep"))
 
 
 def test_report_limits_are_enforced_before_replacing(remote_setup):
@@ -330,6 +337,8 @@ def test_upload_refuses_new_junction_into_store(remote_setup, tmp_path, director
         headers=session,
     )
     assert patched.status_code == 200
+    if (root / "ollama").exists():
+        (root / "ollama").rename(root / "old-ollama")
     directory_link(root / "ollama", store)
     response = client.put(
         f"/v1/keep-jobs/{job['id']}/files",
@@ -357,6 +366,7 @@ def test_cancelled_remote_keep_removes_only_partial(remote_setup):
     assert list(root.rglob("*.partial"))
     assert client.delete(base, headers=session).json()["state"] == "cancelled"
     assert not list(root.rglob("*.partial"))
+    assert not list(root.rglob("*.partial.keep"))
     assert (
         client.put(
             base + "/files", params={"role": "weights", "offset": 0}, content=data, headers=headers
@@ -368,7 +378,7 @@ def test_cancelled_remote_keep_removes_only_partial(remote_setup):
 def test_upload_never_opens_a_shared_inode_for_writing(remote_setup, tmp_path):
     client, job, data, headers, _, _ = remote_setup
     target = Path(job["target"])
-    target.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
     source = tmp_path / "already-kept.gguf"
     source.write_bytes(data)
     os.link(source, target.with_name(target.name + ".partial"))
@@ -383,9 +393,6 @@ def test_upload_never_opens_a_shared_inode_for_writing(remote_setup, tmp_path):
 
 
 def test_reservations_are_atomic(kept_setup):
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-
     from eugene_plexus_library.keep import KeepError
 
     client, model, _, _, _, _ = kept_setup
@@ -423,6 +430,179 @@ def test_reservations_are_atomic(kept_setup):
     assert len(keeps.jobs) == 1
 
 
+@pytest.mark.parametrize("action", ["cancel", "fail"])
+def test_cleanup_blocks_retry_until_finished(kept_setup, monkeypatch, action):
+    client, model, _, _, _, _ = kept_setup
+    keeps = client.app.state.keeps
+    source = keeps.store.get_model(model["id"])
+    old = keeps.local(source, None)
+    cleaning, release, attempted = threading.Event(), threading.Event(), threading.Event()
+    acquired_without_wait = []
+    original_lock, cleanup = keeps.lock, keeps.cleanup
+
+    class ObservedLock:
+        def __enter__(self):
+            if threading.current_thread().name.startswith("keep-retry"):
+                acquired = original_lock.acquire(blocking=False)
+                acquired_without_wait.append(acquired)
+                attempted.set()
+                if acquired:
+                    return self
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, *args):
+            original_lock.release()
+
+    def paused_cleanup(job):
+        cleaning.set()
+        assert release.wait(5)
+        cleanup(job)
+
+    def terminate():
+        if action == "cancel":
+            keeps.cancel(old)
+        else:
+            keeps.fail(old, "transfer failed")
+
+    def retry():
+        job = keeps.local(source, None)
+        keeps.write(job, job.files["weights"], 0, b"new")
+        return job
+
+    monkeypatch.setattr(keeps, "lock", ObservedLock())
+    monkeypatch.setattr(keeps, "cleanup", paused_cleanup)
+    with (
+        ThreadPoolExecutor(1) as terminator,
+        ThreadPoolExecutor(1, thread_name_prefix="keep-retry") as retries,
+    ):
+        ending = terminator.submit(terminate)
+        try:
+            assert cleaning.wait(5)
+            retrying = retries.submit(retry)
+            assert attempted.wait(5)
+            if acquired_without_wait[0]:
+                # Without the reservation lock, write the retry before old cleanup resumes.
+                retrying.result(timeout=5)
+        finally:
+            release.set()
+        ending.result(timeout=5)
+        new = retrying.result(timeout=5)
+    assert new.files["weights"].partial.read_bytes() == b"new"
+    assert acquired_without_wait == [False]
+
+
+def test_reservations_exclude_aliased_folders(kept_setup, tmp_path, directory_link, monkeypatch):
+    from eugene_plexus_library.keep import KeepError
+
+    client, model, _, root, _, _ = kept_setup
+    keeps = client.app.state.keeps
+    alias = tmp_path / "alias"
+    directory_link(alias, root)
+    monkeypatch.setattr(keeps.config, "writable_roots", lambda: [root, alias])
+    source = keeps.store.get_model(model["id"])
+    first = keeps.local(source, str(root))
+    assert not first.files["weights"].partial.exists()
+    with pytest.raises(KeepError, match="already being kept"):
+        keeps.local(source, str(alias))
+
+
+def test_failure_after_cancel_does_not_remove_retry_partial(kept_setup):
+    client, model, _, _, _, _ = kept_setup
+    keeps = client.app.state.keeps
+    source = keeps.store.get_model(model["id"])
+    old = keeps.local(source, None)
+    keeps.cancel(old)
+    new = keeps.local(source, None)
+    keeps.write(new, new.files["weights"], 0, b"new")
+    keeps.fail(old, "late transfer error")
+    assert new.files["weights"].partial.read_bytes() == b"new"
+    assert old.public.state == "cancelled"
+
+
+def test_reservation_refuses_marker_link(kept_setup, tmp_path, directory_link):
+    from eugene_plexus_library.keep import KeepError
+
+    client, model, _, root, _, _ = kept_setup
+    keeps = client.app.state.keeps
+    source = keeps.store.get_model(model["id"]).model_copy(update={"name": "foo"})
+    marker = root / "ollama" / "foo" / "foo.gguf.partial.keep"
+    marker.parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    directory_link(marker, outside)
+    with pytest.raises(KeepError):
+        keeps.local(source, None)
+    assert not list(outside.iterdir())
+
+
+def test_startup_preserves_unmarked_partial_with_keep_name(kept_setup):
+    from eugene_plexus_library.keep import Keeps
+
+    client, _, _, root, _, _ = kept_setup
+    partial = root / "ollama" / "foo" / "foo.gguf.partial"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"a person's own file")
+    keeps = client.app.state.keeps
+    Keeps(keeps.config, keeps.store)
+    assert partial.read_bytes() == b"a person's own file"
+
+
+def test_startup_removes_marked_partial(kept_setup):
+    from eugene_plexus_library.keep import Keeps
+
+    client, _, _, root, _, _ = kept_setup
+    partial = root / "ollama" / "foo" / "foo.gguf.partial"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"interrupted Keep")
+    marker = partial.with_name(partial.name + ".keep")
+    marker.write_text("interrupted-job", encoding="utf-8")
+    keeps = client.app.state.keeps
+    Keeps(keeps.config, keeps.store)
+    assert not partial.exists()
+    assert not marker.exists()
+
+
+def test_startup_removes_partial_for_truncated_name_ending_in_dash(kept_setup):
+    from eugene_plexus_library.keep import Keeps
+
+    client, model, _, _, _, _ = kept_setup
+    keeps = client.app.state.keeps
+    source = keeps.store.get_model(model["id"]).model_copy(update={"name": "a" * 119 + "-tail"})
+    job = keeps.local(source, None)
+    file = job.files["weights"]
+    assert file.path.parent.name.endswith("-")
+    file.path.parent.mkdir(parents=True, exist_ok=True)
+    file.partial.write_bytes(b"interrupted Keep")
+    # Model a previous process's ownership record, including before marker creation is fixed.
+    marker = file.partial.with_name(file.partial.name + ".keep")
+    marker.write_text(job.public.id, encoding="utf-8")
+    Keeps(keeps.config, keeps.store)
+    assert not file.partial.exists()
+    assert not marker.exists()
+
+
+def test_reservation_marks_every_partial_before_transfer(kept_setup):
+    client, model, _, _, _, _ = kept_setup
+    keeps = client.app.state.keeps
+    source = keeps.store.get_model(model["id"])
+    job = keeps.reserve(
+        name=source.name,
+        tags=source.ollama.tags,
+        digest="sha256:" + "a" * 64,
+        size=3,
+        store=source.root,
+        folder=None,
+        projector_digest="sha256:" + "b" * 64,
+        projector_size=2,
+    )
+    for file in job.files.values():
+        assert not file.partial.exists()
+        assert file.partial.with_name(file.partial.name + ".keep").read_text() == job.public.id
+    keeps.cancel(job)
+    assert not list(job.root.rglob("*.partial.keep"))
+
+
 def test_startup_removes_only_orphan_keep_partials(kept_setup, tmp_path, directory_link):
     from eugene_plexus_library.keep import Keeps
 
@@ -430,16 +610,18 @@ def test_startup_removes_only_orphan_keep_partials(kept_setup, tmp_path, directo
     keeps = client.app.state.keeps
     job = keeps.local(keeps.store.get_model(model["id"]), None)
     file = job.files["weights"]
-    file.path.parent.mkdir(parents=True)
+    file.path.parent.mkdir(parents=True, exist_ok=True)
     file.partial.write_bytes(b"interrupted transfer")
     projector = file.path.with_name("mmproj-" + file.path.name + ".partial")
     projector.write_bytes(b"interrupted projector")
+    projector.with_name(projector.name + ".keep").write_text(job.public.id)
     unrelated = file.path.with_name("download.gguf.partial")
     unrelated.write_bytes(b"another module")
     outside = tmp_path / "outside"
     outside.mkdir()
     external = outside / "escaped.gguf.partial"
     external.write_bytes(b"keep this")
+    external.with_name(external.name + ".keep").write_text(job.public.id)
     directory_link(root / "ollama" / "escaped", outside)
     final = file.path
     final.write_bytes(b"already kept")
@@ -460,7 +642,7 @@ def test_startup_removes_only_orphan_keep_partials(kept_setup, tmp_path, directo
         update={"name": "CON." + "a" * 116}
     )
     prefixed = restarted.local(reserved_name, None).files["weights"].partial
-    prefixed.parent.mkdir(parents=True)
+    prefixed.parent.mkdir(parents=True, exist_ok=True)
     prefixed.write_bytes(b"interrupted")
     Keeps(keeps.config, keeps.store)
     assert not prefixed.exists()
@@ -474,7 +656,7 @@ def test_reservation_names_existing_partial(kept_setup):
     job = keeps.local(keeps.store.get_model(model["id"]), None)
     keeps.cancel(job)
     partial = job.files["weights"].partial
-    partial.parent.mkdir(parents=True)
+    partial.parent.mkdir(parents=True, exist_ok=True)
     partial.write_bytes(b"partial")
     with pytest.raises(KeepError, match=r"\.gguf\.partial already exists"):
         keeps.local(keeps.store.get_model(model["id"]), None)

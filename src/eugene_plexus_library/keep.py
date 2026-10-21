@@ -53,6 +53,10 @@ class File:
     def partial(self) -> Path:
         return self.path.with_name(self.path.name + ".partial")
 
+    @property
+    def marker(self) -> Path:
+        return self.partial.with_name(self.partial.name + ".keep")
+
 
 @dataclass
 class Job:
@@ -81,10 +85,10 @@ class Keeps:
         self.remove_orphan_partials()
 
     def remove_orphan_partials(self) -> None:
-        """Discard interrupted Keep files; never traverse links or other layouts."""
+        """Discard only marked, interrupted Keep files; never traverse links."""
         with self.lock:
             owned = {
-                file.partial
+                os.path.realpath(file.marker)
                 for job in self.jobs.values()
                 if job.public.state == "running"
                 for file in job.files.values()
@@ -101,17 +105,24 @@ class Keeps:
                     log.warning("Keep partials in %s were left in place: %s", directory, exc)
                     continue
                 for child in children:
-                    name = child.name
-                    if not re.fullmatch(r"[A-Za-z0-9._-]{1,126}", name) or name != name.strip(".-"):
-                        continue
-                    for filename in (name + ".gguf.partial", "mmproj-" + name + ".gguf.partial"):
-                        path = child / filename
-                        if path in owned:
+                    try:
+                        self.guard_path(root, child)
+                        if not child.is_dir():
                             continue
+                        markers = list(child.glob("*.partial.keep"))
+                    except (KeepError, OSError) as exc:
+                        log.warning("Keep partials in %s were left in place: %s", child, exc)
+                        continue
+                    for marker in markers:
+                        if os.path.realpath(marker) in owned:
+                            continue
+                        path = marker.with_suffix("")
                         try:
+                            self.guard_path(root, marker)
                             self.guard_path(root, path)
-                            if path.is_file():
-                                path.unlink()
+                            if marker.is_file():
+                                path.unlink(missing_ok=True)
+                                marker.unlink()
                         except (KeepError, OSError) as exc:
                             log.warning("Keep partial %s was left in place: %s", path, exc)
 
@@ -208,17 +219,41 @@ class Keeps:
             )
         job = Job(public, root.absolute(), provenance, files, source_id)
         with self.lock:
-            for file in files.values():
-                self.guard(job, file.path)
-                self.guard(job, file.partial)
-                for path in (file.path, file.partial):
-                    if path.exists():
-                        raise KeepError(409, f"{path} already exists. Nothing was written.")
+            destinations = {
+                os.path.realpath(path)
+                for file in files.values()
+                for path in (file.path, file.partial)
+            }
             if any(
-                same_path(other.public.target, target) and other.public.state == "running"
+                same_path(os.path.realpath(path), target_path)
                 for other in self.jobs.values()
+                if other.public.state == "running"
+                for file in other.files.values()
+                for path in (file.path, file.partial)
+                for target_path in destinations
             ):
                 raise KeepError(409, f"{target} is already being kept.")
+            for file in files.values():
+                for path in (file.path, file.partial, file.marker):
+                    self.guard(job, path)
+                    if path.exists():
+                        raise KeepError(409, f"{path} already exists. Nothing was written.")
+            marked: list[Path] = []
+            try:
+                for file in files.values():
+                    self.guard(job, file.marker)
+                    file.path.parent.mkdir(parents=True, exist_ok=True)
+                    self.guard(job, file.marker)
+                    with file.marker.open("x", encoding="utf-8") as output:
+                        marked.append(file.marker)
+                        output.write(public.id)
+            except (KeepError, OSError) as exc:
+                for marker in marked:
+                    self.guard(job, marker)
+                    marker.unlink(missing_ok=True)
+                if isinstance(exc, KeepError):
+                    raise
+                raise KeepError(409, f"Keep could not reserve {target}: {exc}") from exc
             self.jobs[public.id] = job
         return job
 
@@ -254,21 +289,24 @@ class Keeps:
 
     def cleanup(self, job: Job) -> None:
         for file in job.files.values():
-            for path in [file.partial, *([file.path] if file.published else [])]:
+            for path in [file.partial, file.marker, *([file.path] if file.published else [])]:
                 # A changed junction is refused, including during cancellation.
                 self.guard(job, path)
                 path.unlink(missing_ok=True)
 
     def fail(self, job: Job, cause: str) -> None:
-        job.public.state = type(job.public.state).failed
-        job.public.error = cause
-        try:
-            self.cleanup(job)
-        except (KeepError, OSError) as exc:
-            job.public.error += f" Cleanup refused: {exc}"
+        with job.lock, self.lock:
+            if job.public.state != "running":
+                return
+            job.public.state = type(job.public.state).failed
+            job.public.error = cause
+            try:
+                self.cleanup(job)
+            except (KeepError, OSError) as exc:
+                job.public.error += f" Cleanup refused: {exc}"
 
     def cancel(self, job: Job) -> KeepJob:
-        with job.lock:
+        with job.lock, self.lock:
             if job.public.state == "running":
                 job.public.state = type(job.public.state).cancelled
                 try:
@@ -286,6 +324,8 @@ class Keeps:
         os.close(fd)
         file.published = True
         os.replace(file.partial, file.path)
+        self.guard(job, file.marker)
+        file.marker.unlink()
         file.verified = True
 
     async def run_local(self, job: Job) -> None:
