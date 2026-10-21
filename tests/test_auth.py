@@ -190,6 +190,28 @@ def test_a_service_token_cannot_forget_a_model(
     )
 
 
+def test_a_service_token_cannot_move_profiles_to_another_file(
+    authed_client: TestClient, service_token: str
+) -> None:
+    """Moving a model's profiles is the operator's click (row 22): the profiles
+    are tuning work, and a peer must not be able to point them at a file."""
+    response = authed_client.post(
+        "/v1/models/deadbeef/relocate", json={"to": "cafe"}, headers=_auth(service_token)
+    )
+    assert response.status_code == 401
+
+
+def test_where_a_file_may_have_gone_is_a_read(
+    authed_client: TestClient, service_token: str, operator_token: str
+) -> None:
+    """The read moves nothing, so it takes what the other reads take."""
+    path = "/v1/models/deadbeef/relocate-candidates"
+    assert authed_client.get(path).status_code == 401
+    # Authorised, then unknown: the answer is the model's absence, not the door.
+    assert authed_client.get(path, headers=_auth(service_token)).status_code == 404
+    assert authed_client.get(path, headers=_auth(operator_token)).status_code == 404
+
+
 def test_a_service_token_cannot_write_a_profile(
     authed_client: TestClient, service_token: str
 ) -> None:

@@ -36,9 +36,10 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 
+from . import fingerprint
 from ._generated.models import Scan, ScanRoot, ScanState, SkippedPath
 from ._generated.models import Status1 as ScanRootStatus
-from .scanner import RootResult, ScanCounters, Scanner
+from .scanner import RootResult, ScanCounters, Scanner, ScanResult
 from .store import StateStore
 
 log = logging.getLogger(__name__)
@@ -185,6 +186,17 @@ class ScanManager:
 
     # -- the walk -----------------------------------------------------------
 
+    def _walk(self, scanner: Scanner, roots: list[Path], ollama_roots: list[Path]) -> ScanResult:
+        """The walk, then each model's fingerprint (row 22): the proof that a file
+        which moved is the same file. A model found again unchanged keeps the
+        one it has, so a rescan reads nothing for it; one found new or changed,
+        and one a scan before fingerprints began left without, is read now
+        (about 1.6 MiB per file). Cancelling stops between models, and what
+        was read is kept."""
+        result = scanner.scan(roots, ollama_roots=ollama_roots)
+        result.models = fingerprint.stamp_all(result.models, should_cancel=self._cancel.is_set)
+        return result
+
     async def _run(self, roots: list[Path], *, full: bool, ollama_roots: list[Path]) -> None:
         try:
             scanner = Scanner(
@@ -194,7 +206,7 @@ class ScanManager:
                 follow_symlinks=self._resolve_follow_symlinks(),
             )
             result = await asyncio.wait_for(
-                asyncio.to_thread(partial(scanner.scan, roots, ollama_roots=ollama_roots)),
+                asyncio.to_thread(partial(self._walk, scanner, roots, ollama_roots)),
                 timeout=self._timeout,
             )
         except TimeoutError:

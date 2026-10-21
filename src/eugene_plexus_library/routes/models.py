@@ -1,4 +1,4 @@
-"""Model routes: list, read, and forget."""
+"""Model routes: list, read, forget, and re-point a moved file's profiles."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from .. import deletion, eligibility, engine_fit, hardware, prepared
+from .. import deletion, eligibility, engine_fit, fingerprint, hardware, prepared
 from .._generated.models import (
     EligibilityList,
     EligibilityRequest,
@@ -23,9 +23,14 @@ from .._generated.models import (
     ModelDeleteRequest,
     ModelDeletion,
     ModelFormat,
+    ModelRelocated,
     ModelStatus,
     PreparedModelRequest,
     Problem,
+    ProfileRename,
+    RelocateCandidate,
+    RelocateCandidateList,
+    RelocateRequest,
     SpecialTokens,
 )
 from ..config import ConfigStore
@@ -33,7 +38,7 @@ from ..dependencies import require_operator
 from ..formats import gguf
 from ..paths import is_within, same_path
 from ..scan_manager import ScanManager
-from ..store import StateStore
+from ..store import RelocateRefused, StateStore
 
 router = APIRouter(tags=["models"])
 
@@ -259,6 +264,8 @@ async def add_prepared_model(request: Request, body: PreparedModelRequest) -> Li
         await scans.wait()
     found = await asyncio.to_thread(prepared.model_from, target, root)
     model = prepared.link_sources([*store.list_models(), found])[-1]
+    # Fingerprinted here as a scan would, so its files can be recognised if they move.
+    model = await asyncio.to_thread(fingerprint.stamp, model)
     return store.add_model(model, seen_at=datetime.now(tz=UTC))
 
 
@@ -387,6 +394,75 @@ async def delete_model(request: Request, model_id: str, body: ModelDeleteRequest
         )
 
     return await asyncio.to_thread(run)
+
+
+def _refused(exc: RelocateRefused) -> HTTPException:
+    return _problem(exc.status, exc.title, exc.detail)
+
+
+@router.get(
+    "/v1/models/{model_id}/relocate-candidates",
+    response_model=RelocateCandidateList,
+    response_model_exclude_none=True,
+)
+async def list_relocate_candidates(request: Request, model_id: str) -> RelocateCandidateList:
+    """Where a missing model's file may have gone (row 22): the present models
+    that have its fingerprint (`same`), or, for an entry from before
+    fingerprints, that match its size and details (`likely`). A read: nothing
+    is moved."""
+    store: StateStore = request.app.state.state_store
+    _present(store, model_id)
+    return RelocateCandidateList(
+        candidates=[
+            RelocateCandidate(model=model, match=match, differences=differences)
+            for model, match, differences in store.relocate_candidates(model_id)
+        ]
+    )
+
+
+@router.post(
+    "/v1/models/{model_id}/relocate",
+    response_model=ModelRelocated,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_operator)],
+)
+async def relocate_model(request: Request, model_id: str, body: RelocateRequest) -> ModelRelocated:
+    """Move a missing model's profiles to the same file at its new path (row 22).
+
+    Only on a click: nothing here is called by a scan. The profiles move to a
+    file with the same contents, which the new file is read for **now**, or, for
+    an entry from before fingerprints, after `confirmLikely`. The missing entry
+    is forgotten in the same transaction. No file is touched.
+    """
+    store: StateStore = request.app.state.state_store
+    try:
+        # Asked before a byte is read, so a call that cannot work costs nothing.
+        _, target = store.check_relocation(model_id, body.to)
+        try:
+            found = await asyncio.to_thread(fingerprint.of, target)
+        except fingerprint.FingerprintError as exc:
+            if exc.absent:
+                raise RelocateRefused("File not there", f"{exc.path} is no longer there.") from exc
+            raise RelocateRefused(
+                "File unreadable",
+                f"Eugene could not read {exc.path} to check it: {exc.cause}.",
+            ) from exc
+        if found is None:
+            raise RelocateRefused(
+                "File unreadable",
+                f"Eugene could not read {target.path} to check it: it lists no files.",
+            )
+        done = store.relocate(
+            model_id, body.to, found=found, confirm_likely=bool(body.confirmLikely)
+        )
+    except RelocateRefused as exc:
+        raise _refused(exc) from exc
+    return ModelRelocated(
+        model=done.model,
+        moved=done.moved,
+        renamed=[ProfileRename(name=was, renamedTo=now) for was, now in done.renamed],
+        warnings=done.warnings,
+    )
 
 
 @router.get("/v1/models/{model_id}", response_model=LibraryModel)

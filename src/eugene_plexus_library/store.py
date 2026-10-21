@@ -24,6 +24,9 @@ That asymmetry decides the behaviour everywhere else:
 * A moved model reads as a new model. Nothing guesses that a file which
   vanished from one root and appeared in another is the same file,
   because a wrong guess silently applies one model's tuning to another.
+  What it does is *say* where the file went (`movedTo`, from the content
+  fingerprint) and, when the person clicks, move the profiles there
+  (`relocate`), in one transaction and only to a file with the same contents.
 
 ## JSON, not YAML
 
@@ -55,11 +58,12 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import profile_storage
+from . import fingerprint, profile_storage
 from ._causes import plain_cause, v01_data
 from ._generated.models import (
     Download,
@@ -69,6 +73,7 @@ from ._generated.models import (
     ModelProfile,
     ModelProfileSpec,
     ModelStatus,
+    RelocateMatch,
 )
 from ._private_files import write_private_text
 from .paths import normalize
@@ -82,6 +87,72 @@ STATE_VERSION = 2
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+class RelocateRefused(Exception):
+    """A relocate that did not happen, and the plain reason (row 22). `status`
+    is the HTTP answer: 409 unless an entry is unknown (404)."""
+
+    def __init__(self, title: str, detail: str, *, status: int = 409) -> None:
+        super().__init__(detail)
+        self.title = title
+        self.detail = detail
+        self.status = status
+
+
+@dataclass
+class Relocation:
+    """What a relocate did: the model the profiles are on now, how many moved,
+    the ones that came with a new name, and the stale paths left in them."""
+
+    model: LibraryModel
+    moved: int
+    renamed: list[tuple[str, str]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+#: What a `likely` candidate says Eugene could not check.
+_NO_FINGERPRINT = "The missing file was never fingerprinted, so its contents cannot be compared."
+
+
+def _free_name(name: str, taken: set[str]) -> str:
+    """`name`, or `name (moved)` when the target model uses it, and `(moved 2)`
+    when that is used too."""
+    if name not in taken:
+        return name
+    candidate = f"{name} (moved)"
+    number = 2
+    while candidate in taken:
+        candidate = f"{name} (moved {number})"
+        number += 1
+    return candidate
+
+
+def _stale_path_warnings(profile: ModelProfile, old_paths: list[str]) -> list[str]:
+    """A profile that names the old file (or one of its files) in its arguments,
+    environment or flags moves unchanged, and is listed: Eugene does not edit a
+    person's arguments, and the person is told which ones to look at."""
+
+    def names_old(text: str) -> bool:
+        flat = text.replace("\\", "/").casefold()
+        return any(old.replace("\\", "/").casefold() in flat for old in old_paths if old)
+
+    flag_text = [
+        s
+        for value in (profile.flags or {}).values()
+        for s in (value if isinstance(value, list) else [value])
+        if isinstance(s, str)
+    ]
+    where = [
+        ("extra arguments", profile.extraArgs or []),
+        ("environment", list((profile.env or {}).values())),
+        ("flags", flag_text),
+    ]
+    return [
+        f'The profile "{profile.name}" still names the old path in its {label}.'
+        for label, texts in where
+        if any(names_old(text) for text in texts)
+    ]
 
 
 class StateStore:
@@ -319,20 +390,46 @@ class StateStore:
 
     def list_models(self) -> list[LibraryModel]:
         with self._lock:
-            return [self._with_profile_count(m) for m in self._models.values()]
+            moved = self._moved_to_locked()
+            return [self._with_profile_count(m, moved) for m in self._models.values()]
 
     def get_model(self, model_id: str) -> LibraryModel | None:
         with self._lock:
             model = self._models.get(model_id)
-            return self._with_profile_count(model) if model else None
+            return self._with_profile_count(model, self._moved_to_locked()) if model else None
 
     def find_by_path(self, path: str) -> LibraryModel | None:
         with self._lock:
             model = self._by_path.get(normalize(path))
-            return self._with_profile_count(model) if model else None
+            return self._with_profile_count(model, self._moved_to_locked()) if model else None
 
-    def _with_profile_count(self, model: LibraryModel) -> LibraryModel:
-        return model.model_copy(update={"profileCount": len(self._profiles.get(model.id, []))})
+    def _with_profile_count(
+        self, model: LibraryModel, moved: dict[str, str] | None = None
+    ) -> LibraryModel:
+        """The model as the API shows it: with its profile count, and for a
+        missing one where its file went. Both are worked out here and never
+        stored, so neither can outlive what it describes."""
+        update: dict[str, Any] = {"profileCount": len(self._profiles.get(model.id, []))}
+        if moved is None:
+            moved = self._moved_to_locked()
+        if model.id in moved:
+            update["movedTo"] = moved[model.id]
+        return model.model_copy(update=update)
+
+    def _moved_to_locked(self) -> dict[str, str]:
+        """`{missing id: present id}` where exactly one present entry has the
+        missing entry's fingerprint. Two copies leave the choice to the person."""
+        present: dict[str, list[str]] = {}
+        for model in self._models.values():
+            if model.status == ModelStatus.present and model.fingerprint:
+                present.setdefault(model.fingerprint, []).append(model.id)
+        return {
+            model.id: found[0]
+            for model in self._models.values()
+            if model.status == ModelStatus.missing
+            and model.fingerprint
+            and len(found := present.get(model.fingerprint, [])) == 1
+        }
 
     def replace_models(self, found: list[LibraryModel], *, scanned_at: datetime) -> dict[str, int]:
         """Install a completed scan's results.
@@ -408,6 +505,134 @@ class StateStore:
             self._profiles.pop(model_id, None)
             self._reindex_locked()
             return True
+
+    # -- relocating: a missing model's profiles to its file at a new path ----
+
+    def relocate_candidates(
+        self, model_id: str
+    ) -> list[tuple[LibraryModel, RelocateMatch, list[str]]]:
+        """The present models that may be this missing model's file (row 22):
+        `same` for an equal fingerprint, `likely` only when this entry has no
+        fingerprint and everything its entry says matches. Nothing else is a
+        candidate, and a model that is not missing has none."""
+        with self._lock:
+            source = self._models.get(model_id)
+            if source is None or source.status != ModelStatus.missing:
+                return []
+            moved = self._moved_to_locked()
+            found: list[tuple[LibraryModel, RelocateMatch, list[str]]] = []
+            for model in self._models.values():
+                if model.status != ModelStatus.present or model.format != source.format:
+                    continue
+                if source.fingerprint:
+                    if model.fingerprint != source.fingerprint:
+                        continue
+                    found.append((model, RelocateMatch.same, []))
+                elif fingerprint.difference(source, model) is None:
+                    found.append((model, RelocateMatch.likely, [_NO_FINGERPRINT]))
+            found.sort(key=lambda item: (item[1] != RelocateMatch.same, item[0].path))
+            return [(self._with_profile_count(m, moved), how, why) for m, how, why in found]
+
+    def check_relocation(self, source_id: str, target_id: str) -> tuple[LibraryModel, LibraryModel]:
+        """The two entries, or why they cannot be paired at all: unknown (404),
+        the source is still there, the target is not. Reads nothing from disk,
+        so the caller asks before it spends a read on a call that cannot work."""
+        with self._lock:
+            return self._pair_locked(source_id, target_id)
+
+    def _pair_locked(self, source_id: str, target_id: str) -> tuple[LibraryModel, LibraryModel]:
+        source = self._models.get(source_id)
+        if source is None:
+            raise RelocateRefused("Unknown model", f"No model with id {source_id!r}.", status=404)
+        target = self._models.get(target_id)
+        if target is None:
+            raise RelocateRefused("Unknown model", f"No model with id {target_id!r}.", status=404)
+        if source.status != ModelStatus.missing:
+            raise RelocateRefused(
+                "Nothing to move",
+                f"This model is still at {source.path}; there is nothing to move.",
+            )
+        if target.status != ModelStatus.present:
+            raise RelocateRefused("File not there", f"{target.path} is no longer there.")
+        return source, target
+
+    def relocate(
+        self,
+        source_id: str,
+        target_id: str,
+        *,
+        found: str | None,
+        confirm_likely: bool = False,
+    ) -> Relocation:
+        """Move a missing model's profiles to the same file at its new path, and
+        forget the missing entry (row 22). All of it in one transaction: if the
+        profiles cannot be written, nothing has moved.
+
+        `found` is the target's fingerprint **read just now** by the caller, so
+        the proof is about the file as it is at the click and not as it was at
+        the scan. Refused, with the plain reason (`RelocateRefused`), unless
+        the contents match: equal fingerprints, or, for an entry that has none,
+        every detail the entries carry and `confirm_likely`.
+        """
+        with self._profile_transaction():
+            source, target = self._pair_locked(source_id, target_id)
+            self._require_same_file(source, target, found, confirm_likely)
+
+            moving = self._profiles.pop(source_id, [])
+            kept = self._profiles.setdefault(target_id, [])
+            names = {p.name for p in kept}
+            ids = {p.id for p in kept}
+            # The target keeps its own default; one with no profiles takes the
+            # source's, so a model with profiles never has none.
+            has_default = any(p.default for p in kept)
+            renamed: list[tuple[str, str]] = []
+            warnings: list[str] = []
+            old_paths = list(dict.fromkeys([source.path, *(f.path for f in source.files or [])]))
+            for profile in moving:
+                name = _free_name(profile.name, names)
+                if name != profile.name:
+                    renamed.append((profile.name, name))
+                names.add(name)
+                profile_id = profile.id if profile.id not in ids else uuid.uuid4().hex[:12]
+                ids.add(profile_id)
+                moved = profile.model_copy(
+                    update={
+                        "id": profile_id,
+                        "name": name,
+                        "default": profile.default and not has_default,
+                    }
+                )
+                kept.append(moved)
+                warnings.extend(_stale_path_warnings(moved, old_paths))
+            if not kept:
+                self._profiles.pop(target_id, None)
+            self._models.pop(source_id, None)
+            self._reindex_locked()
+            model = self._with_profile_count(self._models[target_id])
+        return Relocation(model=model, moved=len(moving), renamed=renamed, warnings=warnings)
+
+    @staticmethod
+    def _require_same_file(
+        source: LibraryModel, target: LibraryModel, found: str | None, confirm_likely: bool
+    ) -> None:
+        if source.fingerprint:
+            if found is None or found != source.fingerprint:
+                why = fingerprint.difference(source, target) or "its contents are not the same"
+                raise RelocateRefused(
+                    "Different file", f"{target.path} is a different file: {why}."
+                )
+            return
+        # No fingerprint to compare: what the entries say can only make it likely.
+        difference = fingerprint.difference(source, target)
+        if difference is not None:
+            raise RelocateRefused(
+                "Different file", f"{target.path} is a different file: {difference}."
+            )
+        if not confirm_likely:
+            raise RelocateRefused(
+                "Cannot prove it",
+                "Eugene cannot prove these are the same file. Confirm to move anyway.",
+            )
 
     @property
     def last_scan_at(self) -> datetime | None:
