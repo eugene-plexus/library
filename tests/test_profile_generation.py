@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -5,6 +6,61 @@ from pydantic import ValidationError
 
 from eugene_plexus_library._generated.models import ModelProfileSpec
 from eugene_plexus_library.store import StateStore
+
+
+def test_author_sampling_fields_survive_save_replace_and_restart(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    profile = store.create_profile(
+        "model",
+        ModelProfileSpec(
+            name="first",
+            engine="llama_cpp",
+            authorSampling=False,
+            topK=0,
+            minP=0,
+        ),
+    )
+    assert (profile.authorSampling, profile.topK, profile.minP) == (False, 0, 0)
+    again = StateStore(path)
+    again.load()
+    saved = again.get_profile("model", profile.id)
+    assert (saved.authorSampling, saved.topK, saved.minP) == (False, 0, 0)
+    updated = again.replace_profile(
+        "model",
+        profile.id,
+        ModelProfileSpec(
+            name="first",
+            engine="llama_cpp",
+            authorSampling=True,
+            topK=20,
+            minP=0.05,
+        ),
+    )
+    assert (updated.authorSampling, updated.topK, updated.minP) == (True, 20, 0.05)
+    third = StateStore(path)
+    third.load()
+    cleared = third.replace_profile(
+        "model", profile.id, ModelProfileSpec(name="first", engine="llama_cpp")
+    )
+    assert (cleared.authorSampling, cleared.topK, cleared.minP) == (True, None, None)
+    document = json.loads(path.with_suffix(".profiles.json").read_text(encoding="utf-8"))
+    assert document["version"] == 2
+
+
+def test_old_profiles_enable_author_sampling_without_migration(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    profile = store.create_profile("model", ModelProfileSpec(name="old", engine="llama_cpp"))
+    stored = path.with_suffix(".profiles.json")
+    document = json.loads(stored.read_text(encoding="utf-8"))
+    document["profiles"]["model"][0]["settings"].pop("authorSampling", None)
+    stored.write_text(json.dumps(document), encoding="utf-8")
+    before = stored.read_bytes()
+    again = StateStore(path)
+    again.load()
+    assert again.get_profile("model", profile.id).authorSampling is True
+    assert stored.read_bytes() == before
 
 
 def test_generation_defaults_survive_save_replace_and_restart(tmp_path: Path) -> None:

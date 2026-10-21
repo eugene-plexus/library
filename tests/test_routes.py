@@ -126,6 +126,9 @@ def test_profile_crud(configured_client: TestClient, models_dir: Path) -> None:
         json={
             "name": "long context",
             "engine": "llama_cpp",
+            "authorSampling": False,
+            "topK": 0,
+            "minP": 0,
             "flags": {"contextSize": 32768, "nGpuLayers": 99},
             "env": {"CUDA_VISIBLE_DEVICES": "0"},
             "notes": "OOMs above 24 layers on the 3090",
@@ -134,6 +137,7 @@ def test_profile_crud(configured_client: TestClient, models_dir: Path) -> None:
     assert created.status_code == 201
     profile = created.json()
     assert profile["default"] is True
+    assert (profile["authorSampling"], profile["topK"], profile["minP"]) == (False, 0, 0)
     assert profile["flags"]["contextSize"] == 32768
 
     listed = configured_client.get(f"/v1/models/{model_id}/profiles").json()
@@ -141,10 +145,22 @@ def test_profile_crud(configured_client: TestClient, models_dir: Path) -> None:
 
     replaced = configured_client.put(
         f"/v1/models/{model_id}/profiles/{profile['id']}",
-        json={"name": "long context", "engine": "llama_cpp", "flags": {"contextSize": 8192}},
+        json={
+            "name": "long context",
+            "engine": "llama_cpp",
+            "flags": {"contextSize": 8192},
+            "authorSampling": True,
+            "topK": 20,
+            "minP": 0.05,
+        },
     )
     assert replaced.status_code == 200
     assert replaced.json()["flags"] == {"contextSize": 8192}
+    assert (
+        replaced.json()["authorSampling"],
+        replaced.json()["topK"],
+        replaced.json()["minP"],
+    ) == (True, 20, 0.05)
 
     assert (
         configured_client.delete(f"/v1/models/{model_id}/profiles/{profile['id']}").status_code

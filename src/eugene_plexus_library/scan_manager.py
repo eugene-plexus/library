@@ -37,8 +37,16 @@ from functools import partial
 from pathlib import Path
 
 from . import fingerprint
-from ._generated.models import Scan, ScanRoot, ScanState, SkippedPath
+from ._generated.models import (
+    LibraryModel,
+    RecommendedSamplingSource,
+    Scan,
+    ScanRoot,
+    ScanState,
+    SkippedPath,
+)
 from ._generated.models import Status1 as ScanRootStatus
+from .formats import generation_config
 from .scanner import RootResult, ScanCounters, Scanner, ScanResult
 from .store import StateStore
 
@@ -194,6 +202,10 @@ class ScanManager:
         (about 1.6 MiB per file). Cancelling stops between models, and what
         was read is kept."""
         result = scanner.scan(roots, ollama_roots=ollama_roots)
+        result.models = [
+            _author_sampling(model) if not self._cancel.is_set() else model
+            for model in result.models
+        ]
         result.models = fingerprint.stamp_all(result.models, should_cancel=self._cancel.is_set)
         return result
 
@@ -251,6 +263,47 @@ class ScanManager:
             result.files_scanned,
             len(result.skipped),
         )
+
+
+def _author_sampling(model: LibraryModel) -> LibraryModel:
+    if model.safetensors is not None:
+        return model.model_copy(
+            update={
+                "safetensors": model.safetensors.model_copy(
+                    update={
+                        "recommendedSampling": generation_config.read(Path(model.path)),
+                    }
+                )
+            }
+        )
+    if model.gguf is not None:
+        values = (
+            model.gguf.recommendedSampling.model_dump(exclude_none=True)
+            if model.gguf.recommendedSampling
+            else {}
+        )
+        metadata = model.gguf.metadata or {}
+        # The GGUF reader's public KV already contains min_p; no second header read.
+        for key, target in (
+            ("temp", "temperature"),
+            ("top_p", "topP"),
+            ("top_k", "topK"),
+            ("min_p", "minP"),
+        ):
+            if f"general.sampling.{key}" in metadata:
+                values[target] = metadata[f"general.sampling.{key}"]
+        return model.model_copy(
+            update={
+                "gguf": model.gguf.model_copy(
+                    update={
+                        "recommendedSampling": generation_config.sampling_values(
+                            values, source=RecommendedSamplingSource.gguf
+                        ),
+                    }
+                )
+            }
+        )
+    return model
 
 
 def _to_scan_root(result: RootResult) -> ScanRoot:
