@@ -60,8 +60,33 @@ def _unjoined_is_null(node: str | None) -> str | None:
     return None if node == tokens.STANDALONE_NODE else node
 
 
+def install_members(request: Request) -> frozenset[str] | None:
+    """The machines the install lists, from the trust bundle this library
+    holds; None when it holds none, or one with no key of the root (a
+    standalone node, or a root failing closed), which says nothing about
+    who was removed."""
+    auth = getattr(request.app.state, "auth_state", None)
+    bundle = auth.bundle.get() if auth is not None and auth.bundle is not None else None
+    if bundle is None or not any(
+        key.issuer == tokens.ISSUER_CONTROL and tokens.GRANT_AUTHORITY in key.grants
+        for key in bundle.keys.values()
+    ):
+        return None
+    members: frozenset[str] = bundle.members
+    return members
+
+
+def _fail_removed(request: Request) -> None:
+    members = install_members(request)
+    if members is None:
+        return
+    for id in journal(request).fail_removed(members):
+        log.warning("run %s ended: its machine was removed from the install", id)
+
+
 @router.get("", response_model=OperationList, dependencies=[Depends(require_operator)])
 def list_operations(request: Request) -> dict[str, Any]:
+    _fail_removed(request)
     return {"operations": [public(r) for r in journal(request).list()]}
 
 
@@ -91,6 +116,13 @@ def submit(
         return None
 
     intent = intent.model_copy(update={"node": _unjoined_is_null(intent.node)})
+    members = install_members(request)
+    if intent.node is not None and members is not None and intent.node not in members:
+        raise HTTPException(
+            409,
+            f"No machine named {intent.node!r} is in the install. It may have been removed; "
+            "choose another machine.",
+        )
     return public(journal(request).create(id, intent, resolve))
 
 

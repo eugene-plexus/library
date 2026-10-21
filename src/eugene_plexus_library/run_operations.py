@@ -8,6 +8,7 @@ after a crash reconciles the result instead of repeating a declaration.
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import secrets
@@ -430,6 +431,41 @@ class Journal:
             record.update(lease=None, leaseUntil=0)
 
         return self.change(id, update)
+
+    def fail_removed(self, members: frozenset[str]) -> builtins.list[str]:
+        """End every unfinished run whose machine is not in `members` (library#14).
+
+        No other machine can claim a run (`claim` refuses it), so a run left
+        on a removed machine would wait until someone cancelled it. Returns
+        the ids it ended."""
+        with closing(sqlite3.connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT id, json_extract(document, '$.node') FROM operations "
+                "WHERE json_extract(document, '$.step') "
+                "NOT IN ('ready','skipped','failed','cancelled')"
+            ).fetchall()
+        ended: builtins.list[str] = []
+        for id, node in rows:
+            if node is None or node in members:
+                continue
+
+            def end(record: dict[str, Any]) -> None:
+                if record["step"] in TERMINAL or record["node"] in members:
+                    return
+                record.update(
+                    failedStep=record["step"],
+                    step="failed",
+                    error=(
+                        f"The machine {record['node']!r} was removed from the install, so this "
+                        "run cannot finish there. Run the model again on another machine."
+                    ),
+                    lease=None,
+                    leaseUntil=0,
+                )
+
+            if self.change(id, end)["step"] == "failed":
+                ended.append(id)
+        return ended
 
 
 def public(record: dict[str, Any]) -> dict[str, Any]:

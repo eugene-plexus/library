@@ -283,3 +283,72 @@ def test_an_unjoined_agent_claims_the_run_its_console_named_null(app, tmp_path):
         # The workaround spelling lands on the same node, and is the same intent.
         named = {"node": "local", "modelId": model.id}
         assert client.put("/v1/run-operations/a", json=named, headers=operator).status_code == 202
+
+
+def test_a_run_on_a_removed_machine_ends_and_says_why(app, install, tmp_path):
+    """library#14: no other machine may claim a run, so one left on a
+    removed machine waited until someone cancelled it."""
+    from eugene_plexus_library import tokens
+
+    app.state.auth_state = install.auth_state()
+    app.state.auth_state.bundle._interval = 0
+    with TestClient(app) as client:
+        model = _model(tmp_path / "model.gguf")
+        app.state.state_store.replace_models([model], scanned_at=datetime.now(UTC))
+        operator = {"Authorization": "Bearer " + install.session()}
+        far = {"node": "far", "modelId": model.id}
+        here = {"node": "gw", "modelId": model.id}
+        assert client.put("/v1/run-operations/a", json=far, headers=operator).status_code == 202
+        assert client.put("/v1/run-operations/b", json=here, headers=operator).status_code == 202
+        listed = client.get("/v1/run-operations", headers=operator).json()["operations"]
+        assert {op["id"]: op["step"] != "failed" for op in listed} == {"a": True, "b": True}
+
+        # The root removes `far`: its key leaves the bundle this library holds.
+        assert install.node is not None
+        install.version += 1
+        tokens.write_bundle_file(
+            install.bundle_path,
+            tokens.build_bundle(
+                authority=install.identity,
+                version=install.version,
+                epoch=1,
+                keys=[install.root.trust_key(["authority"]), install.node.trust_key(["node"])],
+            ),
+        )
+        listed = client.get("/v1/run-operations", headers=operator).json()["operations"]
+        by_id = {op["id"]: op for op in listed}
+        assert by_id["a"]["step"] == "failed"
+        assert "'far' was removed from the install" in by_id["a"]["error"]
+        assert by_id["a"]["failedStep"] is not None
+        assert by_id["b"]["step"] != "failed"
+        refused = client.put("/v1/run-operations/c", json=far, headers=operator)
+        assert refused.status_code == 409, refused.text
+        assert "No machine named 'far'" in refused.text
+
+
+def test_a_bundle_with_no_root_key_ends_no_run(app, install, tmp_path):
+    """A root failing closed lists no key at all; that removes nobody."""
+    from eugene_plexus_library import tokens
+
+    app.state.auth_state = install.auth_state()
+    app.state.auth_state.bundle._interval = 0
+    with TestClient(app) as client:
+        model = _model(tmp_path / "model.gguf")
+        app.state.state_store.replace_models([model], scanned_at=datetime.now(UTC))
+        operator = {"Authorization": "Bearer " + install.session()}
+        far = {"node": "far", "modelId": model.id}
+        assert client.put("/v1/run-operations/a", json=far, headers=operator).status_code == 202
+        assert install.node is not None
+        install.version += 1
+        tokens.write_bundle_file(
+            install.bundle_path,
+            tokens.build_bundle(
+                authority=install.identity,
+                version=install.version,
+                epoch=1,
+                keys=[install.node.trust_key(["node"])],
+            ),
+        )
+        journal = app.state.run_operations
+        assert run_operations.install_members(SimpleNamespace(app=app)) is None  # type: ignore[arg-type]
+        assert journal.get("a")["step"] != "failed"
