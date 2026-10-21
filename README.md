@@ -43,7 +43,7 @@ downloads are exercised against real files and the live hub. AMD, Intel and Appl
 unverified on hardware. Guidance is an estimate, not a guarantee of runtime fit;
 the owning agent performs launch admission.
 
-Not here yet: MLX, relocating a moved model, and adopting a model's author-recommended sampling into anything (it is reported; the gateway owns request parameters).
+Not here yet: MLX, and adopting a model's author-recommended sampling into anything (it is reported; the gateway owns request parameters).
 
 ## Wire contract
 
@@ -54,6 +54,8 @@ Defined in [`specs/openapi/library.yaml`](https://github.com/eugene-plexus/specs
 | `GET /v1/models`                                                          | Every model. `?path=` for reverse lookup from an absolute path    |
 | `GET /v1/models/{id}`                                                     | One model, with full metadata                                     |
 | `DELETE /v1/models/{id}`                                                  | Forget a **missing** entry and its profiles. Never touches a file |
+| `GET /v1/models/{id}/relocate-candidates`                                 | Where a **missing** model's file may have gone (`same` / `likely`) |
+| `POST /v1/models/{id}/relocate`                                           | Move its profiles to that file, on a click; never by itself       |
 | `GET`/`POST /v1/models/{id}/profiles`                                     | List / create launch profiles                                     |
 | `GET`/`PUT`/`DELETE /v1/models/{id}/profiles/{pid}`                       | Read / replace / delete one                                       |
 | `GET`/`POST`/`DELETE /v1/scan`                                            | State of / start / cancel the walk                                |
@@ -209,7 +211,7 @@ A model's identity is its **path**. The `id` is a URL-safe handle derived from i
 
 It is derived rather than random so it survives restarts, since profiles are keyed to it. Treat it as **opaque** — use `GET /v1/models?path=` to go the other way rather than reproducing the normalization. And it is not content addressing: no byte of the model is read to produce it.
 
-**Move a model and it reads as a new model.** The old entry goes `missing` and keeps its profiles so you can copy them across. Nothing guesses that a file which vanished from one root and appeared in another is the same file, because a wrong guess silently applies one model's tuning to another.
+**Move a model and it reads as a new model.** The old entry goes `missing` and keeps its profiles. Nothing guesses that a file which vanished from one root and appeared in another is the same file, because a wrong guess silently applies one model's tuning to another. What the scan does instead is read a **fingerprint** of each model (about 1.6 MiB per file: the format, each file's role and size, the first 1 MiB, eight 64 KiB blocks and the last 64 KiB) and keep it on the missing entry. A missing entry then says where its file went (`movedTo`), and `POST /v1/models/{id}/relocate` moves its profiles there, only to a file with the same contents and only on a click. An entry that went missing before fingerprints existed can be moved after the person confirms that Eugene cannot prove it.
 
 ## Running
 
