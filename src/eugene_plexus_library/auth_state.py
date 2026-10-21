@@ -10,7 +10,7 @@ The supervising agent hands this process four things and no key:
 * `AUTH_RECIPIENT` -- which machine this is (`node:<name>`), the
   audience a token must name to be accepted here;
 * `SERVICE_TOKEN` -- this library's own token, addressed to this
-  machine alone. Unused: the library calls no peer.
+  machine alone. Keep asks its local agent to reach a worker with it.
 
 `MASTER_KEY` is the separate at-rest encryption credential. With none of
 the first four, the library runs unauthenticated (dev/standalone), as it
@@ -40,7 +40,7 @@ class AuthState:
     """This machine, as a token's audience names it."""
 
     service_token: str | None
-    """This library's own token, good on this machine only. Unused today."""
+    """This library's own token, used to call its local agent."""
 
     master_key: bytes | None
     """At-rest secretbox key, when the operator has unlocked the agent."""

@@ -59,7 +59,6 @@ from ._generated.models import (
     ConfigUpdateRequest,
     ConfigUpdateResult,
     ConfigValueType,
-    LibraryFolder,
     LibraryFolderKind,
     LibraryFolderStatus,
 )
@@ -734,7 +733,7 @@ class ConfigStore:
                 roots.append(root)
         return roots
 
-    def library_folders(self) -> list[LibraryFolder]:
+    def library_folders(self) -> list[LibraryFolderStatus]:
         """The folders with their mounts, as the wire carries them: the
         configured ones, then Ollama's own store when it was found."""
         folders = [

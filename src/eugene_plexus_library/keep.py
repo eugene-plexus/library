@@ -7,7 +7,9 @@ and an offset; neither remote paths nor remote URLs participate in placement.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -17,10 +19,10 @@ from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from . import fingerprint
-from ._generated.models import KeepJob, LibraryModel, OllamaKept
+from ._generated.models import KeepJob, LibraryModel, Method, Method1, OllamaKept, State
 from .config import ConfigStore
 from .downloads import _in_store, _refuse_store
 from .formats.ollama import blob_path
@@ -29,6 +31,7 @@ from .scanner import Scanner
 from .store import StateStore
 
 CHUNK = 16 * 1024 * 1024
+log = logging.getLogger(__name__)
 
 
 class KeepError(Exception):
@@ -74,6 +77,43 @@ class Keeps:
         self.config, self.store = config, store
         self.jobs: dict[str, Job] = {}
         self.tasks: set[asyncio.Task] = set()
+        self.lock = threading.RLock()
+        self.remove_orphan_partials()
+
+    def remove_orphan_partials(self) -> None:
+        """Discard interrupted Keep files; never traverse links or other layouts."""
+        with self.lock:
+            owned = {
+                file.partial
+                for job in self.jobs.values()
+                if job.public.state == "running"
+                for file in job.files.values()
+            }
+            for root in self.config.writable_roots():
+                root = root.absolute()
+                directory = root / "ollama"
+                try:
+                    self.guard_path(root, directory)
+                    if not directory.is_dir():
+                        continue
+                    children = list(directory.iterdir())
+                except (KeepError, OSError) as exc:
+                    log.warning("Keep partials in %s were left in place: %s", directory, exc)
+                    continue
+                for child in children:
+                    name = child.name
+                    if not re.fullmatch(r"[A-Za-z0-9._-]{1,126}", name) or name != name.strip(".-"):
+                        continue
+                    for filename in (name + ".gguf.partial", "mmproj-" + name + ".gguf.partial"):
+                        path = child / filename
+                        if path in owned:
+                            continue
+                        try:
+                            self.guard_path(root, path)
+                            if path.is_file():
+                                path.unlink()
+                        except (KeepError, OSError) as exc:
+                            log.warning("Keep partial %s was left in place: %s", path, exc)
 
     def get(self, id: str) -> Job:
         if id not in self.jobs:
@@ -81,17 +121,20 @@ class Keeps:
         return self.jobs[id]
 
     def guard(self, job: Job, path: Path) -> None:
+        self.guard_path(job.root, path)
+
+    def guard_path(self, root: Path, path: Path) -> None:
         protected = _in_store(path, self.config.ollama_roots())
         if protected is not None:
             exc = _refuse_store(path, protected)
             raise KeepError(409, str(exc), "ReadOnlyFolder")
-        if not is_within(path, job.root) or not real_within(path, job.root):
-            raise KeepError(409, f"{path} is outside the Library folder {job.root}.")
+        if not is_within(path, root) or not real_within(path, root):
+            raise KeepError(409, f"{path} is outside the Library folder {root}.")
         # Refuse links and junctions below the nominated root, even ones that
         # stay inside it. This also protects an already kept hard link from
         # ever being opened for a retry's writes.
         current = path
-        while not same_path(current, job.root):
+        while not same_path(current, root):
             if current.is_symlink() or os.path.isjunction(current):
                 raise KeepError(409, f"{current} is a link. Nothing was written.")
             current = current.parent
@@ -133,11 +176,11 @@ class Keeps:
         }:
             safe = "model-" + safe
         target = root.absolute() / "ollama" / safe / (safe + ".gguf")
-        method = "copy" if node else "link"
+        method = Method1.copy if node else Method1.link
         public = KeepJob(
             id=uuid.uuid4().hex,
             model=None,
-            state="running",
+            state=State.running,
             method=method,
             bytesDone=0,
             bytesTotal=size + projector_size,
@@ -153,7 +196,7 @@ class Keeps:
             store=store,
             node=node,
             keptAt=datetime.now(UTC),
-            method=method,
+            method=Method(method),
         )
         files = {"weights": File(target, digest, size, source)}
         if projector_digest:
@@ -164,17 +207,19 @@ class Keeps:
                 projector,
             )
         job = Job(public, root.absolute(), provenance, files, source_id)
-        for file in files.values():
-            self.guard(job, file.path)
-            self.guard(job, file.partial)
-            if file.path.exists() or file.partial.exists():
-                raise KeepError(409, f"{file.path} already exists. Nothing was written.")
-        if any(
-            same_path(other.public.target, target) and other.public.state == "running"
-            for other in self.jobs.values()
-        ):
-            raise KeepError(409, f"{target} is already being kept.")
-        self.jobs[public.id] = job
+        with self.lock:
+            for file in files.values():
+                self.guard(job, file.path)
+                self.guard(job, file.partial)
+                for path in (file.path, file.partial):
+                    if path.exists():
+                        raise KeepError(409, f"{path} already exists. Nothing was written.")
+            if any(
+                same_path(other.public.target, target) and other.public.state == "running"
+                for other in self.jobs.values()
+            ):
+                raise KeepError(409, f"{target} is already being kept.")
+            self.jobs[public.id] = job
         return job
 
     def local(self, model: LibraryModel, folder: str | None) -> Job:
@@ -182,7 +227,8 @@ class Keeps:
             raise KeepError(409, "Keep needs a present model in Ollama.")
         source = Path(model.path)
         digest = "sha256:" + source.name.removeprefix("sha256-")
-        if blob_path(Path(model.root), digest) != source:
+        root = cast(str, model.root)
+        if blob_path(Path(root), digest) != source:
             raise KeepError(409, "The source is not an Ollama blob.")
         projector = next((Path(f.path) for f in model.files or [] if f.role == "projector"), None)
         return self.reserve(
@@ -190,7 +236,7 @@ class Keeps:
             tags=model.ollama.tags,
             digest=digest,
             size=source.stat().st_size,
-            store=model.root,
+            store=root,
             folder=folder,
             source=source,
             projector=projector,
@@ -355,6 +401,20 @@ class Keeps:
         }
 
     def write(self, job: Job, file: File, offset: int, data: bytes) -> dict:
+        with job.lock:
+            try:
+                return self._write(job, file, offset, data)
+            except OSError as exc:
+                full = exc.errno == errno.ENOSPC or getattr(exc, "winerror", None) == 112
+                cause = f"The disk holding {job.root} is full" if full else str(exc)
+                self.fail(job, cause)
+                raise KeepError(507 if full else 409, cause) from exc
+            except KeepError as exc:
+                if exc.status == 507:
+                    self.fail(job, exc.detail)
+                raise
+
+    def _write(self, job: Job, file: File, offset: int, data: bytes) -> dict:
         with job.lock:
             if job.public.state != "running" or file.verified:
                 raise KeepError(409, "This Keep file is no longer receiving bytes.")

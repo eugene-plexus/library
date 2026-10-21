@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Annotated
+from typing import Annotated, Any, cast
 from urllib.parse import quote
 
 import httpx
@@ -23,14 +23,15 @@ from .._generated.models import (
 )
 from .._http import shared_internal_client
 from ..dependencies import require_authorized, require_operator
-from ..keep import CHUNK, KeepError, Keeps
+from ..keep import CHUNK, File, Job, KeepError, Keeps
 from ..node_ollama import NodeStores
 
 router = APIRouter(tags=["ollama"])
 
 
 def manager(request: Request) -> Keeps:
-    return request.app.state.keeps
+    keeps: Keeps = request.app.state.keeps
+    return keeps
 
 
 def own(node: str, claims: tokens.Claims | None) -> None:
@@ -56,7 +57,7 @@ async def limited(request: Request, limit: int) -> bytes:
     response_model=KeepJob,
     dependencies=[Depends(require_operator)],
 )
-async def keep_model(id: str, body: KeepRequest, request: Request):
+async def keep_model(id: str, body: KeepRequest, request: Request) -> KeepJob:
     keeps = manager(request)
     model = keeps.store.get_model(id)
     if model is None:
@@ -69,14 +70,14 @@ async def keep_model(id: str, body: KeepRequest, request: Request):
 @router.get(
     "/v1/keep-jobs/{id}", response_model=KeepJob, dependencies=[Depends(require_authorized)]
 )
-async def get_job(id: str, request: Request):
+async def get_job(id: str, request: Request) -> KeepJob:
     return manager(request).get(id).public
 
 
 @router.delete(
     "/v1/keep-jobs/{id}", response_model=KeepJob, dependencies=[Depends(require_operator)]
 )
-async def cancel_job(id: str, request: Request):
+async def cancel_job(id: str, request: Request) -> KeepJob:
     keeps = manager(request)
     return await asyncio.to_thread(keeps.cancel, keeps.get(id))
 
@@ -86,7 +87,7 @@ async def report(
     node: str,
     request: Request,
     claims: Annotated[tokens.Claims | None, Depends(require_authorized)],
-):
+) -> Response:
     own(node, claims)
     raw = await limited(request, 1024 * 1024)
     try:
@@ -117,14 +118,15 @@ async def report(
     response_model_exclude_none=True,
     dependencies=[Depends(require_authorized)],
 )
-async def list_reports(request: Request):
-    return request.app.state.node_ollama.listing(manager(request).store.list_models())
+async def list_reports(request: Request) -> dict[str, Any]:
+    reports: NodeStores = request.app.state.node_ollama
+    return reports.listing(manager(request).store.list_models())
 
 
-async def send_from_node(request: Request, job) -> None:
+async def send_from_node(request: Request, job: Job) -> None:
     keeps = manager(request)
     try:
-        # The local agent owns peer lookup and session translation. Its address
+        # The local agent owns peer lookup and machine credentials. Its address
         # is supplied by the supervisor, never by a worker's report or the caller.
         agent = request.app.state.settings.agent_url
         if not agent:
@@ -133,9 +135,11 @@ async def send_from_node(request: Request, job) -> None:
         response = await client.post(
             agent.rstrip("/")
             + "/api/proxy/node:"
-            + quote(job.public.node, safe="")
+            + quote(cast(str, job.public.node), safe="")
             + "/v1/ollama/send",
-            headers={"Authorization": request.headers.get("authorization", "")},
+            headers={"Authorization": "Bearer " + request.app.state.auth_state.service_token}
+            if request.app.state.auth_state.service_token
+            else {},
             json={"job": job.public.id, "digest": job.public.digest},
         )
         response.raise_for_status()
@@ -153,7 +157,7 @@ async def send_from_node(request: Request, job) -> None:
     response_model=KeepJob,
     dependencies=[Depends(require_operator)],
 )
-async def keep_remote(node: str, body: NodeOllamaKeepRequest, request: Request):
+async def keep_remote(node: str, body: NodeOllamaKeepRequest, request: Request) -> KeepJob:
     reports = request.app.state.node_ollama.reports
     for store in reports.get(node, {}).get("stores", []):
         for model in store["models"]:
@@ -179,7 +183,9 @@ async def keep_remote(node: str, body: NodeOllamaKeepRequest, request: Request):
     raise HTTPException(404, "This machine has not reported that Ollama digest.")
 
 
-def assigned(request: Request, id: str, role: str, claims):
+def assigned(
+    request: Request, id: str, role: str, claims: tokens.Claims | None
+) -> tuple[Keeps, Job, File]:
     keeps = manager(request)
     job = keeps.get(id)
     if not job.public.node:
@@ -194,7 +200,7 @@ async def file_state(
     body: KeepFileRequest,
     request: Request,
     claims: Annotated[tokens.Claims | None, Depends(require_authorized)],
-):
+) -> dict[str, Any]:
     keeps, job, file = assigned(request, id, body.role, claims)
     if job.public.state not in ("running", "done"):
         raise HTTPException(409, "This Keep is no longer running.")
@@ -208,7 +214,7 @@ async def file_chunk(
     claims: Annotated[tokens.Claims | None, Depends(require_authorized)],
     role: str = Query(pattern="^(weights|projector)$"),
     offset: int = Query(ge=0),
-):
+) -> dict[str, Any]:
     keeps, job, file = assigned(request, id, role, claims)
     data = await limited(request, CHUNK)
     return await asyncio.to_thread(keeps.write, job, file, offset, data)
@@ -220,6 +226,6 @@ async def file_complete(
     body: KeepFileRequest,
     request: Request,
     claims: Annotated[tokens.Claims | None, Depends(require_authorized)],
-):
+) -> dict[str, Any]:
     keeps, job, file = assigned(request, id, body.role, claims)
     return await asyncio.to_thread(keeps.complete, job, file)

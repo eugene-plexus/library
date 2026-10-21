@@ -380,3 +380,162 @@ def test_upload_never_opens_a_shared_inode_for_writing(remote_setup, tmp_path):
     )
     assert response.status_code == 409
     assert source.read_bytes() == data
+
+
+def test_reservations_are_atomic(kept_setup):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from eugene_plexus_library.keep import KeepError
+
+    client, model, _, _, _, _ = kept_setup
+    keeps = client.app.state.keeps
+    inserting, release, second_done = threading.Event(), threading.Event(), threading.Event()
+
+    class PausedInsert(dict):
+        def __setitem__(self, key, value):
+            if not inserting.is_set():
+                inserting.set()
+                assert release.wait(5)
+            super().__setitem__(key, value)
+
+    keeps.jobs = PausedInsert()
+
+    def reserve(second=False):
+        try:
+            return keeps.local(keeps.store.get_model(model["id"]), None)
+        except KeepError as exc:
+            return exc
+        finally:
+            if second:
+                second_done.set()
+
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(reserve)
+        assert inserting.wait(5)
+        second = pool.submit(reserve, True)
+        try:
+            assert not second_done.wait(0.2), "A second reservation passed the pending insert"
+        finally:
+            release.set()
+        assert first.result().public.state == "running"
+        assert isinstance(second.result(), KeepError)
+    assert len(keeps.jobs) == 1
+
+
+def test_startup_removes_only_orphan_keep_partials(kept_setup, tmp_path, directory_link):
+    from eugene_plexus_library.keep import Keeps
+
+    client, model, _, root, _, _ = kept_setup
+    keeps = client.app.state.keeps
+    job = keeps.local(keeps.store.get_model(model["id"]), None)
+    file = job.files["weights"]
+    file.path.parent.mkdir(parents=True)
+    file.partial.write_bytes(b"interrupted transfer")
+    projector = file.path.with_name("mmproj-" + file.path.name + ".partial")
+    projector.write_bytes(b"interrupted projector")
+    unrelated = file.path.with_name("download.gguf.partial")
+    unrelated.write_bytes(b"another module")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external = outside / "escaped.gguf.partial"
+    external.write_bytes(b"keep this")
+    directory_link(root / "ollama" / "escaped", outside)
+    final = file.path
+    final.write_bytes(b"already kept")
+    keeps.remove_orphan_partials()
+    assert file.partial.exists(), "A live job owns this partial"
+    Keeps(keeps.config, keeps.store)
+    assert not file.partial.exists()
+    assert not projector.exists()
+    assert unrelated.read_bytes() == b"another module"
+    assert external.read_bytes() == b"keep this"
+    assert final.read_bytes() == b"already kept"
+    # The old job cannot be restored, but its abandoned transfer no longer blocks a retry.
+    final.unlink()
+    restarted = Keeps(keeps.config, keeps.store)
+    assert restarted.local(keeps.store.get_model(model["id"]), None).public.state == "running"
+    # The Windows device-name prefix can add six characters after truncation.
+    reserved_name = keeps.store.get_model(model["id"]).model_copy(
+        update={"name": "CON." + "a" * 116}
+    )
+    prefixed = restarted.local(reserved_name, None).files["weights"].partial
+    prefixed.parent.mkdir(parents=True)
+    prefixed.write_bytes(b"interrupted")
+    Keeps(keeps.config, keeps.store)
+    assert not prefixed.exists()
+
+
+def test_reservation_names_existing_partial(kept_setup):
+    from eugene_plexus_library.keep import KeepError
+
+    client, model, _, _, _, _ = kept_setup
+    keeps = client.app.state.keeps
+    job = keeps.local(keeps.store.get_model(model["id"]), None)
+    keeps.cancel(job)
+    partial = job.files["weights"].partial
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"partial")
+    with pytest.raises(KeepError, match=r"\.gguf\.partial already exists"):
+        keeps.local(keeps.store.get_model(model["id"]), None)
+
+
+@pytest.mark.parametrize("cause", [errno.ENOSPC, errno.EACCES])
+def test_upload_write_error_fails_job_and_returns_cause(remote_setup, monkeypatch, cause):
+    client, job, data, headers, session, root = remote_setup
+    target = Path(job["target"])
+    partial = target.with_name(target.name + ".partial")
+    original = Path.open
+
+    def broken_open(path, *args, **kwargs):
+        if path == partial and args and args[0] in ("wb", "r+b"):
+            # Leave a real partial, as a buffered write can fail on close.
+            with original(path, "wb") as stream:
+                stream.write(b"partial")
+            raise OSError(cause, os.strerror(cause))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", broken_open)
+    response = client.put(
+        f"/v1/keep-jobs/{job['id']}/files",
+        params={"role": "weights", "offset": 0},
+        content=data,
+        headers=headers,
+    )
+    assert response.status_code == (507 if cause == errno.ENOSPC else 409), response.text
+    failed = client.get(f"/v1/keep-jobs/{job['id']}", headers=session).json()
+    assert failed["state"] == "failed"
+    expected = f"The disk holding {root} is full" if cause == errno.ENOSPC else os.strerror(cause)
+    assert expected in response.json()["detail"]["detail"] and expected in failed["error"]
+    assert not partial.exists() and not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_remote_keep_uses_library_machine_credential(kept_setup, install, monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    import httpx
+
+    from eugene_plexus_library.routes import ollama
+
+    client, model, _, _, _, _ = kept_setup
+    app = client.app
+    app.state.auth_state = install.auth_state()
+    app.state.auth_state = replace(app.state.auth_state, service_token=install.service("library"))
+    app.state.settings.agent_url = "http://local-agent"
+    job = app.state.keeps.local(app.state.state_store.get_model(model["id"]), None)
+    job.public.node = "far"
+    observed = []
+
+    async def send(request):
+        observed.append(request.headers["authorization"])
+        job.public.state = type(job.public.state).done
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as transport:
+        monkeypatch.setattr(ollama, "shared_internal_client", lambda *args, **kwargs: transport)
+        operator = install.session(aud=[install.recipient])
+        request = SimpleNamespace(app=app, headers={"authorization": "Bearer " + operator})
+        await ollama.send_from_node(request, job)
+    assert observed == ["Bearer " + app.state.auth_state.service_token]

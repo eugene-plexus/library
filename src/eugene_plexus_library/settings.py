@@ -63,8 +63,7 @@ class Settings(BaseSettings):
     """This machine as a token's audience names it: `node:<name>`."""
 
     service_token: str | None = None
-    """This library's own token, addressed to this machine alone. Not
-    consumed: the library makes no outbound calls to peers, deliberately."""
+    """This library's own token, addressed to its local agent's machine."""
 
     master_key: str | None = None
     """Base64 32-byte secretbox key for at-rest config decryption."""

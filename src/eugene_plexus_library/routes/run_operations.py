@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Iterable
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path as FilePath
@@ -374,7 +375,9 @@ async def _preparing_folder(request: Request, id: str, node: str | None, lease: 
     return FilePath(folder)
 
 
-def _target(folder: FilePath, path: str, protected=()) -> prepared_uploads.Target:
+def _target(
+    folder: FilePath, path: str, protected: Iterable[FilePath] = ()
+) -> prepared_uploads.Target:
     try:
         return prepared_uploads.target(folder, path, tuple(protected))
     except prepared_uploads.UploadRefused as exc:

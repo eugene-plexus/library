@@ -228,7 +228,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
 
     @app.exception_handler(KeepError)
-    async def keep_error(request: Request, exc: KeepError):
+    async def keep_error(request: Request, exc: KeepError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status,
             content={
