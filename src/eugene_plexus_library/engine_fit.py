@@ -120,14 +120,25 @@ def budget_of(question: FitQuestion, detected: HostHardware | None) -> MemoryBud
         cards = 1 if vram_total > 0 else 0
     ram_available = question.ramAvailableBytes
     ram_total = question.ramTotalBytes
+    unified = bool(question.unifiedMemory)
+    if unified and ram_available is not None:
+        # One pool (row 16): the total is the most the GPU may use, and what
+        # is free is the smaller of that and the RAM other programs leave.
+        # The agent reports Metal's limit as a Mac's memory and no free
+        # figure, so the caller's `vramFreeBytes` is the limit itself.
+        vram_free = min(vram_free, ram_available)
+    if ram_available is None:
+        # On a unified budget None says "what other programs hold was not
+        # known"; a total in its place would say nothing is held.
+        ram_available = None if unified else (ram_total or 0)
     return MemoryBudget(
         vramFreeBytes=vram_free,
         vramTotalBytes=vram_total,
         largestGpuFreeBytes=vram_free // cards if cards > 0 else 0,
-        ramAvailableBytes=ram_available if ram_available is not None else (ram_total or 0),
+        ramAvailableBytes=ram_available,
         ramTotalBytes=ram_total if ram_total is not None else (ram_available or 0),
         gpuCount=cards,
-        unifiedMemory=bool(question.unifiedMemory),
+        unifiedMemory=unified,
         source=Source.override,
     )
 
@@ -140,12 +151,30 @@ def _gib(count: int | None) -> str:
     return fit_mod.format_bytes(count)
 
 
+def _unified_words(result: Fit, budget: MemoryBudget, need: str, max_context: int | None) -> str:
+    """One pool (row 16): what is free now, and the limit the GPU cannot pass."""
+    limit, free = fit_mod.unified_pool(budget)
+    known = (budget.vramTotalBytes or 0) > 0
+    verdict = result.verdict
+    if verdict is FitVerdict.unknown:
+        return "this machine's memory could not be read, so there is nothing to compare against"
+    if verdict is FitVerdict.fits:
+        return f"fits in free memory: {need}, {_gib(free)} of {_gib(limit)} free now"
+    if verdict is FitVerdict.tight:
+        return f"fits once other programs close: {need}, {_gib(free)} of {_gib(limit)} free now"
+    longest = f"; it fits up to {max_context:,} tokens" if max_context else ""
+    ceiling = "the operating system lets the GPU use" if known else "this machine has"
+    return f"too large: {need}, more than the {_gib(limit)} {ceiling}{longest}"
+
+
 def _spill_words(result: Fit, max_context: int | None) -> str:
     budget = result.budget or MemoryBudget()
     need = f"about {_gib(result.requiredBytes)} at {result.contextLength:,} tokens"
     free = budget.vramFreeBytes or 0
     no_card = (budget.vramTotalBytes or 0) == 0 and not budget.unifiedMemory
     verdict = result.verdict
+    if budget.unifiedMemory:
+        return _unified_words(result, budget, need, max_context)
     if verdict is FitVerdict.unknown:
         return (
             "a graphics card here did not say how much memory it has, so there is "
@@ -245,9 +274,11 @@ def engine_fit(sizing: Sizing, engine: EligibilityEngine, question: Question) ->
         # `GET /v1/models/{id}/fit` does with `vramBytes` alone: the total is
         # for a share-taking engine, and it must not turn this page's
         # `split` into the popover's `tight`.
+        # A unified budget keeps its total: there it is the GPU's limit, and
+        # `tight` is what lies between what is free and that limit (row 16).
         spill_budget = (
             question.budget.model_copy(update={"vramTotalBytes": question.budget.vramFreeBytes})
-            if question.budget.source is Source.override
+            if question.budget.source is Source.override and not question.budget.unifiedMemory
             else question.budget
         )
         result = fit_mod.compute(

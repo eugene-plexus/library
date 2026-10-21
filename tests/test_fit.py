@@ -317,6 +317,165 @@ def test_unified_memory_has_no_split_verdict() -> None:
     assert FitVerdict.split not in verdicts
 
 
+# --------------------------------------------------------------------------- #
+# Row 16: memory in use counts on a unified budget, and the GPU limit is hard
+# --------------------------------------------------------------------------- #
+
+# A 64 GiB Mac. Metal's working-set limit is two thirds of RAM there (A4
+# measured exactly that on GitHub's macOS runners): 42.67 GiB.
+MAC_RAM = 64 * GIB
+MAC_LIMIT = MAC_RAM * 2 // 3
+
+
+def _mac(*, available: int | None, limit: bool = True, total: int | None = MAC_RAM) -> HostHardware:
+    return HostHardware(
+        hostname="mac",
+        os=Os.macos,
+        arch=Arch.arm64,
+        ramTotalBytes=total,
+        ramAvailableBytes=available,
+        unifiedMemory=True,
+        gpus=[Gpu(index=0, name="Apple M2 Max", vendor=Vendor.apple, vramTotalBytes=MAC_LIMIT)]
+        if limit
+        else [],
+    )
+
+
+def _score(required: int, budget: fit.MemoryBudget) -> fit.Fit:
+    """A fit whose `requiredBytes` is exactly `required`."""
+    kv = QWEN_SHAPE.kv_bytes(4096, KvCacheType.f16) or 0
+    result = fit.compute(
+        weights_bytes=required - kv - fit.DEFAULT_OVERHEAD_BYTES,
+        budget=budget,
+        context_length=4096,
+        shape=QWEN_SHAPE,
+    )
+    assert result.requiredBytes == required
+    return result
+
+
+def test_unified_counts_memory_in_use() -> None:
+    """**The bug.** 35 GiB is inside the 42.67 GiB macOS lets the GPU use, but
+    other programs hold all but 25 GiB of RAM, so the model does not load
+    now. It read `fits`, because the free figure was the limit itself."""
+    budget = fit.budget_from_hardware(
+        _mac(available=64 * GIB),
+        vram_override=MAC_LIMIT,
+        ram_override=25 * GIB,
+        unified_override=True,
+    )
+    result = _score(35 * GIB, budget)
+    assert result.verdict is FitVerdict.tight
+    assert budget.vramFreeBytes == 25 * GIB
+    assert budget.vramTotalBytes == MAC_LIMIT
+    assert any("once other programs close" in note for note in result.notes or [])
+
+
+def test_unified_beyond_gpu_limit_is_no() -> None:
+    """**The second half.** 50 GiB is more than the 42.67 GiB the GPU may
+    use, however much RAM there is: closing programs does not raise the
+    limit. It read `tight` against the 64 GiB of RAM."""
+    budget = fit.budget_from_hardware(
+        _mac(available=64 * GIB),
+        vram_override=MAC_LIMIT,
+        ram_override=64 * GIB,
+        unified_override=True,
+    )
+    result = _score(50 * GIB, budget)
+    assert result.verdict is FitVerdict.no
+    assert any(
+        "more than the" in note and "lets the GPU use" in note for note in result.notes or []
+    )
+
+
+def test_unified_fits_inside_free_memory() -> None:
+    budget = fit.budget_from_hardware(_mac(available=30 * GIB))
+    result = _score(20 * GIB, budget)
+    assert result.verdict is FitVerdict.fits
+    assert not any("once other programs close" in note for note in result.notes or [])
+
+
+def test_a_detected_mac_reads_what_other_programs_hold() -> None:
+    """The same rule on the host's own numbers: Metal reports no free
+    figure, so free is what the rest of RAM leaves, up to the limit."""
+    budget = fit.budget_from_hardware(_mac(available=25 * GIB))
+    assert budget.vramFreeBytes == 25 * GIB
+    assert budget.vramTotalBytes == MAC_LIMIT
+    assert budget.largestGpuFreeBytes == 25 * GIB
+    assert _score(35 * GIB, budget).verdict is FitVerdict.tight
+    assert _score(50 * GIB, budget).verdict is FitVerdict.no
+
+    idle = fit.budget_from_hardware(_mac(available=60 * GIB))
+    assert idle.vramFreeBytes == MAC_LIMIT
+    assert _score(35 * GIB, idle).verdict is FitVerdict.fits
+
+
+def test_the_notes_name_the_limit_and_the_ram_it_is_of() -> None:
+    result = _score(35 * GIB, fit.budget_from_hardware(_mac(available=25 * GIB)))
+    note = next(n for n in result.notes or [] if "lets the GPU use" in n)
+    assert "42.67 GiB" in note
+    assert "64.00 GiB" in note
+
+
+def test_one_ram_figure_from_a_caller_is_not_named_as_the_total() -> None:
+    """`ramBytes` alone becomes both RAM figures; saying a Mac has 25 GiB
+    because 25 GiB is free would be a number that lies."""
+    budget = fit.budget_from_hardware(
+        _mac(available=64 * GIB),
+        vram_override=MAC_LIMIT,
+        ram_override=25 * GIB,
+        unified_override=True,
+    )
+    note = next(n for n in _score(35 * GIB, budget).notes or [] if "lets the GPU use" in n)
+    assert "25.00 GiB" not in note
+
+
+def test_unified_without_what_other_programs_hold_scores_the_limit_and_says_so() -> None:
+    budget = fit.budget_from_hardware(_mac(available=None))
+    assert budget.vramFreeBytes == MAC_LIMIT
+    assert budget.ramAvailableBytes is None
+    fits = _score(35 * GIB, budget)
+    assert fits.verdict is FitVerdict.fits
+    assert any("what other programs hold was not known" in note for note in fits.notes or [])
+    assert _score(50 * GIB, budget).verdict is FitVerdict.no
+
+
+def test_a_caller_budget_on_another_host_does_not_borrow_this_hosts_ram() -> None:
+    """`vramBytes` for a Mac this library does not run on, with no
+    `ramBytes`: this host's free RAM says nothing about that Mac."""
+    budget = fit.budget_from_hardware(
+        _mac(available=2 * GIB), vram_override=MAC_LIMIT, unified_override=True
+    )
+    assert budget.vramFreeBytes == MAC_LIMIT
+    assert budget.ramAvailableBytes is None
+
+
+def test_unified_with_no_limit_is_scored_against_memory_as_before() -> None:
+    """Metal not reachable and RAM unreadable-is-unknown; with RAM read,
+    one pool is the ceiling (the behaviour before row 16)."""
+    budget = fit.budget_from_hardware(_mac(available=24 * GIB, limit=False, total=32 * GIB))
+    assert _score(20 * GIB, budget).verdict is FitVerdict.fits
+    assert _score(30 * GIB, budget).verdict is FitVerdict.tight
+    assert _score(40 * GIB, budget).verdict is FitVerdict.no
+
+
+def test_unified_with_neither_limit_nor_ram_is_unknown() -> None:
+    budget = fit.budget_from_hardware(_mac(available=None, limit=False, total=None))
+    result = _score(8 * GIB, budget)
+    assert result.verdict is FitVerdict.unknown
+    assert any("could not be read" in note for note in result.notes or [])
+
+
+def test_max_context_follows_free_memory_on_a_unified_budget() -> None:
+    weights = 20 * GIB
+    idle = fit.budget_from_hardware(_mac(available=60 * GIB))
+    busy = fit.budget_from_hardware(_mac(available=25 * GIB))
+    roomy = fit.max_context_that_fits(weights_bytes=weights, budget=idle, shape=QWEN_SHAPE)
+    cramped = fit.max_context_that_fits(weights_bytes=weights, budget=busy, shape=QWEN_SHAPE)
+    assert roomy is not None and cramped is not None
+    assert cramped < roomy
+
+
 def test_largest_gpu_is_reported_separately_from_the_sum() -> None:
     """ "Fits on one card" and "fits across all of them" are different
     questions with different performance — and two replicas on two cards

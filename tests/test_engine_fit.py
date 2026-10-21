@@ -341,6 +341,78 @@ def test_a_spill_engine_under_a_callers_budget_compares_free_memory() -> None:
     assert fit is not None and fit.verdict is FitVerdict.split
 
 
+# --- a unified-memory node (row 16) -----------------------------------------
+
+MAC_RAM = 64 * GIB
+MAC_LIMIT = MAC_RAM * 2 // 3  # what Metal lets the GPU use on a 64 GiB Mac (A4)
+A_SHAPE = fit_mod.ModelShape(
+    block_count=64, attention_layers=16, head_count_kv=4, key_length=256, value_length=256
+)
+
+
+def mac(ram_available: int | None) -> FitQuestion:
+    """What the console sends for a Mac: the agent reports Metal's limit as
+    the device's memory and no free figure, so free is the limit too."""
+    return FitQuestion(
+        vramFreeBytes=MAC_LIMIT,
+        vramTotalBytes=MAC_LIMIT,
+        gpuCount=1,
+        ramAvailableBytes=ram_available,
+        ramTotalBytes=MAC_RAM,
+        unifiedMemory=True,
+    )
+
+
+def needing(required: int) -> engine_fit.Sizing:
+    """A model whose `required` is exactly that at 4,096 tokens of context."""
+    kv = A_SHAPE.kv_bytes(4096, fit_mod.KvCacheType.f16) or 0
+    return engine_fit.Sizing(
+        weights_bytes=required - kv - fit_mod.DEFAULT_OVERHEAD_BYTES, shape=A_SHAPE
+    )
+
+
+def test_a_unified_node_keeps_its_gpu_limit_and_counts_what_is_free() -> None:
+    budget = engine_fit.budget_of(mac(25 * GIB), None)
+    assert (budget.vramFreeBytes, budget.vramTotalBytes) == (25 * GIB, MAC_LIMIT)
+    assert (budget.ramAvailableBytes, budget.ramTotalBytes) == (25 * GIB, MAC_RAM)
+
+
+def test_a_unified_node_without_what_is_free_is_scored_against_its_limit() -> None:
+    budget = engine_fit.budget_of(mac(None), None)
+    assert budget.vramFreeBytes == MAC_LIMIT
+    assert budget.ramAvailableBytes is None
+
+
+def test_a_spill_engine_reads_memory_in_use_on_a_unified_node() -> None:
+    """The judge's answer for a Mac. The spill engine's free-for-total
+    swap (the test above) must not erase the limit: `tight` is the answer
+    between what is free and what the GPU may use."""
+    q = question(engine_fit.budget_of(mac(25 * GIB), None), context=4096)
+    tight = engine_fit.engine_fit(needing(35 * GIB), engine(LLAMA), q)
+    assert tight.verdict is FitVerdict.tight
+    assert tight.reason.startswith("fits once other programs close")
+    assert "25.00 GiB of 42.67 GiB free now" in tight.reason
+
+    beyond = engine_fit.engine_fit(needing(50 * GIB), engine(LLAMA), q)
+    assert beyond.verdict is FitVerdict.no
+    assert "more than the 42.67 GiB the operating system lets the GPU use" in beyond.reason
+    assert beyond.maxContextLength is None
+
+    fits = engine_fit.engine_fit(needing(20 * GIB), engine(LLAMA), q)
+    assert fits.verdict is FitVerdict.fits
+    assert fits.maxContextLength is not None
+
+
+def test_nothing_known_about_a_unified_node_says_so() -> None:
+    q = question(
+        engine_fit.budget_of(FitQuestion(unifiedMemory=True, vramFreeBytes=0, gpuCount=0), None),
+        context=4096,
+    )
+    answer = engine_fit.engine_fit(needing(8 * GIB), engine(LLAMA), q)
+    assert answer.verdict is FitVerdict.unknown
+    assert "memory could not be read" in answer.reason
+
+
 def test_the_starter_sets_facts_carry_each_entrys_size() -> None:
     from eugene_plexus_library import starter
     from eugene_plexus_library._generated.models import KvCacheType

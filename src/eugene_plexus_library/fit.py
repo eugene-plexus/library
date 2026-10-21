@@ -335,6 +335,12 @@ def budget_from_hardware(
     share-taking engine's share is of the total, which an override of free
     memory alone cannot say. Without it the total is the free figure, as
     before.
+
+    **A unified budget** (Apple silicon, an integrated GPU, a GB10) is one
+    pool, so the free figure counts the memory other programs hold (row 16):
+    `vramTotalBytes` is the most the GPU may use, and `vramFreeBytes` is the
+    smaller of that and the RAM available. Without a RAM reading
+    (`ramAvailableBytes` is None) it is the limit, and `compute` says so.
     """
     per_gpu_free = [
         (gpu.vramFreeBytes if gpu.vramFreeBytes is not None else gpu.vramTotalBytes)
@@ -373,7 +379,14 @@ def budget_from_hardware(
             vram_total = max(vram_total_override, vram_free)
 
     ram_total = hardware.ramTotalBytes or 0
-    ram_available = hardware.ramAvailableBytes or ram_total
+    ram_available: int | None = hardware.ramAvailableBytes or ram_total
+    # What other programs hold is known from this host's own reading, or from
+    # the caller's `ram_override`. A caller that overrode the GPU's memory but
+    # not RAM is describing another machine, and this host's RAM says nothing
+    # about it.
+    in_use_known = ram_override is not None or (
+        vram_override is None and bool(hardware.ramAvailableBytes)
+    )
     if ram_override is not None:
         ram_total = ram_available = ram_override
         source = Source.override
@@ -382,6 +395,16 @@ def budget_from_hardware(
     if unified_override is not None:
         unified = unified_override
         source = Source.override
+
+    if unified:
+        # One pool (row 16). `vram_total` is the most the GPU may use; what
+        # it can use now is that or what other programs leave, whichever is
+        # less. A card's own free reading stays when it is already lower.
+        if in_use_known:
+            vram_free = min(vram_free, ram_available or 0)
+            largest = min(largest, vram_free)
+        else:
+            ram_available = None
 
     return MemoryBudget(
         vramFreeBytes=vram_free,
@@ -423,6 +446,27 @@ def card_of_unknown_size(budget: MemoryBudget) -> bool:
     return (budget.gpuCount or 0) > 0 and (budget.vramTotalBytes or 0) == 0
 
 
+def unified_pool(budget: MemoryBudget) -> tuple[int, int]:
+    """`(limit, free)` of a unified budget, in bytes (row 16).
+
+    The limit is the most the GPU may use: Metal's working-set limit on
+    Apple silicon, an integrated GPU's allowance, a GB10's share. Closing
+    programs does not raise it. Free is what the GPU can use now, and the
+    budget has already taken the memory other programs hold out of it.
+
+    When the limit itself is not known there is only the machine's memory
+    to score against: the RAM total is the ceiling and the RAM available
+    is what is free. Both zero is a budget with nothing to compare against.
+    """
+    limit = budget.vramTotalBytes or 0
+    free = budget.vramFreeBytes or 0
+    if limit <= 0:
+        limit = budget.ramTotalBytes or 0
+        ram_available = budget.ramAvailableBytes
+        free = ram_available if ram_available is not None else limit
+    return limit, free
+
+
 def _verdict(required: int, budget: MemoryBudget) -> FitVerdict:
     vram_free = budget.vramFreeBytes or 0
     vram_total = budget.vramTotalBytes or 0
@@ -437,10 +481,14 @@ def _verdict(required: int, budget: MemoryBudget) -> FitVerdict:
     if budget.unifiedMemory:
         # One pool. `tight` is what "would fit if you closed something"
         # means here, and there is no partial-offload case to describe
-        # because there is nothing to offload *to*.
-        if required <= vram_free or (vram_free == 0 and required <= ram_available):
+        # because there is nothing to offload *to*. Past the GPU's limit it
+        # is `no`: closing programs does not raise that (row 16).
+        limit, free = unified_pool(budget)
+        if limit <= 0:
+            return FitVerdict.unknown
+        if required <= free:
             return FitVerdict.fits
-        if required <= vram_total or required <= (budget.ramTotalBytes or 0):
+        if required <= limit:
             return FitVerdict.tight
         return FitVerdict.no
 
@@ -461,6 +509,70 @@ def _verdict(required: int, budget: MemoryBudget) -> FitVerdict:
     if required <= vram_free + ram_available:
         return FitVerdict.split
     return FitVerdict.no
+
+
+def unified_limit_words(budget: MemoryBudget) -> str:
+    """The GPU's limit in words, and the RAM it is a part of when that is known.
+
+    The library cannot tell macOS from an integrated GPU's operating system
+    or a GB10 from a budget, so the limit is the operating system's. A caller
+    that sent one RAM figure gets it as both `ramTotalBytes` and
+    `ramAvailableBytes`; naming that as the machine's memory would say a Mac
+    has the memory that is free, so the total is named only when it is
+    plainly a total (this host's own reading, or more than what is free; and
+    at least the limit).
+    """
+    limit, _ = unified_pool(budget)
+    if (budget.vramTotalBytes or 0) <= 0:
+        return f"this machine's {format_bytes(limit)} of memory"
+    ram_total = budget.ramTotalBytes or 0
+    is_a_total = budget.source is Source.detected or ram_total != budget.ramAvailableBytes
+    if ram_total >= limit and is_a_total:
+        return (
+            f"the operating system lets the GPU use {format_bytes(limit)} of this machine's "
+            f"{format_bytes(ram_total)}"
+        )
+    return f"the operating system lets the GPU use {format_bytes(limit)}"
+
+
+def _unified_notes(
+    budget: MemoryBudget, required: int, context_length: int, verdict: FitVerdict
+) -> list[str]:
+    """What a person needs to read beside a unified-memory verdict (row 16)."""
+    limit, free = unified_pool(budget)
+    if verdict is FitVerdict.unknown:
+        return [
+            "this machine's memory could not be read, so there is nothing to compare against "
+            "-- the verdict is unknown rather than a guess"
+        ]
+    need = f"about {format_bytes(required)} at {context_length:,} tokens"
+    if (budget.vramTotalBytes or 0) > 0:
+        notes = [unified_limit_words(budget)]
+    else:
+        notes = [
+            "the GPU's memory limit was not known, so this is scored against "
+            f"{unified_limit_words(budget)}"
+        ]
+    if budget.ramAvailableBytes is None:
+        notes.append(
+            "what other programs hold was not known, so this is scored against the whole "
+            f"{format_bytes(limit)}"
+        )
+    if verdict is FitVerdict.tight:
+        notes.append(
+            f"fits once other programs close: {need}, {format_bytes(free)} of "
+            f"{format_bytes(limit)} free now"
+        )
+    elif verdict is FitVerdict.no:
+        notes.append(
+            f"too large: {need}, more than the {format_bytes(limit)} "
+            + (
+                "the operating system lets the GPU use"
+                if (budget.vramTotalBytes or 0) > 0
+                else "this machine has"
+            )
+        )
+    return notes
 
 
 def compute(
@@ -525,6 +637,8 @@ def compute(
 
     required = weights_bytes + kv_bytes + overhead_total
     verdict = _verdict(required, budget)
+    if budget.unifiedMemory:
+        notes += _unified_notes(budget, required, context_length, verdict)
     offload = offload_for(
         verdict,
         weights_bytes=weights_bytes,

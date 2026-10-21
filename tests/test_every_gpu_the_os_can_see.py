@@ -181,6 +181,36 @@ def test_a_shared_pool_is_not_scored_as_spilling_into_itself(
     assert shared["fit"]["verdict"] != FitVerdict.split.value
 
 
+def test_a_shared_pool_reads_memory_in_use_and_its_limit_over_the_fit_route(
+    configured_client: TestClient, models_dir: Path
+) -> None:
+    """Row 16 through the route the console calls. `vramBytes` is the GPU's
+    limit and `ramBytes` what is free: between them is `tight`, past the
+    limit is `no`, whatever RAM there is."""
+    model_id = _scan_one(configured_client, models_dir)
+    url = f"/v1/models/{model_id}/fit"
+    base = configured_client.get(url, params={"contextLength": 4096}).json()
+    required = base["fit"]["requiredBytes"]
+    shared = {"contextLength": 4096, "unifiedMemory": "true"}
+
+    busy = configured_client.get(
+        url, params={**shared, "vramBytes": required * 2, "ramBytes": required // 2}
+    ).json()["fit"]
+    assert busy["verdict"] == FitVerdict.tight.value
+    assert busy["budget"]["vramFreeBytes"] == required // 2
+    assert busy["budget"]["vramTotalBytes"] == required * 2
+
+    beyond = configured_client.get(
+        url, params={**shared, "vramBytes": required // 2, "ramBytes": 64 * GIB}
+    ).json()["fit"]
+    assert beyond["verdict"] == FitVerdict.no.value
+
+    idle = configured_client.get(
+        url, params={**shared, "vramBytes": required * 2, "ramBytes": required * 4}
+    ).json()["fit"]
+    assert idle["verdict"] == FitVerdict.fits.value
+
+
 RX_7900 = gpu_probe.Adapter(
     name="AMD Radeon RX 7900 XTX",
     vendor=gpu_probe.AMD,
