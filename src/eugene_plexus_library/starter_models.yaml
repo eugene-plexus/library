@@ -147,6 +147,15 @@ classes:
   parameters: 34660610688
   architecture: qwen35moe
   contextLength: 262144
+  cpuProof:
+    decodeTokensPerSecond: 13.85
+    promptTokensPerSecond: 175.4
+    promptTokens: 512
+    decodeTokens: 128
+    threads: 16
+    engine: llama_cpp b10948
+    measuredOn: '2026-10-21'
+    machine: "AMD Ryzen 9 9950X (16 cores), Troy's workstation"
   evidence:
     downloads30d: 4338121
     repos: [unsloth/Qwen3.6-35B-A3B-GGUF, unsloth/Qwen3.6-35B-A3B-MTP-GGUF, HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive,

@@ -8,9 +8,17 @@ all four in.
 
 from __future__ import annotations
 
+import asyncio
+import copy
+from pathlib import Path
 from typing import Any
 
+import pytest
+import yaml
+
 from eugene_plexus_library import starter_review as review
+
+from .test_starter import cpu_proof
 
 
 def row(
@@ -360,3 +368,242 @@ def test_the_architecture_list_is_parsed_from_the_engine_source() -> None:
     };
     """
     assert review.parse_architectures(source) >= {"llama", "qwen3", "gemma4"}
+
+
+def recorded_entry(size=5 * 1024**3):
+    return {
+        "class": "8B",
+        "baseModel": "V/Current",
+        "repo": "unsloth/current-GGUF",
+        "recommended": {"file": "current-Q4_K_M.gguf", "sizeBytes": size},
+        "cpuProof": cpu_proof(),
+        "evidence": {"consecutiveReviewsAtTop": 2},
+    }
+
+
+def review_command(
+    monkeypatch,
+    tmp_path,
+    entries,
+    *,
+    engine="b10948",
+    enabled=True,
+    previous=None,
+    challenger=False,
+    cli=False,
+):
+    answers = [
+        row("unsloth/current-GGUF", downloads=100, base="V/Current"),
+        row("bartowski/current-GGUF", downloads=90, base="V/Current"),
+    ]
+    if challenger:
+        answers.extend(
+            [
+                row("unsloth/new-GGUF", downloads=300, base="V/New"),
+                row("bartowski/new-GGUF", downloads=290, base="V/New"),
+            ]
+        )
+
+    async def listing(self, **kwargs):
+        return answers
+
+    async def architectures(tag):
+        return {"qwen35"}
+
+    async def build(client, candidate, *, size_class):
+        result = recorded_entry()
+        result.update(baseModel=candidate.name, repo="unsloth/new-GGUF")
+        result["recommended"]["file"] = "new-Q4_K_M.gguf"
+        result.pop("cpuProof")
+        return result
+
+    monkeypatch.setattr(review.HubClient, "list_models", listing)
+    monkeypatch.setattr(review, "engine_architectures", architectures)
+    monkeypatch.setattr(review, "build_entry", build)
+    path = tmp_path / "current.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            previous
+            or {
+                "reviewed": "2026-09-21",
+                "engine": "llama_cpp b10948",
+                "classes": entries,
+            }
+        )
+    )
+    if cli:
+        report = tmp_path / "report.md"
+        proposal = tmp_path / "proposed.yaml"
+        review.main(
+            [
+                "--starter-file",
+                str(path),
+                "--report",
+                str(report),
+                "--proposed",
+                str(proposal),
+                "--no-cpu-proof",
+                "--pages",
+                "1",
+                "--limit",
+                "100",
+                "--base-url",
+                "https://hub.invalid",
+            ]
+        )
+        return report.read_text(encoding="utf-8"), yaml.safe_load(proposal.read_text()), []
+    return asyncio.run(
+        review.review(
+            starter_file=path,
+            engine_tag=engine,
+            pages=1,
+            limit=100,
+            base_url="https://hub.invalid",
+            token=None,
+            cpu_proof_enabled=enabled,
+        )
+    )
+
+
+def test_proof_kept_when_file_and_engine_unchanged(monkeypatch, tmp_path):
+    entry = recorded_entry()
+    text, proposed, verdicts = review_command(monkeypatch, tmp_path, [entry])
+    assert proposed["classes"][0]["cpuProof"] == entry["cpuProof"]
+    assert next(v for v in verdicts if v.size_class == "8B").check == "cpu"
+    assert "13.85 tok/s" in text and cpu_proof()["machine"] in text
+
+
+@pytest.mark.parametrize("changed", ["repo", "file", "size"])
+def test_large_proof_invalidated_when_inputs_change(changed):
+    entry = recorded_entry(9 * 1024**3)
+    # The recorded proof belongs to the current row, whereas the replacement
+    # names a changed file. Exercise the carry check used for KEEP and REPLACE.
+    original = copy.deepcopy(entry)
+    if changed == "repo":
+        entry["repo"] += "-changed"
+    elif changed == "file":
+        entry["recommended"]["file"] = "changed.gguf"
+    else:
+        entry["recommended"]["sizeBytes"] += 1
+    assert review.kept_cpu_proof(entry, original, "b10948") is None
+
+
+def test_a_large_files_hand_proof_survives_a_new_engine_tag(monkeypatch, tmp_path):
+    entry = recorded_entry(9 * 1024**3)
+    entry["cpuProof"]["engine"] = "llama_cpp old"
+    text, proposed, verdicts = review_command(monkeypatch, tmp_path, [entry])
+    assert proposed["classes"][0]["cpuProof"] == entry["cpuProof"]
+    assert "hand measurement is needed" not in text
+    assert next(v for v in verdicts if v.size_class == "8B").check == "cpu"
+
+
+def test_a_small_files_proof_is_measured_again_under_a_new_engine_tag():
+    entry = recorded_entry()
+    entry["cpuProof"]["engine"] = "llama_cpp old"
+    assert review.kept_cpu_proof(entry, copy.deepcopy(entry), "b10948") is None
+
+
+def test_large_hand_proof_kept(monkeypatch, tmp_path):
+    entry = recorded_entry(22_134_528_992)
+    _, proposed, _ = review_command(monkeypatch, tmp_path, [entry])
+    assert proposed["classes"][0]["cpuProof"] == entry["cpuProof"]
+
+
+def test_small_files_measured_one_at_a_time_and_deleted(monkeypatch, tmp_path):
+    from eugene_plexus_library import cpu_proof as cpu
+
+    paths = []
+    calls = []
+
+    async def engine(tag, directory):
+        calls.append(tag)
+        return Path(directory) / "llama-bench"
+
+    async def download(client, entry, path):
+        assert not any(p.exists() for p in paths)
+        path.write_bytes(b"weights")
+        paths.append(path)
+
+    def measure(bench, model, tag, **kwargs):
+        assert model.exists()
+        return cpu.CpuProof.model_validate(cpu_proof(11))
+
+    monkeypatch.setattr(cpu, "download_engine", engine)
+    monkeypatch.setattr(review, "download_cpu_model", download)
+    monkeypatch.setattr(cpu, "measure", measure)
+    first = recorded_entry(8 * 1024**3)
+    first.pop("cpuProof")
+    second = copy.deepcopy(first)
+    second["class"] = "4B"
+    second["recommended"]["sizeBytes"] = 2 * 1024**3
+    _, proposed, verdicts = review_command(monkeypatch, tmp_path, [first, second])
+    assert calls == ["b10948"]
+    assert len(paths) == 2 and not any(p.exists() for p in paths)
+    assert all(e["cpuProof"]["decodeTokensPerSecond"] == 11 for e in proposed["classes"])
+    assert next(v for v in verdicts if v.size_class == "8B").check == "cpu"
+
+
+@pytest.mark.parametrize("failure", ["engine", "download", "bench"])
+def test_cpu_failure_makes_review_with_cause(monkeypatch, tmp_path, failure):
+    from eugene_plexus_library import cpu_proof as cpu
+
+    async def engine(tag, directory):
+        if failure == "engine":
+            raise cpu.CpuProofError("HTTP 503: build unavailable")
+        return Path(directory) / "llama-bench"
+
+    async def download(client, entry, path):
+        if failure == "download":
+            raise review.HubError("HTTP 403: model download denied")
+        path.write_bytes(b"weights")
+
+    def measure(*args, **kwargs):
+        raise cpu.CpuProofError("unsupported model architecture: qwen35")
+
+    monkeypatch.setattr(cpu, "download_engine", engine)
+    monkeypatch.setattr(review, "download_cpu_model", download)
+    monkeypatch.setattr(cpu, "measure", measure)
+    entry = recorded_entry()
+    entry.pop("cpuProof")
+    text, proposed, verdicts = review_command(monkeypatch, tmp_path, [entry])
+    verdict = next(v for v in verdicts if v.size_class == "8B")
+    assert verdict.verdict == "REVIEW" and verdict.check == "architecture"
+    assert proposed["classes"][0]["cpuProof"] is None
+    expected = {
+        "engine": "HTTP 503",
+        "download": "HTTP 403",
+        "bench": "unsupported model architecture",
+    }
+    assert expected[failure] in text
+    assert "b10948" in text
+
+
+def test_no_cpu_proof_flag_skips_measurement(monkeypatch, tmp_path):
+    entry = recorded_entry()
+    entry.pop("cpuProof")
+    _, proposed, _ = review_command(monkeypatch, tmp_path, [entry], enabled=False)
+    assert proposed["classes"][0]["cpuProof"] is None
+
+
+def test_two_reviews_fire_replace(monkeypatch, tmp_path):
+    text, first, _ = review_command(
+        monkeypatch,
+        tmp_path,
+        [recorded_entry()],
+        challenger=True,
+        cli=True,
+    )
+    assert "| 8B | **REVIEW**" in text
+    assert first["classes"][0]["baseModel"] == "V/Current"
+    text, second, _ = review_command(
+        monkeypatch,
+        tmp_path,
+        [],
+        previous=first,
+        challenger=True,
+        cli=True,
+    )
+    assert "| 8B | **REPLACE**" in text
+    entry = second["classes"][0]
+    assert entry["baseModel"] == "V/New"
+    assert entry["evidence"]["consecutiveReviewsAtTop"] == 2

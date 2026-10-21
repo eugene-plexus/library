@@ -130,6 +130,92 @@ def test_the_shipped_list_names_the_engine_it_was_verified_against() -> None:
     assert (starter.load().engine or "").startswith("llama_cpp b")
 
 
+def cpu_proof(decode: float = 13.85) -> dict:
+    return {
+        "decodeTokensPerSecond": decode,
+        "promptTokensPerSecond": 175.4,
+        "promptTokens": 512,
+        "decodeTokens": 128,
+        "threads": 16,
+        "engine": "llama_cpp b10948",
+        "machine": "AMD Ryzen 9 9950X (16 cores), Troy's workstation",
+        "measuredOn": "2026-10-21",
+    }
+
+
+def cpu_set(tmp_path: Path, classes: list[dict], **kwargs) -> object:
+    loaded = starter.load(str(write(tmp_path, {"reviewed": "2026-10-21", "classes": classes})))
+    return starter.build(
+        loaded, budget=budget(0), context_length=8192, kv_cache_type=KvCacheType.f16, **kwargs
+    )
+
+
+def test_cpu_pick_uses_measured_speed(tmp_path: Path) -> None:
+    classes = [
+        entry("4B", size=2 * GIB, params=4_000_000_000),
+        entry("8B", size=5 * GIB, params=8_000_000_000),
+        entry("14B", size=7 * GIB, params=14_000_000_000),
+    ]
+    for item, speed in zip(classes, (20, 11, 6), strict=True):
+        item["cpuProof"] = cpu_proof(speed)
+    result = cpu_set(tmp_path, classes, cpu_floor_tokens_per_second=8)
+    assert result.recommended.sizeClass == "8B"
+    assert "11 tok/s" in result.recommended.reason
+    assert "at least 8 tok/s" in result.recommended.reason
+    assert cpu_proof()["machine"] in result.recommended.reason
+    assert result.models[1].cpuProof.decodeTokensPerSecond == 11
+
+
+def test_cpu_reason_says_tokens_not_words(three_classes: starter.StarterList) -> None:
+    result = starter.build(
+        three_classes, budget=budget(0), context_length=8192, kv_cache_type=KvCacheType.f16
+    )
+    assert "tokens" in result.recommended.reason
+    assert "words" not in result.recommended.reason
+    assert "4 tok/s" in result.recommended.reason
+
+
+def test_no_proof_keeps_smallest_and_says_so(three_classes: starter.StarterList) -> None:
+    result = starter.build(
+        three_classes, budget=budget(0), context_length=8192, kv_cache_type=KvCacheType.f16
+    )
+    assert result.recommended.sizeClass == "4B"
+    assert "No measured entry reached the 4 tok/s floor" in result.recommended.reason
+
+
+def test_moe_without_proof_never_cpu_pick(tmp_path: Path) -> None:
+    moe = entry("30B MoE", size=GIB, params=30_000_000_000)
+    moe["recommended"]["expertBytes"] = GIB // 2
+    dense = entry("4B", size=2 * GIB, params=4_000_000_000)
+    result = cpu_set(tmp_path, [moe, dense])
+    assert result.recommended.sizeClass == "4B"
+    only_moe = cpu_set(tmp_path, [moe])
+    assert only_moe.recommended.sizeClass is None
+
+
+def test_proven_moe_can_win_at_the_default_floor(tmp_path: Path) -> None:
+    dense = entry("4B", size=2 * GIB, params=4_000_000_000)
+    dense["cpuProof"] = cpu_proof(20)
+    moe = entry("30B MoE", size=20 * GIB, params=35_000_000_000)
+    moe["recommended"]["expertBytes"] = 18 * GIB
+    moe["cpuProof"] = cpu_proof(4)
+    assert cpu_set(tmp_path, [dense, moe]).recommended.sizeClass == "30B MoE"
+    moe["recommended"]["sizeBytes"] = 40 * GIB
+    assert cpu_set(tmp_path, [dense, moe]).recommended.sizeClass == "4B"
+
+
+def test_shipped_moe_has_the_recorded_hand_proof() -> None:
+    result = starter.build(
+        starter.load(),
+        budget=budget(0, ram=64 * GIB),
+        context_length=8192,
+        kv_cache_type=KvCacheType.f16,
+    )
+    moe = next(m for m in result.models if m.sizeClass == "30B MoE")
+    assert moe.cpuProof.model_dump(mode="json") == cpu_proof()
+    assert result.recommended.sizeClass == "30B MoE"
+
+
 # --- degrading ---------------------------------------------------------
 
 

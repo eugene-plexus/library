@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_library import hardware
 from eugene_plexus_library._generated.models import Arch, Gpu, HostHardware, Os, Vendor
+from eugene_plexus_library.config import ConfigStore
 
 from .conftest import mock_hubs
 
@@ -110,6 +111,42 @@ def test_the_starter_set_is_served_with_a_recommendation(
     assert body["reviewedDaysAgo"] >= 0
     for model in body["models"]:
         assert model["fit"]["verdict"] in {"fits", "tight", "split", "no"}
+
+
+def test_cpu_floor_is_configurable_and_applies_immediately(catalogue_client):
+    client = catalogue_client
+    key = "starterCpuFloorTokensPerSecond"
+    fields = {f["key"]: f for f in client.get("/v1/config/schema").json()["fields"]}
+    assert fields[key]["default"] == 4
+    assert fields[key]["minimum"] == 1 and fields[key]["maximum"] == 100
+    assert client.get("/v1/config").json()[key] == 4
+    url = "/v1/catalogue/starter?vramBytes=0&ramBytes=68719476736"
+    first = client.get(url).json()
+    assert first["recommended"]["sizeClass"] == "30B MoE"
+    assert "Troy's workstation" in first["recommended"]["reason"]
+    changed = client.patch("/v1/config", json={key: 14}).json()
+    assert changed["applied"] == [key] and not changed["rejected"]
+    assert client.get("/v1/config").json()[key] == 14
+    second = client.get(url).json()
+    assert second["recommended"]["sizeClass"] == "4B"
+    assert "14 tok/s floor" in second["recommended"]["reason"]
+    for invalid in (0, 101, True):
+        assert client.patch("/v1/config", json={key: invalid}).json()["rejected"]
+    client.patch("/v1/config", json={key: None})
+    assert client.get("/v1/config").json()[key] == 4
+
+
+@pytest.mark.parametrize("value", ["broken", -1, 101, True, float("nan"), float("inf")])
+def test_invalid_saved_cpu_floor_uses_and_reports_default(tmp_path, value):
+    import yaml
+
+    key = "starterCpuFloorTokensPerSecond"
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({key: value}))
+    store = ConfigStore(path)
+    store.load()
+    assert store.as_document().model_dump()[key] == 4
+    assert store.starter_cpu_floor_tokens_per_second() == 4
 
 
 def test_it_answers_with_the_hub_unreachable(offline_client: TestClient) -> None:

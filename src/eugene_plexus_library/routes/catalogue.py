@@ -532,6 +532,7 @@ async def get_starter_models(
         context_length=contextLength or config.guidance_context_length(),
         kv_cache_type=kvCacheType,
         store=store,
+        cpu_floor_tokens_per_second=config.starter_cpu_floor_tokens_per_second(),
     )
 
 

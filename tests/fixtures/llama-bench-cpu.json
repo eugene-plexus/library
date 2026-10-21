@@ -1,0 +1,26 @@
+[
+  {
+    "build_commit": "recorded",
+    "build_number": 10948,
+    "cpu_info": "AMD Ryzen 9 9950X 16-Core Processor",
+    "model_filename": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "n_threads": 16,
+    "n_gpu_layers": 0,
+    "n_prompt": 512,
+    "n_gen": 0,
+    "avg_ts": 175.4,
+    "stddev_ts": 3.5
+  },
+  {
+    "build_commit": "recorded",
+    "build_number": 10948,
+    "cpu_info": "AMD Ryzen 9 9950X 16-Core Processor",
+    "model_filename": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "n_threads": 16,
+    "n_gpu_layers": 0,
+    "n_prompt": 0,
+    "n_gen": 128,
+    "avg_ts": 13.85,
+    "stddev_ts": 0.27
+  }
+]

@@ -73,6 +73,7 @@ import json
 import logging
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -80,8 +81,10 @@ from typing import Any
 
 import httpx
 import yaml
+from pydantic import ValidationError
 
 from . import catalogue as catalogue_mod
+from . import cpu_proof as cpu_mod
 from . import fit as fit_mod
 from . import preflight as preflight_mod
 from . import starter as starter_mod
@@ -432,6 +435,8 @@ class ClassVerdict:
     leader: Candidate | None
     runners_up: list[Candidate]
     check: str
+    cpu_proof: cpu_mod.CpuProof | None = None
+    cpu_statistics: dict[str, float] = field(default_factory=dict)
 
 
 def verdict_for(
@@ -808,6 +813,22 @@ def report(
         a("")
         a(v.detail)
         a("")
+        if v.cpu_proof is not None:
+            proof = v.cpu_proof
+            a(
+                f"CPU: {proof.decodeTokensPerSecond:g} tok/s decode, "
+                f"{proof.promptTokensPerSecond:g} tok/s prompt on {proof.machine}; "
+                f"{proof.threads} threads, {proof.engine}, {proof.measuredOn}."
+            )
+            if v.cpu_statistics:
+                a(
+                    "Standard deviation across three runs: "
+                    + ", ".join(
+                        f"{name} {speed:g} tok/s" for name, speed in v.cpu_statistics.items()
+                    )
+                    + "."
+                )
+            a("")
         if v.runners_up:
             a("Runners-up:")
             a("")
@@ -854,6 +875,135 @@ def report(
 # --- the run -----------------------------------------------------------
 
 
+def kept_cpu_proof(
+    entry: dict[str, Any], current: dict[str, Any] | None, engine_tag: str
+) -> cpu_mod.CpuProof | None:
+    """A proof identifies the repo, file, byte size and measured engine tag.
+
+    A file over 8 GiB is never measured by this review, so its proof is a hand
+    measurement. It is kept across a new engine tag (decode speed on a processor
+    moves little between builds) and still names the build it was made with.
+    """
+    if current is None or not current.get("cpuProof"):
+        return None
+    before, after = current.get("recommended") or {}, entry.get("recommended") or {}
+    if (
+        current.get("repo") != entry.get("repo")
+        or before.get("file") != after.get("file")
+        or before.get("sizeBytes") != after.get("sizeBytes")
+    ):
+        return None
+    try:
+        proof = cpu_mod.CpuProof.model_validate(current["cpuProof"])
+    except ValidationError:
+        return None
+    if (after.get("sizeBytes") or 0) > cpu_mod.MAX_MODEL_BYTES:
+        return proof
+    return proof if proof.engine == f"llama_cpp {engine_tag}" else None
+
+
+async def download_cpu_model(client: HubClient, entry: dict[str, Any], path: Path) -> None:
+    """Stream one file into the review's temporary directory."""
+    recommended = entry["recommended"]
+    async with client.stream(entry["repo"], revision="main", path=recommended["file"]) as res:
+        res.raise_for_status()
+        handle = await asyncio.to_thread(path.open, "wb")
+        size = 0
+        try:
+            async for chunk in res.aiter_bytes(1024 * 1024):
+                size += len(chunk)
+                if size > recommended["sizeBytes"]:
+                    raise cpu_mod.CpuProofError("The downloaded model exceeds its recorded size.")
+                await asyncio.to_thread(handle.write, chunk)
+        finally:
+            await asyncio.to_thread(handle.close)
+    if size != recommended["sizeBytes"]:
+        raise cpu_mod.CpuProofError(
+            f"The downloaded model has {size} bytes; expected {recommended['sizeBytes']}."
+        )
+
+
+async def prove_cpu_entries(
+    client: HubClient,
+    *,
+    proposed: dict[str, Any],
+    current: dict[str, Any],
+    verdicts: list[ClassVerdict],
+    engine_tag: str,
+    enabled: bool,
+) -> None:
+    by_current = {e["class"]: e for e in current.get("classes") or []}
+    by_verdict = {v.size_class: v for v in verdicts}
+    pending = []
+    for entry in proposed["classes"]:
+        verdict = by_verdict[entry["class"]]
+        proof = kept_cpu_proof(entry, by_current.get(entry["class"]), engine_tag)
+        entry["cpuProof"] = proof.model_dump(mode="json") if proof else None
+        verdict.cpu_proof = proof
+        if proof:
+            verdict.check = "cpu"
+            continue
+        size = (entry.get("recommended") or {}).get("sizeBytes")
+        if size is not None and size > cpu_mod.MAX_MODEL_BYTES:
+            verdict.detail += " The file is over 8 GiB; a hand measurement is needed."
+        elif not enabled:
+            verdict.detail += " CPU measurement is disabled; no new speed was measured."
+        elif size is None:
+            verdict.verdict = "REVIEW"
+            verdict.detail += " The recommended file's size is missing; no speed was measured."
+        else:
+            pending.append(entry)
+    if not pending:
+        return
+
+    # One engine, then one model at a time, including on download or load failure.
+    with tempfile.TemporaryDirectory(prefix="starter-cpu-") as temp:
+        directory = Path(temp)
+        try:
+            bench = await cpu_mod.download_engine(engine_tag, directory)
+        except cpu_mod.CpuProofError as exc:
+            for verdict in verdicts:
+                verdict.verdict = "REVIEW"
+                verdict.check = "architecture"
+                verdict.cpu_proof = None
+                verdict.detail += (
+                    f" The pinned CPU build {engine_tag} could not be downloaded: {exc}. "
+                    "No speed was measured."
+                )
+            for entry in proposed["classes"]:
+                entry["cpuProof"] = None
+            return
+        for entry in pending:
+            verdict = by_verdict[entry["class"]]
+            model = directory / "model.gguf"
+            try:
+                try:
+                    await download_cpu_model(client, entry, model)
+                except (HubError, httpx.HTTPError, OSError, cpu_mod.CpuProofError) as exc:
+                    raise cpu_mod.CpuProofError(
+                        f"{entry['baseModel']}'s model file could not be downloaded: {exc}"
+                    ) from exc
+                proof = await asyncio.to_thread(
+                    cpu_mod.measure,
+                    bench,
+                    model,
+                    engine_tag,
+                    statistics=verdict.cpu_statistics,
+                )
+                entry["cpuProof"] = proof.model_dump(mode="json")
+                verdict.cpu_proof = proof
+                verdict.check = "cpu"
+            except cpu_mod.CpuProofError as exc:
+                verdict.verdict = "REVIEW"
+                verdict.check = "architecture"
+                verdict.detail += (
+                    f" {entry['baseModel']} did not load or produce a CPU measurement on "
+                    f"the pinned CPU build {engine_tag}: {exc}."
+                )
+            finally:
+                await asyncio.to_thread(model.unlink, missing_ok=True)
+
+
 async def review(
     *,
     starter_file: Path,
@@ -862,6 +1012,7 @@ async def review(
     limit: int,
     base_url: str,
     token: str | None,
+    cpu_proof_enabled: bool = True,
 ) -> tuple[str, dict[str, Any], list[ClassVerdict]]:
     client = HubClient()
     client.configure(base_url=base_url, token=token, enabled=True)
@@ -878,6 +1029,14 @@ async def review(
             )
             for item in current_raw.get("classes") or []
         }
+        # A challenger must retain its streak without replacing the current row.
+        # New files record the previous leader separately, so a change at the top
+        # also resets a formerly shipped model's old streak.
+        if "reviewLeaders" in current_raw:
+            streak = {
+                str(item["baseModel"]).lower(): int(item["consecutiveReviewsAtTop"])
+                for item in current_raw["reviewLeaders"].values()
+            }
         by_current = {str(item.get("class")): item for item in current_raw.get("classes") or []}
 
         verdicts = [
@@ -895,12 +1054,22 @@ async def review(
             "reviewed": date.today().isoformat(),
             "engine": f"llama_cpp {engine_tag}",
             "classes": [],
+            "reviewLeaders": {
+                v.size_class: {
+                    "baseModel": v.leader.name,
+                    "consecutiveReviewsAtTop": streak.get(v.leader.key, 0) + 1,
+                }
+                for v in verdicts
+                if v.leader is not None
+            },
         }
         for v in verdicts:
             if v.verdict == "REPLACE" and v.leader is not None:
                 entry = await build_entry(client, v.leader, size_class=v.size_class)
                 if entry is not None:
-                    entry.setdefault("evidence", {})["consecutiveReviewsAtTop"] = 1
+                    entry.setdefault("evidence", {})["consecutiveReviewsAtTop"] = (
+                        streak.get(v.leader.key, 0) + 1
+                    )
                     proposed["classes"].append(entry)
                     continue
                 v.verdict = "REVIEW"
@@ -917,6 +1086,15 @@ async def review(
                     )
                     kept["evidence"] = evidence
                 proposed["classes"].append(kept)
+
+        await prove_cpu_entries(
+            client,
+            proposed=proposed,
+            current=current_raw,
+            verdicts=verdicts,
+            engine_tag=engine_tag,
+            enabled=cpu_proof_enabled,
+        )
 
         leaders = {v.leader.key for v in verdicts if v.leader}
         new_this_month = sorted(
@@ -974,6 +1152,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=100, help="Repos per page.")
     parser.add_argument("--base-url", default="https://huggingface.co")
     parser.add_argument("--token", default=None)
+    parser.add_argument(
+        "--no-cpu-proof",
+        action="store_true",
+        help="Skip CPU measurements; retain only proofs whose file and engine are unchanged.",
+    )
     parser.add_argument("--report", type=Path, default=None, help="Write the report here.")
     parser.add_argument(
         "--proposed",
@@ -1004,6 +1187,7 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             base_url=args.base_url,
             token=args.token,
+            cpu_proof_enabled=not args.no_cpu_proof,
         )
     )
 

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import re
 import threading
 import time
@@ -253,6 +254,23 @@ FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.file_path,
     ),
     ConfigField(
+        key="starterCpuFloorTokensPerSecond",
+        label="Starter CPU speed floor",
+        description=(
+            "The minimum measured speed for a starter model on a machine with no graphics card.\n\n"
+            "In tok/s, from 1 to 100; the default is 4. The measurement belongs to the "
+            "named test processor. Your processor may be faster or slower. The largest "
+            "entry that fits and reaches this floor is recommended. If none does, the "
+            "smallest dense entry that fits is recommended. After the download, "
+            "Benchmark measures the speed here."
+        ),
+        category="guidance",
+        valueType=ConfigValueType.number,
+        default=4,
+        minimum=1,
+        maximum=100,
+    ),
+    ConfigField(
         key="logLevel",
         label="Log level",
         description=(
@@ -403,6 +421,8 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
     if vt in (ConfigValueType.number, ConfigValueType.duration):
         if isinstance(value, bool) or not isinstance(value, int | float):
             return f"expected number, got {type(value).__name__}"
+        if field.key == "starterCpuFloorTokensPerSecond" and not math.isfinite(value):
+            return "must be a finite number"
         if field.minimum is not None and value < field.minimum:
             return f"must be >= {field.minimum}"
         if field.maximum is not None and value > field.maximum:
@@ -475,6 +495,11 @@ class ConfigStore:
                     # it was on; an empty token read as "<redacted>".
                     if _is_unset(field, value):
                         value = field.default
+                    if key == "starterCpuFloorTokensPerSecond":
+                        error = _validate_value(field, value)
+                        if error:
+                            log.warning("%s: %s; using the default %s", key, error, field.default)
+                            value = field.default
                     merged[key] = value
                 # An empty list on disk is "nothing configured", and the
                 # environment's default fills it -- including a file
@@ -740,6 +765,9 @@ class ConfigStore:
     def guidance_context_length(self) -> int:
         value = self.get("guidanceContextLength")
         return value if isinstance(value, int) and value > 0 else 16384
+
+    def starter_cpu_floor_tokens_per_second(self) -> float:
+        return float(self.get("starterCpuFloorTokensPerSecond"))
 
     def _sealed(self, value: str | None) -> Any:
         """A secret as the file holds it: sealed when there is a master key."""

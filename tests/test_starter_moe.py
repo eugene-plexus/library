@@ -299,6 +299,7 @@ def test_the_review_gives_the_moe_class_a_verdict_and_proposes_its_leader(
             limit=1,
             base_url="https://hub.invalid",
             token=None,
+            cpu_proof_enabled=False,
         )
     )
     moe = next(v for v in verdicts if v.size_class == "30B MoE")

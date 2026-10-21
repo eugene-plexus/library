@@ -58,10 +58,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from . import fit as fit_mod
 from ._generated.models import (
     AlreadyOwned,
+    CpuProof,
     EligibilityCandidate,
     FitOffload,
     FitVerdict,
@@ -161,6 +163,7 @@ class StarterEntry:
     license: str | None = None
     downloads_30d: int | None = None
     expert_bytes: int | None = None
+    cpu_proof: CpuProof | None = None
     shape: fit_mod.ModelShape = field(default_factory=fit_mod.ModelShape)
 
 
@@ -245,6 +248,12 @@ def _entry(item: Any, *, index: int, notes: list[str]) -> StarterEntry | None:
     evidence: dict[str, Any] = raw_evidence if isinstance(raw_evidence, dict) else {}
     raw_shape = item.get("shape")
     shape_raw: dict[str, Any] = raw_shape if isinstance(raw_shape, dict) else {}
+    proof = None
+    if item.get("cpuProof") is not None:
+        try:
+            proof = CpuProof.model_validate(item["cpuProof"])
+        except ValidationError as exc:
+            notes.append(f"Entry {index} has an invalid CPU proof ({exc}); speed is unknown.")
     return StarterEntry(
         size_class=str(item["class"]),
         base_model=str(item["baseModel"]),
@@ -262,6 +271,7 @@ def _entry(item: Any, *, index: int, notes: list[str]) -> StarterEntry | None:
         # every entry written before it was, which reads as unknown and
         # so as dense for the pick: nothing is guessed from a name.
         expert_bytes=_as_int(rec.get("expertBytes")),
+        cpu_proof=proof,
         shape=fit_mod.ModelShape(
             block_count=_as_int(shape_raw.get("blockCount")),
             attention_layers=_as_int(shape_raw.get("attentionLayers")),
@@ -285,6 +295,7 @@ def build(
     kv_cache_type: KvCacheType,
     store: StateStore | None = None,
     today: date | None = None,
+    cpu_floor_tokens_per_second: float = 4,
 ) -> StarterSet:
     """Score every entry against one machine, and pick one.
 
@@ -295,7 +306,12 @@ def build(
         _score(entry, budget=budget, context_length=context_length, kv=kv_cache_type, store=store)
         for entry in starter.entries
     ]
-    recommended = recommend(models, context_length=context_length, budget=budget)
+    recommended = recommend(
+        models,
+        context_length=context_length,
+        budget=budget,
+        cpu_floor_tokens_per_second=cpu_floor_tokens_per_second,
+    )
 
     days = ((today or datetime.now(tz=UTC).date()) - starter.reviewed).days
     notes = list(starter.notes)
@@ -349,6 +365,7 @@ def _score(
         license=entry.license,
         why=entry.why,
         downloads30d=entry.downloads_30d,
+        cpuProof=entry.cpu_proof,
         fit=fit,
         maxContextLength=fit_mod.max_context_that_fits(
             weights_bytes=entry.size_bytes,
@@ -394,7 +411,11 @@ def has_no_accelerator(budget: fit_mod.MemoryBudget) -> bool:
 
 
 def recommend(
-    models: list[StarterModel], *, context_length: int, budget: MemoryBudget
+    models: list[StarterModel],
+    *,
+    context_length: int,
+    budget: MemoryBudget,
+    cpu_floor_tokens_per_second: float = 4,
 ) -> StarterRecommendation | None:
     """The largest that fits entirely, with the numbers said out loud.
 
@@ -439,29 +460,46 @@ def recommend(
             )
         )
 
-    # **On a machine with no accelerator the rule inverts, and it has to.**
-    # "Fits" is a question about memory; on a CPU the question a person
-    # actually has is about speed, and the two have opposite answers.
-    # 16 GB of weights fits comfortably in 32 GB of host memory and
-    # generates at a couple of tokens a second -- which, as somebody's
-    # first sentence out of this software, is indistinguishable from
-    # broken. The guidance record already has this mistake once, in the
-    # other direction: a library measuring a NAS recommended a 57 GB
-    # BF16 download for CPU inference to an operator holding a 5090.
-    # With no card nothing can sit "on the card", so a MoE entry is never
-    # an experts-in-RAM candidate here and `fitting` is every candidate.
+    # CPU speed must have been measured. Without a qualifying proof,
+    # start with the smallest dense entry; MoE needs a proof too.
     if has_no_accelerator(budget) and fitting:
-        best = min(fitting, key=lambda m: (m.sizeBytes, m.parameters or 0))
-        assert best.fit is not None
+        floor = cpu_floor_tokens_per_second
+        proven = [
+            m
+            for m in fitting
+            if m.cpuProof is not None and m.cpuProof.decodeTokensPerSecond >= floor
+        ]
+        if proven:
+            best = max(proven, key=lambda m: (m.sizeBytes, m.parameters or 0))
+            proof = best.cpuProof
+            assert proof is not None
+            return StarterRecommendation(
+                sizeClass=best.sizeClass,
+                reason=(
+                    f"{best.baseModel} is the largest of these that generated at least "
+                    f"{floor:g} tok/s on a test processor "
+                    f"({proof.machine}: {proof.decodeTokensPerSecond:g} tok/s). "
+                    "On a machine with no graphics card, the processor computes every token, "
+                    "so speed decides. Yours may be faster or slower. After the download, "
+                    f"Benchmark measures it here. {best.label}, "
+                    f"{fit_mod.format_bytes(best.sizeBytes)}."
+                ),
+            )
+        dense_fitting = [m for m in fitting if not is_moe(m)]
+        lack = f"No measured entry reached the {floor:g} tok/s floor among those that fit here."
+        if not dense_fitting:
+            return StarterRecommendation(
+                reason=f"{lack} No dense entry fits in memory here. Discover has smaller models."
+            )
+        best = min(dense_fitting, key=lambda m: (m.sizeBytes, m.parameters or 0))
         return StarterRecommendation(
             sizeClass=best.sizeClass,
             reason=(
                 f"{best.baseModel} is the smallest of these, and on a machine with no "
                 f"graphics card that is the one to start with: {best.label}, "
-                f"{fit_mod.format_bytes(best.sizeBytes)}. Bigger ones fit in memory here — "
-                "they just generate a few words a second, because every token is computed "
-                "on the processor. Discover has the larger ones if you want to trade speed "
-                "for quality."
+                f"{fit_mod.format_bytes(best.sizeBytes)}. {lack} "
+                "The processor computes all tokens. After the download, Benchmark measures "
+                "the speed here. Discover has larger models if you want to trade speed for quality."
             ),
         )
 
