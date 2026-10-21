@@ -66,7 +66,8 @@ def install_members(request: Request) -> frozenset[str] | None:
     standalone node, or a root failing closed), which says nothing about
     who was removed."""
     auth = getattr(request.app.state, "auth_state", None)
-    bundle = auth.bundle.get() if auth is not None and auth.bundle is not None else None
+    source = getattr(auth, "bundle", None)
+    bundle = source.get() if source is not None else None
     if bundle is None or not any(
         key.issuer == tokens.ISSUER_CONTROL and tokens.GRANT_AUTHORITY in key.grants
         for key in bundle.keys.values()
