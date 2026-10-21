@@ -21,12 +21,15 @@ from .._generated.models import (
     ModelDeleted,
     ModelDeleteRequest,
     ModelDeletion,
+    ModelFormat,
     ModelStatus,
     PreparedModelRequest,
     Problem,
+    SpecialTokens,
 )
 from ..config import ConfigStore
 from ..dependencies import require_operator
+from ..formats import gguf
 from ..paths import is_within, same_path
 from ..scan_manager import ScanManager
 from ..store import StateStore
@@ -394,6 +397,49 @@ async def get_model(request: Request, model_id: str) -> LibraryModel:
             status.HTTP_404_NOT_FOUND, "Unknown model", f"No model with id {model_id!r}."
         )
     return model
+
+
+#: (path, mtime, size) -> spellings. A vocabulary is read whole for this, so
+#: it is read once per file; a model replaced on disk is read again.
+_SPECIAL_CACHE: dict[tuple[str, int, int], list[str]] = {}
+_SPECIAL_CACHE_MAX = 64
+
+
+@router.get("/v1/models/{model_id}/special-tokens", response_model=SpecialTokens)
+async def get_model_special_tokens(request: Request, model_id: str) -> SpecialTokens:
+    """The spellings this model's engine reads as special tokens in text (DI4).
+
+    The gateway breaks each one in user and tool content, so text in a
+    message cannot act as an end of turn or a new system turn."""
+    store: StateStore = request.app.state.state_store
+    model = store.get_model(model_id)
+    if model is None:
+        raise _problem(
+            status.HTTP_404_NOT_FOUND, "Unknown model", f"No model with id {model_id!r}."
+        )
+    if model.format != ModelFormat.gguf or not model.path:
+        return SpecialTokens(tokens=[])
+    path = Path(model.path)
+
+    def read() -> list[str]:
+        try:
+            stat = path.stat()
+        except OSError:
+            return []
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        cached = _SPECIAL_CACHE.get(key)
+        if cached is not None:
+            return cached
+        try:
+            found = gguf.special_tokens(path)
+        except (OSError, gguf.GgufError):
+            return []
+        if len(_SPECIAL_CACHE) >= _SPECIAL_CACHE_MAX:
+            _SPECIAL_CACHE.pop(next(iter(_SPECIAL_CACHE)))
+        _SPECIAL_CACHE[key] = found
+        return found
+
+    return SpecialTokens(tokens=await asyncio.to_thread(read))
 
 
 @router.delete(

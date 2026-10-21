@@ -473,6 +473,9 @@ class _Reader:
         # was tried. This is also exact, which a buffered `tell()` after
         # a short read is not.
         self._pos = 0
+        #: Arrays read whole whatever their size: only what a caller asks
+        #: for by key (the vocabulary, for `special_tokens`).
+        self.keep: frozenset[str] = frozenset()
 
     def _fail(self, message: str) -> GgufError:
         return GgufError(f"{self._path.name}: {message}")
@@ -534,7 +537,7 @@ class _Reader:
         count = self.length(limit=_MAX_ARRAY, what="array")
         lengths[key] = count
 
-        if count <= _INLINE_ARRAY_LIMIT:
+        if count <= _INLINE_ARRAY_LIMIT or key in self.keep:
             return [self.value(element_tag, key=key, lengths={}) for _ in range(count)]
 
         # Too big to keep. Step over it — see the module docstring for
@@ -676,7 +679,11 @@ def _read_tensor_table(reader: _Reader, count: int) -> _TensorTable:
 
 
 def read_metadata_stream(
-    fh: BinaryIO, *, name: str = "<stream>", tensors: bool = False
+    fh: BinaryIO,
+    *,
+    name: str = "<stream>",
+    tensors: bool = False,
+    keep_arrays: frozenset[str] = frozenset(),
 ) -> GgufMetadata:
     """The same parse, over any seekable binary stream.
 
@@ -689,6 +696,7 @@ def read_metadata_stream(
     of guessing a window size.
     """
     reader = _Reader(fh, Path(name))
+    reader.keep = keep_arrays
 
     magic = reader.raw(4)
     if magic != MAGIC:
@@ -774,3 +782,40 @@ def quant_from_filename(name: str) -> str | None:
     """
     match = _FILENAME_QUANT_RE.search(name)
     return match.group(1).upper() if match else None
+
+
+#: `tokenizer.ggml.token_type` values llama.cpp parses as special when it
+#: tokenizes text with special-token parsing on: unknown, control and
+#: user-defined (`llama-vocab.cpp`, the special-token cache). Normal (1),
+#: unused (5) and byte (6) tokens are not.
+_SPECIAL_TYPES = frozenset({2, 3, 4})
+#: What a markup spelling holds: `< > [ ] |`, or DeepSeek's full-width bar.
+_MARKUP = frozenset("<>[]|\uff5c")
+_VOCAB = frozenset({"tokenizer.ggml.tokens", "tokenizer.ggml.token_type"})
+
+
+def special_tokens(path: Path) -> list[str]:
+    """The spellings this model's engine reads as special tokens in text (DI4).
+
+    Reads the whole vocabulary, which `read_metadata` never does, so it is
+    for one model on request. Only spellings that look like markup are
+    kept: three characters or more, not all whitespace, holding one of
+    `< > [ ] |` or the full-width bar. A whitespace or word token a
+    vocabulary marks user-defined is left out, because breaking it would
+    change ordinary text. Longest first, each once."""
+    with path.open("rb") as fh:
+        meta = read_metadata_stream(fh, name=path.name, keep_arrays=_VOCAB)
+    tokens = meta.kv.get("tokenizer.ggml.tokens")
+    types = meta.kv.get("tokenizer.ggml.token_type")
+    if not isinstance(tokens, list) or not isinstance(types, list):
+        return []
+    found = {
+        token
+        for token, kind in zip(tokens, types, strict=False)
+        if isinstance(token, str)
+        and kind in _SPECIAL_TYPES
+        and len(token) >= 3
+        and not token.isspace()
+        and any(c in _MARKUP for c in token)
+    }
+    return sorted(found, key=lambda t: (-len(t), t))

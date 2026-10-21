@@ -1921,6 +1921,13 @@ class RecommendedSampling(BaseModel):
     topP: float | None = None
 
 
+class SpecialTokens(BaseModel):
+    tokens: list[str] = Field(
+        ...,
+        description='Each spelling once, longest first, so a matcher that tries them\nin order never breaks a long spelling at a shorter one inside it.\n',
+    )
+
+
 class ProfileMode(StrEnum):
     """
     What to start a model as: the agent's `RuntimeMode`, with the same
