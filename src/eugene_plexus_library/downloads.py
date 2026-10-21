@@ -140,13 +140,21 @@ def _role_for(path: str, *, index: int) -> ModelFileRole:
 
 def _in_store(path: Path, stores: list[Path] | None) -> Path | None:
     """The Ollama store `path` is, or is inside, if any (CX9)."""
-    return next((s for s in stores or [] if path_utils.is_within(path, s)), None)
+    return next(
+        (
+            s
+            for s in stores or []
+            if path_utils.is_within(path, s) or path_utils.real_within(path, s)
+        ),
+        None,
+    )
 
 
 def _refuse_store(path: Path, store: Path) -> DownloadError:
+    relation = "in" if path_utils.is_within(path, store) else "a link into"
     return DownloadError(
-        f"{path} is in the Ollama model store {store}. Ollama manages the files in it and "
-        "the Library never writes there, so a download cannot land in it. Choose another folder.",
+        f"{path} is {relation} the Ollama model store {store}. Ollama manages the files "
+        "there, and the Library never writes there. Choose another folder.",
         status=409,
         code="ReadOnlyFolder",
     )
@@ -201,6 +209,8 @@ def _resolve_destination(
     may not (an Ollama store, CX9), so a download that names one is refused
     with that reason rather than as an unknown folder.
     """
+    if root is not None and (store := _in_store(Path(root), read_only)) is not None:
+        raise _refuse_store(Path(root), store)
     if root is not None and any(path_utils.same_path(r, root) for r in read_only or []):
         raise DownloadError(
             f"{root} is an Ollama model store. Ollama manages the files in it and the Library "
@@ -350,6 +360,7 @@ class DownloadJob:
         client: HubClient | Callable[[], HubClient],
         store: StateStore,
         scan_manager: ScanManager | None,
+        guard: Callable[[Path], None] | None = None,
     ) -> None:
         self.record = record
         self.metadata = {f.path: f for f in files}
@@ -359,6 +370,7 @@ class DownloadJob:
         self._get_client = client if callable(client) else (lambda: client)
         self._store = store
         self._scan_manager = scan_manager
+        self._guard = guard or (lambda path: None)
         self.task: asyncio.Task[None] | None = None
         self._samples: list[tuple[float, int]] = []
 
@@ -405,6 +417,9 @@ class DownloadJob:
                 await self._transfer_all()
             except asyncio.CancelledError:
                 raise
+            except DownloadError as exc:
+                self._fail(str(exc), code=exc.code)
+                return
             except HubError as exc:
                 # Upstream said no in a way that says why. A gated repo
                 # or a deleted file will not succeed on a retry, so
@@ -419,7 +434,11 @@ class DownloadJob:
                         return
                     # The bytes on disk are wrong, so keeping them and
                     # resuming would compute the same wrong hash again.
-                    self._discard_partials()
+                    try:
+                        self._discard_partials()
+                    except DownloadError as refused:
+                        self._fail(str(refused), code=refused.code)
+                        return
                 elif attempt >= MAX_ATTEMPTS:
                     self._fail(str(exc), code=exc.code)
                     return
@@ -467,6 +486,7 @@ class DownloadJob:
             part = _part_path(Path(entry.destinationPath))
             if part.exists():
                 with contextlib.suppress(OSError):
+                    self._guard(part)
                     part.unlink()
             entry.bytesDownloaded = 0
             entry.state = DownloadState.queued
@@ -494,6 +514,8 @@ class DownloadJob:
     async def _transfer_one(self, entry: DownloadFile) -> None:
         destination = Path(entry.destinationPath)
         part = _part_path(destination)
+        self._guard(destination)
+        self._guard(part)
         destination.parent.mkdir(parents=True, exist_ok=True)
 
         if (
@@ -559,6 +581,7 @@ class DownloadJob:
                 base = self._sum_downloaded() - (entry.bytesDownloaded or 0)
 
             written = offset
+            self._guard(part)
             with part.open(mode) as handle:
                 async for chunk in response.aiter_bytes(CHUNK_BYTES):
                     handle.write(chunk)
@@ -598,6 +621,7 @@ class DownloadJob:
                 remote_digest[:12],
                 have,
             )
+            self._guard(part)
             part.unlink(missing_ok=True)
             entry.sha256 = remote_digest
             entry.bytesDownloaded = 0
@@ -617,6 +641,7 @@ class DownloadJob:
                 self.record.id,
                 part.name,
             )
+            self._guard(part)
             part.unlink(missing_ok=True)
             return 0
 
@@ -675,6 +700,8 @@ class DownloadJob:
             entry.verified = True
 
         if part is not None:
+            self._guard(part)
+            self._guard(destination)
             os.replace(part, destination)
         entry.state = DownloadState.done
 
@@ -775,6 +802,7 @@ class DownloadManager:
                 client=self._client_of(record.source),
                 store=store,
                 scan_manager=scan_manager,
+                guard=self._guard_path,
             )
 
     def _resolve(self, source: str | None) -> tuple[str | None, HubClient]:
@@ -788,6 +816,20 @@ class DownloadManager:
 
     def _client_of(self, source: str | None) -> Callable[[], HubClient]:
         return lambda: self._resolve(source)[1]
+
+    def _guard_path(self, path: Path) -> None:
+        store = _in_store(path, self._read_only_roots())
+        if store is not None:
+            raise _refuse_store(path, store)
+        if not any(
+            path_utils.is_within(path, root) and path_utils.real_within(path, root)
+            for root in self._roots()
+        ):
+            raise DownloadError(f"{path} is outside a writable Library folder.", status=409)
+        if path.exists() and path.stat().st_nlink > 1:
+            raise DownloadError(
+                f"{path} shares its bytes with another file. Nothing was written.", status=409
+            )
 
     # -- reporting ----------------------------------------------------------
 
@@ -918,6 +960,7 @@ class DownloadManager:
             client=self._client_of(source),
             store=self._store,
             scan_manager=self._scan_manager,
+            guard=self._guard_path,
         )
         async with self._lock:
             if download_id is not None and (existing := self.get(download_id)) is not None:
@@ -1113,6 +1156,7 @@ class DownloadManager:
             part = _part_path(Path(entry.destinationPath))
             if part.exists():
                 with contextlib.suppress(OSError):
+                    self._guard_path(part)
                     part.unlink()
                     removed += 1
         log.info(

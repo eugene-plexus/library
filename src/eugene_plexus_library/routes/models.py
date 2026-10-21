@@ -36,7 +36,7 @@ from .._generated.models import (
 from ..config import ConfigStore
 from ..dependencies import require_operator
 from ..formats import gguf
-from ..paths import is_within, same_path
+from ..paths import is_within, real_within, same_path
 from ..scan_manager import ScanManager
 from ..store import RelocateRefused, StateStore
 
@@ -138,7 +138,7 @@ async def _fit_question(request: Request, asked: FitQuestion) -> engine_fit.Ques
 
 def _read_only_folder(path: str, stores: list[Path]) -> HTTPException | None:
     """The refusal for a path in an Ollama store: the Library never writes there."""
-    if any(is_within(path, store) for store in stores):
+    if any(is_within(path, store) or real_within(path, store) for store in stores):
         return _problem(
             status.HTTP_409_CONFLICT,
             "Ollama manages this folder",
@@ -192,6 +192,9 @@ def _write_provenance(
     if refused := _read_only_folder(str(folder), stores):
         raise refused
     target = folder / f"{body.name}{prepared.SUFFIX}"
+    for candidate in (target, target.with_name(target.name + ".partial")):
+        if refused := _read_only_folder(str(candidate), stores):
+            raise refused
     written = prepared.written_entry(entry, folder)
     resolved = prepared.entry_path(target, written)
     # The Library is the home of a model's files (Troy, LS7: B19/B20 amended),
@@ -295,7 +298,9 @@ def _refuse_ollama(model: LibraryModel, stores: list[Path]) -> None:
     By where its files are, not only by what the scan called it: a store can sit
     inside a writable folder."""
     paths = [model.path, *(f.path for f in model.files or [])]
-    if model.ollama is not None or any(is_within(p, s) for p in paths for s in stores):
+    if model.ollama is not None or any(
+        is_within(p, s) or real_within(p, s) for p in paths for s in stores
+    ):
         raise _problem(
             status.HTTP_409_CONFLICT,
             "Ollama manages this model",

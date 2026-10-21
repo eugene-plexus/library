@@ -19,6 +19,8 @@ from .catalogue_sources import HubClients
 from .config import DEFAULT_ROOTS_VARIABLE, ConfigStore
 from .dependencies import require_authorized, require_operator
 from .downloads import DownloadManager
+from .keep import KeepError, Keeps
+from .node_ollama import NodeStores
 from .profile_storage import StorageUnavailable
 from .routes import admin as admin_routes
 from .routes import catalogue as catalogue_routes
@@ -28,6 +30,7 @@ from .routes import downloads as download_routes
 from .routes import guidance as guidance_routes
 from .routes import health as health_routes
 from .routes import models as model_routes
+from .routes import ollama as ollama_routes
 from .routes import profiles as profile_routes
 from .routes import run_operations as run_routes
 from .routes import scan as scan_routes
@@ -99,6 +102,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     state_store = StateStore(settings.state_file)
     state_store.load()
     app.state.state_store = state_store
+    app.state.keeps = Keeps(config_store, state_store)
+    app.state.node_ollama = NodeStores(settings.state_file.with_suffix(".ollama.json"))
 
     manager = ScanManager(
         state_store,
@@ -151,6 +156,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # with its partial file intact, and that has to be written to
         # the state file before anything else stops.
         await app.state.download_manager.shutdown()
+        await app.state.keeps.shutdown()
         await manager.shutdown()
         await hub_clients.aclose()
 
@@ -221,6 +227,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
 
+    @app.exception_handler(KeepError)
+    async def keep_error(request: Request, exc: KeepError):
+        return JSONResponse(
+            status_code=exc.status,
+            content={
+                "detail": {
+                    "title": exc.code,
+                    "status": exc.status,
+                    "detail": exc.detail,
+                    "component": "library",
+                }
+            },
+        )
+
     @app.exception_handler(StorageUnavailable)
     async def storage_unavailable(request: Request, exc: StorageUnavailable) -> JSONResponse:
         return JSONResponse(status_code=503, content={"detail": str(exc)})
@@ -240,6 +260,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # have let a service token delete an entry or kick off a scan.
     authorized = [Depends(require_authorized)]
     app.include_router(model_routes.router, dependencies=authorized)
+    app.include_router(ollama_routes.router)
     app.include_router(scan_routes.router, dependencies=authorized)
     app.include_router(profile_routes.router, dependencies=authorized)
 

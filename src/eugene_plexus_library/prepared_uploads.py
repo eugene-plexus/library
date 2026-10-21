@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import prepared
+from .paths import is_within, real_within
 
 #: Bytes of a file still arriving, beside it. Not a name any engine opens.
 PARTIAL_SUFFIX = ".eugene-upload"
@@ -76,13 +77,14 @@ class Target:
     own: Path
     #: The file under its own name.
     path: Path
+    protected: tuple[Path, ...] = ()
 
     @property
     def partial(self) -> Path:
         return self.path.with_name(self.path.name + PARTIAL_SUFFIX)
 
 
-def target(folder: Path, path: str) -> Target:
+def target(folder: Path, path: str, protected: tuple[Path, ...] = ()) -> Target:
     """`path` (relative to the Library folder `folder`, `/` between folders)
     if it is a place a preparation may write, or why not (B105)."""
     if not path or "\\" in path or ":" in path or path.startswith("/"):
@@ -113,13 +115,20 @@ def target(folder: Path, path: str) -> Target:
     if last.endswith(PARTIAL_SUFFIX) or last == prepared.ENGINE_FILES_MARKER:
         raise UploadRefused(400, f"{last} is a name the Library keeps for itself.")
     own = folder / parts[0]
-    return Target(own=own, path=own.joinpath(*parts[1:]))
+    return Target(own=own, path=own.joinpath(*parts[1:]), protected=protected)
 
 
 def _own_folder(found: Target) -> None:
     """The engine's own folder, made and marked if there is none (B44); a
     folder of that name the person made is left alone."""
     own = found.own
+    for path in (own, found.path, found.partial):
+        if any(is_within(path, store) or real_within(path, store) for store in found.protected):
+            raise UploadRefused(
+                409,
+                f"{path} is a link into an Ollama store. The Library never writes there. "
+                "Choose another folder.",
+            )
     if _linked(own):
         raise UploadRefused(
             409, f"{own} is a link, not an engine's own folder: nothing was written in it."
@@ -157,6 +166,10 @@ def _inside(found: Target) -> None:
             raise UploadRefused(409, f"{here} is a file, not a folder: nothing was written.")
     if _linked(found.path) or _linked(found.partial):
         raise UploadRefused(409, f"{found.path} is a link: nothing was written.")
+    if found.partial.exists() and found.partial.stat().st_nlink > 1:
+        raise UploadRefused(
+            409, f"{found.partial} shares its bytes with another file: nothing was written."
+        )
 
 
 def sha256_of(path: Path) -> str:

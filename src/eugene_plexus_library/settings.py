@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     """Scanned model records and saved profiles. Machine-owned, hence
     JSON rather than the YAML the operator-facing config uses."""
 
+    agent_url: str | None = None
+    """This machine's agent, supplied by the supervisor for peer forwarding."""
+
     bind_host: str = "127.0.0.1"
     """Network interface to bind. The gateway is the thing that gets
     exposed; this stays on loopback unless an operator has a reason."""

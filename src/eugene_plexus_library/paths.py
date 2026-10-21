@@ -100,6 +100,15 @@ def is_within(child: str | os.PathLike[str], parent: str | os.PathLike[str]) -> 
     return child_parts[: len(parent_parts)] == parent_parts
 
 
+def real_within(child: str | os.PathLike[str], parent: str | os.PathLike[str]) -> bool:
+    """Containment after resolving existing symlinks and Windows junctions.
+
+    Unlike identity, write protection follows links, including existing parents
+    of a destination that has not been created yet.
+    """
+    return is_within(os.path.realpath(child), os.path.realpath(parent))
+
+
 def display_name(path: Path) -> str:
     """The name an operator calls this model.
 

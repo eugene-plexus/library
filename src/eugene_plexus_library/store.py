@@ -73,6 +73,7 @@ from ._generated.models import (
     ModelProfile,
     ModelProfileSpec,
     ModelStatus,
+    OllamaKept,
     RelocateMatch,
 )
 from ._private_files import write_private_text
@@ -169,6 +170,7 @@ class StateStore:
         self._storage_error: str | None = None
         self._lock = threading.RLock()
         self._models: dict[str, LibraryModel] = {}
+        self._kept: dict[str, OllamaKept] = {}
         self._profiles: dict[str, list[ModelProfile]] = {}
         self._downloads: dict[str, Download] = {}
         self._by_path: dict[str, LibraryModel] = {}
@@ -239,6 +241,12 @@ class StateStore:
                     log.warning("dropping unreadable cached model: %s", exc)
                     continue
                 self._models[model.id] = model
+            self._kept = {}
+            for path, value in (raw.get("keptFrom") or {}).items():
+                try:
+                    self._kept[normalize(path)] = OllamaKept.model_validate(value)
+                except (ValueError, TypeError) as exc:
+                    log.warning("Cannot read Keep provenance for %s: %s", path, exc)
             try:
                 profiles: dict[str, list[dict[str, Any]]] = {}
                 if self._profiles_path.exists():
@@ -319,6 +327,7 @@ class StateStore:
             self._writable()
             previous = copy.deepcopy(self._profiles)
             previous_models = dict(self._models)
+            previous_kept = dict(self._kept)
             try:
                 yield
                 self._write_locked()
@@ -326,6 +335,7 @@ class StateStore:
             except BaseException:
                 self._profiles = previous
                 self._models = previous_models
+                self._kept = previous_kept
                 self._reindex_locked()
                 raise
 
@@ -333,6 +343,7 @@ class StateStore:
         self._writable()
         payload = {
             "version": STATE_VERSION,
+            "keptFrom": {p: v.model_dump(mode="json") for p, v in self._kept.items()},
             "lastScanAt": self._last_scan_at.isoformat() if self._last_scan_at else None,
             "models": [m.model_dump(mode="json", exclude_none=True) for m in self._models.values()],
             "downloads": [
@@ -449,6 +460,18 @@ class StateStore:
 
             for model in found:
                 existing = previous.get(model.id)
+                kept = self._kept.get(normalize(model.path))
+                if kept is not None:
+                    model = model.model_copy(update={"keptFrom": kept, "name": kept.servedName})
+                elif existing is not None and model.ollama is not None:
+                    if existing.name in model.ollama.tags:
+                        model = model.model_copy(update={"name": existing.name})
+                    elif existing.name != model.name:
+                        log.info(
+                            "%s is gone from Ollama. This model is now served as %s.",
+                            existing.name,
+                            model.name,
+                        )
                 if existing is None:
                     added += 1
                     next_models[model.id] = model.model_copy(
@@ -495,13 +518,42 @@ class StateStore:
             self._write_locked()
             return self._with_profile_count(self._models[model.id])
 
+    def record_kept(
+        self, model: LibraryModel, kept: OllamaKept, source_id: str | None
+    ) -> LibraryModel:
+        """Apply provenance and move profiles only for a proven identical Keep.
+
+        Reuse relocate's transaction and profile collision rules. The source
+        remains present in Ollama; only its profiles move to the Library home.
+        """
+        with self._profile_transaction():
+            source = self._models.get(source_id) if source_id else None
+            if source is not None:
+                self._require_same_file(source, model, model.fingerprint, False)
+            self._kept[normalize(model.path)] = kept
+            model = model.model_copy(
+                update={
+                    "name": kept.servedName,
+                    "keptFrom": kept,
+                    "firstSeenAt": model.firstSeenAt or _now(),
+                    "lastSeenAt": _now(),
+                }
+            )
+            self._models[model.id] = model
+            if source is not None:
+                self.relocate(source.id, model.id, found=model.fingerprint, keep_source=True)
+            self._reindex_locked()
+            return self._with_profile_count(self._models[model.id])
+
     def forget_model(self, model_id: str) -> bool:
         """Drop an entry and its profiles; no file is touched here. Forget, for a
         missing model, and Delete once its files are gone (LS8)."""
         with self._profile_transaction():
             if model_id not in self._models and model_id not in self._profiles:
                 return False
-            self._models.pop(model_id, None)
+            removed = self._models.pop(model_id, None)
+            if removed is not None:
+                self._kept.pop(normalize(removed.path), None)
             self._profiles.pop(model_id, None)
             self._reindex_locked()
             return True
@@ -563,6 +615,7 @@ class StateStore:
         *,
         found: str | None,
         confirm_likely: bool = False,
+        keep_source: bool = False,
     ) -> Relocation:
         """Move a missing model's profiles to the same file at its new path, and
         forget the missing entry (row 22). All of it in one transaction: if the
@@ -575,7 +628,14 @@ class StateStore:
         every detail the entries carry and `confirm_likely`.
         """
         with self._profile_transaction():
-            source, target = self._pair_locked(source_id, target_id)
+            if keep_source:
+                source, target = self._models[source_id], self._models[target_id]
+                if source.ollama is None or target.status != ModelStatus.present:
+                    raise RelocateRefused(
+                        "Keep refused", "Keep needs a present Ollama source and Library target."
+                    )
+            else:
+                source, target = self._pair_locked(source_id, target_id)
             self._require_same_file(source, target, found, confirm_likely)
 
             moving = self._profiles.pop(source_id, [])
@@ -606,7 +666,8 @@ class StateStore:
                 warnings.extend(_stale_path_warnings(moved, old_paths))
             if not kept:
                 self._profiles.pop(target_id, None)
-            self._models.pop(source_id, None)
+            if not keep_source:
+                self._models.pop(source_id, None)
             self._reindex_locked()
             model = self._with_profile_count(self._models[target_id])
         return Relocation(model=model, moved=len(moving), renamed=renamed, warnings=warnings)

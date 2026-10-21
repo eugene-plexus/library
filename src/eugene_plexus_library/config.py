@@ -61,9 +61,9 @@ from ._generated.models import (
     ConfigValueType,
     LibraryFolder,
     LibraryFolderKind,
+    LibraryFolderStatus,
 )
 from .folders import (
-    as_models,
     coerce_folders,
     folder_kind,
     folder_paths,
@@ -71,7 +71,7 @@ from .folders import (
     folders_from_paths,
     validate_folders,
 )
-from .paths import is_within, normalize
+from .paths import is_within, normalize, real_within
 
 log = logging.getLogger(__name__)
 
@@ -470,7 +470,7 @@ class ConfigStore:
         # differs, and the schema says so (settings never lie, 2026-09-30).
         self._started: dict[str, Any] = dict(self._values)
         self._master_key = master_key
-        self._detected: tuple[float, Path | None] | None = None
+        self._detected: tuple[float, list[Path]] | None = None
 
     def _field_defaults(self) -> dict[str, Any]:
         return _defaults(default_roots=self._default_roots)
@@ -676,18 +676,21 @@ class ConfigStore:
         """Ollama's own store on this machine, when `findOllama` is on and no
         folder of kind `ollama` is configured (CX9-C2). Never written to the
         config: turning the setting off is all it takes to remove it."""
+        found = self.found_ollama_stores()
+        return found[0] if found else None
+
+    def found_ollama_stores(self) -> list[Path]:
+        """All automatically found stores, without duplicating configured ones."""
         if not self.get("findOllama"):
-            return None
+            return []
         configured = coerce_folders(self.get(ROOTS_KEY))
         if any(folder_kind(f) == "ollama" for f in configured):
-            return None
+            return []
         found = self._detected_store()
-        if found is None:
-            return None
         taken = {normalize(f["path"]) for f in configured}
-        return None if normalize(found) in taken else found
+        return [p for p in found if normalize(p) not in taken]
 
-    def _detected_store(self) -> Path | None:
+    def _detected_store(self) -> list[Path]:
         """What detection found, kept for a few seconds: the roots are asked for
         on every route, and a store on a share that has gone away must not be
         stat'ed each time."""
@@ -696,7 +699,7 @@ class ConfigStore:
             cached = self._detected
             if cached is not None and now - cached[0] < DETECTION_SECONDS:
                 return cached[1]
-        found = ollama_detect.find_store()
+        found = ollama_detect.find_stores()
         with self._lock:
             self._detected = (now, found)
         return found
@@ -705,8 +708,7 @@ class ConfigStore:
         """Every folder the Library reads: the configured ones, then Ollama's
         own store when it was found. For scanning and for "is this path in a
         Library folder"; a place to *write* is `writable_roots`."""
-        found = self.found_ollama()
-        return [*self.configured_roots(), *([found] if found is not None else [])]
+        return [*self.configured_roots(), *self.found_ollama_stores()]
 
     def ollama_roots(self) -> list[Path]:
         """The folders that are Ollama stores: read-only, never written to."""
@@ -715,8 +717,9 @@ class ConfigStore:
             for f in coerce_folders(self.get(ROOTS_KEY))
             if folder_kind(f) == "ollama"
         ]
-        found = self.found_ollama()
-        return [*roots, *([found] if found is not None else [])]
+        # Hiding a store from the catalogue does not make it writable. Also
+        # protect a detected store configured as an ordinary folder.
+        return list(dict.fromkeys([*roots, *self._detected_store()]))
 
     def writable_roots(self) -> list[Path]:
         """Where a download, a provenance file or a prepared model may be
@@ -725,19 +728,43 @@ class ConfigStore:
         roots: list[Path] = []
         for f in coerce_folders(self.get(ROOTS_KEY)):
             root = Path(f["path"]).expanduser()
-            if folder_kind(f) != "ollama" and not any(is_within(root, s) for s in stores):
+            if folder_kind(f) != "ollama" and not any(
+                is_within(root, s) or real_within(root, s) for s in stores
+            ):
                 roots.append(root)
         return roots
 
     def library_folders(self) -> list[LibraryFolder]:
         """The folders with their mounts, as the wire carries them: the
         configured ones, then Ollama's own store when it was found."""
-        folders = as_models(self.get(ROOTS_KEY))
-        found = self.found_ollama()
-        if found is not None:
+        folders = [
+            LibraryFolderStatus.model_validate({"kind": LibraryFolderKind.folder, **f})
+            for f in coerce_folders(self.get(ROOTS_KEY))
+        ]
+        for found in self.found_ollama_stores():
             folders.append(
-                LibraryFolder(path=str(found), mounts=[], kind=LibraryFolderKind.ollama, found=True)
+                LibraryFolderStatus(
+                    path=str(found), mounts=[], kind=LibraryFolderKind.ollama, found=True
+                )
             )
+        stores = self.ollama_roots()
+        for folder in folders:
+            store = next(
+                (s for s in stores if is_within(folder.path, s) or real_within(folder.path, s)),
+                None,
+            )
+            if store is not None:
+                relation = "in" if is_within(folder.path, store) else "a link into"
+                folder.readOnly = True
+                folder.readOnlyReason = (
+                    f"{folder.path} is {relation} the Ollama model store {store}. "
+                    "Ollama manages the files there, and the Library never writes there. "
+                    "Choose another folder."
+                )
+                try:
+                    list(Path(folder.path).iterdir())
+                except OSError as exc:
+                    folder.error = f"Cannot read {folder.path}: {exc}"
         return folders
 
     def catalogue_enabled(self) -> bool:

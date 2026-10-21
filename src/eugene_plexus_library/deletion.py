@@ -43,7 +43,7 @@ from ._generated.models import (
     ModelStatus,
     PreparedDependent,
 )
-from .paths import is_within
+from .paths import is_within, real_within
 
 #: Downloads still writing files.
 WRITING = {
@@ -242,7 +242,7 @@ def remove(
     A file inside a `protected` folder (an Ollama store, CX9) is never touched:
     the whole call is refused before anything moves."""
     for path in paths:
-        if any(is_within(path, store) for store in protected):
+        if any(is_within(path, store) or real_within(path, store) for store in protected):
             raise DeleteRefused(
                 f"{path} is in an Ollama model store. It is Ollama's file and the Library "
                 "does not delete it. Nothing was deleted."

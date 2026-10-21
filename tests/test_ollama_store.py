@@ -404,7 +404,14 @@ def test_the_found_store_is_a_folder_of_kind_ollama_and_not_in_the_config(
     folders = ollama_client.get("/v1/folders").json()["folders"]
     assert folders == [
         {"path": folders[0]["path"], "mounts": [], "kind": "folder"},
-        {"path": str(store), "mounts": [], "kind": "ollama", "found": True},
+        {
+            "path": str(store),
+            "mounts": [],
+            "kind": "ollama",
+            "found": True,
+            "readOnly": True,
+            "readOnlyReason": folders[1]["readOnlyReason"],
+        },
     ]
     config = ollama_client.get("/v1/config").json()
     assert [Path(f["path"]) for f in config["modelRoots"]] == [models_dir]
@@ -819,7 +826,7 @@ def test_a_writable_folder_inside_a_store_is_not_writable(tmp_path: Path, store:
     configs.apply_patch(
         _patch({"modelRoots": [{"path": str(store / "elsewhere")}, {"path": str(tmp_path / "ok")}]})
     )
-    configs._detected = (time.perf_counter(), store)
+    configs._detected = (time.perf_counter(), [store])
     assert configs.writable_roots() == [tmp_path / "ok"]
 
 
@@ -878,3 +885,46 @@ def test_a_llamacpp_child_with_no_model_falls_back_to_the_ggml_one(store: Path) 
     found = by_name(scan(store))
     assert found["fallback:latest"].ollama.tags == ["fallback:latest", "llama3:latest"]
     assert found["fallback:latest"].path.endswith(f"sha256-{digest('llama-v2')}")
+
+
+@pytest.fixture
+def kept_setup(settings, models_dir, tmp_path, monkeypatch):
+    store = tmp_path / "store"
+    source = write_gguf(store / "blobs" / "temporary", qwen_like_kv())
+    digest = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+    source = source.rename(source.with_name(digest.replace(":", "-")))
+    named(
+        store,
+        "manifests",
+        "llama3:latest",
+        manifest(
+            {
+                "mediaType": "application/vnd.ollama.image.model",
+                "digest": digest,
+            }
+        ),
+    )
+    monkeypatch.setenv("OLLAMA_MODELS", str(store))
+    settings.config_file.write_text(json.dumps({"modelRoots": [str(models_dir)]}))
+    with TestClient(create_app(settings=settings)) as client:
+        wait_for_scan(client)
+        model = next(m for m in client.get("/v1/models").json()["models"] if m.get("ollama"))
+        yield client, model, source, models_dir, store, digest
+
+
+def test_new_tag_keeps_served_name(kept_setup):
+    client, model, _, _, store, digest = kept_setup
+    named(
+        store,
+        "manifests",
+        "llama3:8b",
+        manifest(
+            {
+                "mediaType": "application/vnd.ollama.image.model",
+                "digest": digest,
+            }
+        ),
+    )
+    client.post("/v1/scan")
+    wait_for_scan(client)
+    assert client.get(f"/v1/models/{model['id']}").json()["name"] == "llama3:latest"

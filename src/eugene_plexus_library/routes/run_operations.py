@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from .. import prepared, prepared_uploads, tokens
 from .._generated.models import DownloadSpec, LibraryModel, ModelProfileSpec
 from ..dependencies import require_authorized, require_operator
-from ..paths import is_within, normalize
+from ..paths import is_within, normalize, real_within
 from ..run_operations import (
     TERMINAL,
     Checkpoint,
@@ -272,13 +272,16 @@ def _adopt(
             f"({', '.join(str(r) for r in roots) or 'none configured'}).",
         )
     folder = FilePath(entry).parent
-    if any(is_within(folder, store) for store in stores or []):
+    if any(is_within(folder, store) or real_within(folder, store) for store in stores or []):
         raise HTTPException(
             409,
             f"{folder} is in an Ollama model store, which the Library never writes to. "
             "Nothing was written.",
         )
     target = folder / f"{body.name}{prepared.SUFFIX}"
+    for path in (target, target.with_name(target.name + ".partial")):
+        if any(is_within(path, store) or real_within(path, store) for store in stores or []):
+            raise HTTPException(409, f"{path} is a link into an Ollama store. Nothing was written.")
     written = prepared.written_entry(entry, folder)
     if not os.path.isfile(prepared.entry_path(target, written)):
         raise HTTPException(400, f"The prepared entry {entry} is not there. Nothing was written.")
@@ -371,9 +374,9 @@ async def _preparing_folder(request: Request, id: str, node: str | None, lease: 
     return FilePath(folder)
 
 
-def _target(folder: FilePath, path: str) -> prepared_uploads.Target:
+def _target(folder: FilePath, path: str, protected=()) -> prepared_uploads.Target:
     try:
-        return prepared_uploads.target(folder, path)
+        return prepared_uploads.target(folder, path, tuple(protected))
     except prepared_uploads.UploadRefused as exc:
         raise HTTPException(exc.status, exc.detail) from None
 
@@ -392,7 +395,7 @@ async def prepared_file_state(
     """What the library holds of one file of the preparation: whole (its
     size and SHA-256), and what has arrived of a send not complete."""
     folder = await _preparing_folder(request, id, node, body.lease)
-    found = _target(folder, body.path)
+    found = _target(folder, body.path, request.app.state.config_store.ollama_roots())
     return {"path": body.path, **await _refused(prepared_uploads.state, found)}
 
 
@@ -419,7 +422,7 @@ async def prepared_file_chunk(
     """One chunk of a file of the preparation, at `offset`: what has arrived
     so far, or 0 to start the file again (B104)."""
     folder = await _preparing_folder(request, id, node, lease)
-    found = _target(folder, path)
+    found = _target(folder, path, request.app.state.config_store.ollama_roots())
     data = await _capped_body(request)
     received = await _refused(prepared_uploads.write, found, offset, data)
     return {"path": path, "sizeBytes": None, "sha256": None, "receivedBytes": received}
@@ -435,7 +438,7 @@ async def prepared_file_complete(
     """Every byte is sent: checked against the size and SHA-256 the node
     states, then under its own name. Again for a file in place: no change."""
     folder = await _preparing_folder(request, id, node, body.lease)
-    found = _target(folder, body.path)
+    found = _target(folder, body.path, request.app.state.config_store.ollama_roots())
     held = await _refused(prepared_uploads.complete, found, body.sizeBytes, body.sha256)
     return {"path": body.path, **held}
 
