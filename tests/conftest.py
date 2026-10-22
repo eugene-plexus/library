@@ -192,6 +192,14 @@ def write_gguf(
     return path
 
 
+def pad_gguf(path: Path, data_bytes: int, *, alignment: int = 32) -> Path:
+    """Give a header fixture a data region without allocating its weights in RAM."""
+    size = path.stat().st_size
+    with path.open("r+b") as stream:
+        stream.truncate(size + (-size % alignment) + data_bytes)
+    return path
+
+
 def qwen_like_kv(
     *,
     name: str = "Test 7B",

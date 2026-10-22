@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import struct
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from eugene_plexus_library import fit as fit_mod
 from eugene_plexus_library._generated.models import FitOffload, FitVerdict, HostHardware
 from eugene_plexus_library.formats import gguf
 
-from .conftest import qwen_like_kv, write_gguf
+from .conftest import pad_gguf, qwen_like_kv, write_gguf
 
 GIB = 2**30
 # ggml type ids and sizes, restated rather than imported: a fixture that
@@ -27,7 +28,10 @@ def _tensor(name: str, dims: list[int], ggml_type: int, offset: int = 0) -> byte
 
 def _model(tmp_path: Path, tensors: list[tuple[str, list[int], int]], name="m.gguf") -> Path:
     payload = b"".join(_tensor(n, d, t) for n, d, t in tensors)
-    return write_gguf(tmp_path / name, qwen_like_kv(), tensor_count=len(tensors), payload=payload)
+    path = write_gguf(tmp_path / name, qwen_like_kv(), tensor_count=len(tensors), payload=payload)
+    sizes = {F32: (1, 4), Q8_0: (32, 34), Q4_K: (256, 144), UNKNOWN: (1, 0)}
+    largest = max(math.prod(d) // sizes[t][0] * sizes[t][1] for _, d, t in tensors)
+    return pad_gguf(path, largest)
 
 
 def test_the_tensor_table_gives_expert_bytes_and_never_needs_the_weights(tmp_path):
@@ -170,6 +174,7 @@ def test_a_sharded_models_experts_are_summed_across_its_parts(tmp_path):
         parts.append(
             write_gguf(root / f"moe-0000{index}-of-00002.gguf", kv, tensor_count=1, payload=payload)
         )
+        pad_gguf(parts[-1], 256 * 256 * 8 // 256 * 144)
     result = Scanner().scan([root])
     model = next(m for m in result.models if m.path == str(parts[0]))
     assert model.gguf.shardCount == 2
