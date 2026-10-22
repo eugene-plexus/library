@@ -605,9 +605,12 @@ def read_metadata(path: Path, *, tensors: bool = False) -> GgufMetadata:
     propagate: a permission error or a vanished file is the caller's to
     classify, and folding it into `GgufError` would report a locked file
     as a malformed one.
+
+    With `tensors=True`, also check known tensor byte ranges against the
+    local file's size. Unknown types remain readable, without a size estimate.
     """
     with path.open("rb") as fh:
-        return read_metadata_stream(fh, name=path.name, tensors=tensors)
+        return read_metadata_stream(fh, name=path.name, tensors=tensors, validate_data=tensors)
 
 
 # ggml's own type table: (elements per block, bytes per block), by the
@@ -674,6 +677,8 @@ class _TensorTable:
     nextn_blocks: frozenset[int]
     has_first_block: bool
     has_markov_head: bool
+    data_end: int
+    last_tensor: str
 
 
 def is_expert_tensor(name: str) -> bool:
@@ -690,6 +695,8 @@ def _read_tensor_table(reader: _Reader, count: int) -> _TensorTable:
     nextn: set[int] = set()
     first_block = False
     markov_head = False
+    data_end = 0
+    last_tensor = ""
     for _ in range(min(count, _MAX_TENSORS)):
         name = reader.string()
         classifier |= name.startswith("cls.")
@@ -705,12 +712,14 @@ def _read_tensor_table(reader: _Reader, count: int) -> _TensorTable:
         for _ in range(dims):
             elements *= int(reader.scalar(T_UINT64))
         ggml_type = int(reader.scalar(T_UINT32))
-        reader.scalar(T_UINT64)  # offset
+        offset = int(reader.scalar(T_UINT64))
         size = GGML_TYPE_SIZES.get(ggml_type)
         if size is None or elements % size[0]:
             known = False
             continue
         nbytes = elements // size[0] * size[1]
+        if offset + nbytes > data_end:
+            data_end, last_tensor = offset + nbytes, name
         total += nbytes
         if is_expert_tensor(name):
             experts += nbytes
@@ -721,6 +730,8 @@ def _read_tensor_table(reader: _Reader, count: int) -> _TensorTable:
         frozenset(nextn),
         first_block,
         markov_head,
+        data_end,
+        last_tensor,
     )
 
 
@@ -730,6 +741,7 @@ def read_metadata_stream(
     name: str = "<stream>",
     tensors: bool = False,
     keep_arrays: frozenset[str] = frozenset(),
+    validate_data: bool = False,
 ) -> GgufMetadata:
     """The same parse, over any seekable binary stream.
 
@@ -739,7 +751,8 @@ def read_metadata_stream(
     `general.file_type` rather than on a filename. A buffer that stops
     inside the KV block raises `GgufTruncated` carrying the offset it
     wanted, so the caller fetches exactly that much and retries instead
-    of guessing a window size.
+    of guessing a window size. `validate_data` is only for a complete local
+    file; a remote probe intentionally omits the weights.
     """
     reader = _Reader(fh, Path(name))
     reader.keep = keep_arrays | _TARGET_ARRAYS
@@ -778,6 +791,17 @@ def read_metadata_stream(
     non_causal = kv.get(f"{architecture}.attention.causal") is False
     if tensors or non_causal:
         table = _read_tensor_table(reader, tensor_count)
+        if validate_data and table.last_tensor:
+            alignment = kv.get("general.alignment", 32)
+            if not _is_int(alignment) or alignment <= 0:
+                alignment = 32
+            data_start = reader.tell() + (-reader.tell() % alignment)
+            end = data_start + table.data_end
+            if end > reader._end:
+                raise reader._fail(
+                    f"tensor {table.last_tensor!r} ends at byte {end}, "
+                    f"but file ends at byte {reader._end}"
+                )
         classifier = table.classifier
         markov_head = table.has_markov_head
         if tensors:

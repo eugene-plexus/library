@@ -109,7 +109,7 @@ def test_a_split_gguf_goes_whole_and_a_shared_projector_stays(models_dir: Path) 
     folder = models_dir / "vision"
     kv = qwen_like_kv(name="V") | {"split.count": 2}
     first = write_gguf(folder / "v-Q4_K_M-00001-of-00002.gguf", kv)
-    second = _write(folder / "v-Q4_K_M-00002-of-00002.gguf", b"s" * 64)
+    second = write_gguf(folder / "v-Q4_K_M-00002-of-00002.gguf", kv, payload=b"s" * 64)
     other = write_gguf(folder / "v-Q8_0.gguf", qwen_like_kv(name="V"))
     projector = write_gguf(folder / "mmproj-v-f16.gguf", {"general.architecture": "clip"})
     listed = scan(models_dir)

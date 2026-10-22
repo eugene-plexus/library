@@ -19,7 +19,7 @@ from eugene_plexus_library.downloads import _role_for
 from eugene_plexus_library.formats import gguf
 from eugene_plexus_library.scanner import Scanner
 
-from .conftest import qwen_like_kv, write_gguf
+from .conftest import pad_gguf, qwen_like_kv, write_gguf
 
 ARCH = "qwen35"
 
@@ -49,7 +49,7 @@ def _blocks(first: int, last: int, *, head: bool) -> list[str]:
 
 
 def _write(path: Path, kv: dict[str, Any], names: list[str]) -> Path:
-    return write_gguf(path, kv, tensor_count=len(names), payload=_table(names))
+    return pad_gguf(write_gguf(path, kv, tensor_count=len(names), payload=_table(names)), 128)
 
 
 def _kv(*, blocks: int, nextn: int | None = None, vocab: int = 128, name: str = "Q") -> dict:

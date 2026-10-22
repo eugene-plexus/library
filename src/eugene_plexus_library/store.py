@@ -70,6 +70,7 @@ from ._generated.models import (
     DownloadState,
     LibraryModel,
     ModelFileRole,
+    ModelFormat,
     ModelProfile,
     ModelProfileSpec,
     ModelStatus,
@@ -170,6 +171,7 @@ class StateStore:
         self._storage_error: str | None = None
         self._lock = threading.RLock()
         self._models: dict[str, LibraryModel] = {}
+        self._unchecked_ggufs: set[str] = set()
         self._kept: dict[str, OllamaKept] = {}
         self._profiles: dict[str, list[ModelProfile]] = {}
         self._downloads: dict[str, Download] = {}
@@ -299,6 +301,11 @@ class StateStore:
                 except ValueError:
                     self._last_scan_at = None
             self._reindex_locked()
+            # Cached entries from an older reader have no proof of valid tensor
+            # ranges. Revalidate once per process; later scans remain incremental.
+            self._unchecked_ggufs = {
+                m.id for m in self._models.values() if m.format == ModelFormat.gguf
+            }
             if self._storage_error:
                 log.error("%s", self._storage_error)
 
@@ -385,6 +392,8 @@ class StateStore:
         with self._lock:
             model = self._by_path.get(path)
             if model is None or model.status != ModelStatus.present:
+                return None
+            if model.id in self._unchecked_ggufs:
                 return None
             if model.modifiedAt is None:
                 return None
@@ -498,6 +507,7 @@ class StateStore:
                 next_models[model_id] = model.model_copy(update={"status": ModelStatus.missing})
 
             self._models = next_models
+            self._unchecked_ggufs.difference_update(m.id for m in found)
             self._last_scan_at = now
             self._reindex_locked()
             self._write_locked()

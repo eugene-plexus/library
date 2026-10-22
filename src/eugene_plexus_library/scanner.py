@@ -315,26 +315,6 @@ def _lacks_expert_bytes(model: LibraryModel) -> bool:
     )
 
 
-def _expert_bytes(metadata: gguf.GgufMetadata, shards: list[os.DirEntry[str]]) -> int | None:
-    """Expert bytes across every part of a model; None if any part is unknown.
-
-    A sharded model's tensors are spread over its parts, each with its own
-    table, so the first part's table is not the model's.
-    """
-    total = metadata.expert_bytes
-    if total is None:
-        return None
-    for entry in shards:
-        try:
-            part = gguf.read_metadata(Path(entry.path), tensors=True).expert_bytes
-        except (gguf.GgufError, OSError):
-            return None
-        if part is None:
-            return None
-        total += part
-    return total
-
-
 class Scanner:
     """Walks roots and produces models.
 
@@ -1004,6 +984,11 @@ class Scanner:
                 return
 
             cached = self._cache_lookup(cache_key(path, stat))
+            # The first part's stat cannot detect a copy interrupted in a later part.
+            if cached is not None and shards:
+                sizes = {f.path: f.sizeBytes for f in cached.files or []}
+                if any(sizes.get(e.path) != _stat_size(e) for e in shards):
+                    cached = None
             if (
                 cached is not None
                 and not _lacks_expert_bytes(cached)
@@ -1015,6 +1000,17 @@ class Scanner:
             metadata = self._read_gguf(path, result)
             if metadata is None:
                 return
+            # Validate every part, even when an unknown type prevents sizing
+            # the whole model. Carry the experts' sum forward without re-reading.
+            for shard in shards:
+                part = self._read_gguf(Path(shard.path), result)
+                if part is None:
+                    return
+                metadata.expert_bytes = (
+                    metadata.expert_bytes + part.expert_bytes
+                    if metadata.expert_bytes is not None and part.expert_bytes is not None
+                    else None
+                )
             if metadata.is_projector:
                 projectors.append((entry, metadata))
                 return
@@ -1149,7 +1145,7 @@ class Scanner:
         name = display_name(path)
         declared = metadata.name
         sampling = metadata.recommended_sampling
-        expert_bytes = _expert_bytes(metadata, shards)
+        expert_bytes = metadata.expert_bytes
 
         return LibraryModel(
             id=model_id(path),

@@ -39,6 +39,7 @@ from .conftest import (
     cross_encoder_kv,
     decoder_embedding_kv,
     embedding_kv,
+    pad_gguf,
     qwen_like_kv,
     reranker_kv,
     write_gguf,
@@ -129,7 +130,7 @@ def test_classifier_tensors_identify_only_non_causal_rerankers(tmp_path, causal,
     kv["bert.attention.causal"] = causal
     encoded = name.encode()
     table = struct.pack("<Q", len(encoded)) + encoded + struct.pack("<I Q I Q", 1, 8, 0, 0)
-    path = write_gguf(tmp_path / "head.gguf", kv, tensor_count=1, payload=table)
+    path = pad_gguf(write_gguf(tmp_path / "head.gguf", kv, tensor_count=1, payload=table), 32)
     for tensors in (False, True):
         meta = gguf.read_metadata(path, tensors=tensors)
         assert meta.is_rerank is expected
