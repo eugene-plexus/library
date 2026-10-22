@@ -2044,22 +2044,11 @@ class DraftKind(StrEnum):
       block and no first block (`--spec-type draft-mtp`).
     * `simple` — a whole small model named as a draft (`draft-*.gguf`)
       (`--spec-type draft-simple`).
-    * `dflash` — a DFlash drafter (`--spec-type draft-dflash`).
-    * `dspark` — a DSpark drafter (`--spec-type draft-dspark`).
-    * `eagle3` — an EAGLE3 drafter (`--spec-type draft-eagle3`).
-
-    DFlash, DSpark and EAGLE3 are bound to a target model by their
-    header: `general.architecture`, `<arch>.target_layers` and
-    `<arch>.target_hidden_size`. DSpark uses the `dflash` architecture
-    with a `markov_w1.weight` tensor.
 
     """
 
     mtp = 'mtp'
     simple = 'simple'
-    dflash = 'dflash'
-    dspark = 'dspark'
-    eagle3 = 'eagle3'
 
 
 class MlxQuantization(BaseModel):
@@ -2517,10 +2506,6 @@ class CatalogueFile(BaseModel):
         description='For the small non-LFS files — `config.json`, the tokenizer\nfiles, the safetensors index — which have no content digest\nupstream. They are still verifiable:\n`sha1("blob <len>\\0" + bytes)`, checked exactly against a\nreal repo. Between this and `sha256` every file has\nsomething to check, so nothing is written unverified.\n',
     )
     role: ModelFileRole | None = None
-    draftKind: DraftKind | None = Field(
-        None,
-        description='For a file in CatalogueModel.draftFiles, its kind by its name prefix (mtp-, draft-, dflash-, dspark-, eagle3-). The scan reads the header after the download, and the header decides.\n',
-    )
     lfs: bool | None = Field(
         None,
         description='Whether upstream stores this through LFS. Decides which\ndigest is present, and also which redirect shape the\ndownload meets — a 302 to a signed CDN URL for LFS, a 307\nto an internal path for the rest, both mandatory to follow.\n',
@@ -4948,6 +4933,11 @@ class Message(BaseModel):
 
 class LibraryModelList(BaseModel):
     models: list[LibraryModel]
+    nextCursor: str | None = Field(
+        None,
+        description='Opaque continuation token to pass as `cursor` for the next\npage. Present only when more models remain. Omitted on the\nlast page, on an unpaginated response, and for a `path`\nlookup.\n',
+        min_length=1,
+    )
     lastScanAt: AwareDatetime | None = Field(
         None,
         description='When the walk that produced this list finished. Omitted\nbefore the first scan. Present here as well as on `Scan` so\na browser rendering the list can say how stale it is\nwithout a second call.\n',
