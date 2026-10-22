@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 
 from .. import deletion, eligibility, engine_fit, fingerprint, hardware, prepared
 from .._generated.models import (
@@ -36,6 +37,7 @@ from .._generated.models import (
 from ..config import ConfigStore
 from ..dependencies import require_operator
 from ..formats import gguf
+from ..model_pages import ModelPages
 from ..paths import is_within, real_within, same_path
 from ..scan_manager import ScanManager
 from ..store import RelocateRefused, StateStore
@@ -79,7 +81,9 @@ async def list_models(
         default=None,
         description="Reverse lookup: the single entry at this absolute path, or nothing.",
     ),
-) -> LibraryModelList:
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> JSONResponse:
     """Every model, including ones whose files are gone.
 
     `missing` entries are listed rather than hidden: they carry the
@@ -87,6 +91,7 @@ async def list_models(
     thing here that cannot be recovered by looking at the disk again.
     """
     store: StateStore = request.app.state.state_store
+    next_cursor = None
 
     if path is not None:
         found = store.find_by_path(path)
@@ -95,9 +100,30 @@ async def list_models(
         # reproduce the id derivation, case-folding and all.
         models = [found] if found else []
     else:
-        models = sorted(store.list_models(), key=lambda m: m.name.lower())
+        # Validate here, after the reverse lookup, so path ignores even bad
+        # paging parameters and invalid limits answer the contracted 400.
+        page_limit = None
+        if limit is not None:
+            try:
+                page_limit = int(limit) if limit.isascii() and limit.isdecimal() else 0
+            except ValueError:
+                page_limit = 0
+            if not 1 <= page_limit <= 500:
+                raise _problem(
+                    400, "Invalid page limit", "The limit must be an integer between 1 and 500."
+                )
+        pager: ModelPages = request.app.state.model_pages
+        try:
+            models, next_cursor = pager.page(store.list_models(), page_limit, cursor)
+        except ValueError as exc:
+            raise _problem(400, "Invalid model cursor", str(exc)) from exc
 
-    return LibraryModelList(models=models, lastScanAt=store.last_scan_at)
+    result = LibraryModelList(models=models, lastScanAt=store.last_scan_at, nextCursor=next_cursor)
+    # Omit only this new field on a last/unpaginated/path response. Recursive
+    # exclude_none/unset would also change the legacy model and scan fields.
+    return JSONResponse(
+        result.model_dump(mode="json", exclude={"nextCursor"} if next_cursor is None else set())
+    )
 
 
 @router.post("/v1/eligibility", response_model=EligibilityList)

@@ -20,6 +20,7 @@ from .config import DEFAULT_ROOTS_VARIABLE, ConfigStore
 from .dependencies import require_authorized, require_operator
 from .downloads import DownloadManager
 from .keep import KeepError, Keeps
+from .model_pages import ModelPages
 from .node_ollama import NodeStores
 from .profile_storage import StorageUnavailable
 from .routes import admin as admin_routes
@@ -102,6 +103,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     state_store = StateStore(settings.state_file)
     state_store.load()
     app.state.state_store = state_store
+    app.state.model_pages = ModelPages()
     app.state.keeps = Keeps(config_store, state_store)
     app.state.node_ollama = NodeStores(settings.state_file.with_suffix(".ollama.json"))
 
