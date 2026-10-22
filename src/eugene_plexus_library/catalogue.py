@@ -51,6 +51,7 @@ from ._generated.models import (
     CatalogueModel,
     CatalogueRecommendation,
     CatalogueSearchResult,
+    DraftKind,
     EligibilityCandidate,
     EngineKind,
     EngineModelList,
@@ -96,11 +97,10 @@ _DOC_NAMES = {"readme.md", "license", "license.txt", ".gitattributes", "notice"}
 
 _PROJECTOR_RE = re.compile(r"(^|[/_-])mmproj", re.IGNORECASE)
 _IMATRIX_RE = re.compile(r"imatrix", re.IGNORECASE)
-_DRAFT_RE = re.compile(r"(^|/)(mtp|draft)[-_/]|(^|[/_-])(mtp|draft)\.", re.IGNORECASE)
-# Drafters of kinds Eugene does not launch yet (llama.cpp's `draft-dflash`,
-# `draft-eagle3`, `draft-dspark`): ggml-org ships `dflash-*.gguf` beside the
-# MTP file. Never a version of the model, so never a candidate.
-_OTHER_DRAFTER_RE = re.compile(r"(^|/)(dflash|eagle3?|dspark)[-_]", re.IGNORECASE)
+_DRAFT_RE = re.compile(
+    r"(^|/)(mtp|draft|dflash|dspark|eagle3)[-_/]|(^|[/_-])(mtp|draft|dflash|dspark|eagle3)\.",
+    re.IGNORECASE,
+)
 # Does a label look like a quant tier at all? Loose on purpose: the
 # point is to tell `Q4_K_XL` and `UD-IQ2_S` (tiers we have never heard
 # of) from `instruct` or a bare model name, not to validate a list.
@@ -140,6 +140,8 @@ def _role_for(path: str, fmt: ModelFormat, *, index: int) -> ModelFileRole:
 
 
 def _to_catalogue_file(meta: FileMetadata, role: ModelFileRole) -> CatalogueFile:
+    match = _DRAFT_RE.search(meta.path) if role is ModelFileRole.draft else None
+    prefix = (match.group(2) or match.group(4)).lower() if match else None
     return CatalogueFile(
         path=meta.path,
         sizeBytes=meta.size,
@@ -147,6 +149,7 @@ def _to_catalogue_file(meta: FileMetadata, role: ModelFileRole) -> CatalogueFile
         gitBlobSha1=meta.git_blob_sha1,
         role=role,
         lfs=meta.lfs,
+        draftKind=DraftKind("simple" if prefix == "draft" else prefix) if prefix else None,
     )
 
 
@@ -244,9 +247,6 @@ def _gguf_groups(
         # precisions of one (library#13).
         if _DRAFT_RE.search(meta.path):
             drafts.append(meta)
-            continue
-        if _OTHER_DRAFTER_RE.search(meta.path):
-            other.append(meta)
             continue
 
         shard = gguf.shard_position(PurePosixPath(path.name))  # type: ignore[arg-type]

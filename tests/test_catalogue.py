@@ -148,12 +148,9 @@ def test_thirty_gguf_files_are_twenty_five_choices(info, files, store, budget) -
     ]
 
 
-def test_drafting_companions_are_offered_and_other_drafters_are_not_versions(
-    info, store, budget
-) -> None:
+def test_dflash_offered_as_draft_file(info, store, budget) -> None:
     """library#13, from ggml-org/Qwen3.6-27B-GGUF's listing (2026-10-18):
-    three MTP precisions are offered as companions, and the DFlash drafters
-    beside them are neither companions nor versions of the model."""
+    MTP and DFlash precisions are companions, never versions of the model."""
     listing = [
         ("Qwen3.6-27B-Q4_K_M.gguf", 19_095_766_304),
         ("Qwen3.6-27B-Q8_0.gguf", 28_595_762_464),
@@ -167,12 +164,39 @@ def test_drafting_companions_are_offered_and_other_drafters_are_not_versions(
     model = build(info, [FileMetadata(path=p, size=n) for p, n in listing], store, budget)
     assert sorted(c.label for c in model.candidates) == ["Q4_K_M", "Q8_0"]
     assert sorted(f.path for f in model.draftFiles or []) == [
+        "dflash-Qwen3.6-27B-BF16.gguf",
+        "dflash-Qwen3.6-27B-Q8_0.gguf",
         "mtp-Qwen3.6-27B-BF16.gguf",
         "mtp-Qwen3.6-27B-Q4_0.gguf",
         "mtp-Qwen3.6-27B-Q8_0.gguf",
     ]
-    other = {f.path for f in model.otherFiles or []}
-    assert {"dflash-Qwen3.6-27B-BF16.gguf", "dflash-Qwen3.6-27B-Q8_0.gguf"} <= other
+    assert {f.draftKind.value for f in model.draftFiles or []} == {"mtp", "dflash"}
+
+
+@pytest.mark.parametrize(
+    "prefix,kind",
+    [
+        ("mtp", "mtp"),
+        ("draft", "simple"),
+        ("DFLASH", "dflash"),
+        ("dspark", "dspark"),
+        ("eagle3", "eagle3"),
+    ],
+)
+def test_every_drafter_prefix_has_its_kind(info, store, budget, prefix, kind) -> None:
+    model = build(
+        info,
+        [
+            FileMetadata(path="model-Q4_K_M.gguf", size=1000),
+            FileMetadata(path=f"helpers/{prefix}-model-Q8_0.gguf", size=100),
+        ],
+        store,
+        budget,
+    )
+    assert len(model.candidates) == 1
+    [draft] = model.draftFiles
+    assert draft.draftKind.value == kind
+    assert draft.role is ModelFileRole.draft
 
 
 def test_every_label_is_distinct(info, files, store, budget) -> None:

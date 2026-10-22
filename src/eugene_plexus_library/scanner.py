@@ -192,12 +192,13 @@ def _stat_size(entry: os.DirEntry[str]) -> int | None:
 
 def _lacks_speculation(model: LibraryModel) -> bool:
     """A GGUF entry cached before SD1 (2026-10-18), re-read once so it says
-    whether it carries its own MTP head. Same rule as `_lacks_expert_bytes`."""
+    whether it carries its own MTP head. A bound drafter cached as a model
+    before row 17 must also be reclassified from its header."""
     return (
         model.format is ModelFormat.gguf
         and model.gguf is not None
         and model.status is ModelStatus.present
-        and model.gguf.speculation is None
+        and (model.gguf.speculation is None or model.architecture in {"dflash", "eagle3"})
     )
 
 
@@ -216,16 +217,34 @@ def _with_drafts(model: LibraryModel, drafts: list[_Draft], paired: set[str]) ->
     those: its files' `draft` entries and `sizeBytes` are rebuilt from this
     scan, so a companion deleted since the entry was cached is gone.
 
-    A companion pairs with every model of its architecture in its folder,
-    since one MTP file serves every quant of a model, and with none whose
-    vocabulary size differs from its own when both are known.
+    MTP and simple companions pair by architecture. Bound drafters pair by
+    target hidden size and layer ids. Every kind also checks vocabulary
+    size when both files declare one.
     """
     if model.format is not ModelFormat.gguf or model.gguf is None:
         return model
     detail = model.gguf
     mine: list[_Draft] = []
     for draft in drafts:
-        if draft.metadata.architecture != model.architecture:
+        if draft.kind in {DraftKind.dflash, DraftKind.dspark, DraftKind.eagle3}:
+            meta = draft.metadata
+            if meta.draft_target_problem is not None:
+                continue
+            target = detail.metadata or {}
+            hidden = target.get(f"{model.architecture}.embedding_length")
+            blocks = target.get(f"{model.architecture}.block_count")
+            minimum = meta.target_min_layers
+            if (
+                not isinstance(hidden, int)
+                or isinstance(hidden, bool)
+                or hidden != meta.target_hidden_size
+                or not isinstance(blocks, int)
+                or isinstance(blocks, bool)
+                or minimum is None
+                or blocks < minimum
+            ):
+                continue
+        elif draft.metadata.architecture != model.architecture:
             continue
         theirs = draft.metadata.vocab_size
         if theirs is not None and detail.vocabSize is not None and theirs != detail.vocabSize:
@@ -253,6 +272,31 @@ def _with_drafts(model: LibraryModel, drafts: list[_Draft], paired: set[str]) ->
             "sizeBytes": size,
             "gguf": detail.model_copy(update={"speculation": speculation}),
         }
+    )
+
+
+def _draft_skip_detail(draft: _Draft, paired: set[str]) -> str:
+    labels = {
+        DraftKind.mtp: "MTP head (draft-mtp)",
+        DraftKind.simple: "draft model (draft-simple)",
+        DraftKind.dflash: "DFlash drafter (draft-dflash)",
+        DraftKind.dspark: "DSpark drafter (draft-dspark)",
+        DraftKind.eagle3: "EAGLE3 drafter (draft-eagle3)",
+    }
+    what = labels[draft.kind]
+    if draft.entry.path in paired:
+        return f"{what} for speculative decoding with the model beside it"
+    if draft.kind in {DraftKind.mtp, DraftKind.simple}:
+        return (
+            f"{what} for speculative decoding, but no model of the same architecture is beside it"
+        )
+    meta = draft.metadata
+    problem = meta.draft_target_problem
+    if problem is not None:
+        return f"{what} cannot pair: {problem}"
+    return (
+        f"{what}, but no model it was made for is beside it: it needs hidden size "
+        f"{meta.target_hidden_size} and at least {meta.target_min_layers} layers"
     )
 
 
@@ -974,7 +1018,11 @@ class Scanner:
             if metadata.is_projector:
                 projectors.append((entry, metadata))
                 return
-            kind = metadata.draft_kind(entry.name) if not shards else None
+            kind = (
+                metadata.draft_kind(entry.name)
+                if not shards or metadata.architecture in {"dflash", "eagle3"}
+                else None
+            )
             if kind is not None:
                 drafts.append(_Draft(entry, metadata, DraftKind(kind), stat.st_size))
                 return
@@ -1041,21 +1089,11 @@ class Scanner:
                 self.counters.models_found += 1
 
         for draft in drafts:
-            what = (
-                "MTP head (draft-mtp)"
-                if draft.kind is DraftKind.mtp
-                else "draft model (draft-simple)"
-            )
             result.skipped.append(
                 SkippedPath(
                     path=draft.entry.path,
                     reason=SkipReason.draft,
-                    detail=(
-                        f"{what} for speculative decoding with the model beside it"
-                        if draft.entry.path in paired
-                        else f"{what} for speculative decoding, but no model of the same "
-                        "architecture is beside it"
-                    ),
+                    detail=_draft_skip_detail(draft, paired),
                 )
             )
 

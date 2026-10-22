@@ -111,6 +111,7 @@ _SCALAR = {
 # squeeze between the two. A per-layer array of int32 at this limit is
 # 2 KB.
 _INLINE_ARRAY_LIMIT = 512
+_TARGET_ARRAYS = frozenset({"dflash.target_layers", "eagle3.target_layers"})
 
 # Sanity ceilings. A corrupt or truncated file can present a u64 length
 # as something like 2^61; without a bound the reader tries to allocate
@@ -258,6 +259,9 @@ class GgufMetadata:
     the last block, so this is what tells it from a model that carries its
     own head (SD1). None when the table was not read."""
 
+    has_markov_head: bool = False
+    """The tensor table names `markov_w1.weight`: a DFlash file is DSpark."""
+
     @property
     def architecture(self) -> str | None:
         value = self.kv.get("general.architecture")
@@ -296,8 +300,8 @@ class GgufMetadata:
         return self.mtp_tensors and self.has_first_block is True
 
     def draft_kind(self, filename: str) -> str | None:
-        """`mtp` or `simple` when this file is a companion to draft with
-        rather than a model of its own, else None (SD1).
+        """The kind when this file is a companion rather than a model of
+        its own, else None. DFlash, DSpark and EAGLE3 are always companions.
 
         A separate MTP head is told by its tensors: the last block's
         `nextn` tensors and no first block, so it cannot run alone. A whole
@@ -305,6 +309,10 @@ class GgufMetadata:
         (`draft-*.gguf`), because any small model could otherwise be taken
         for a draft.
         """
+        if self.architecture == "dflash":
+            return "dspark" if self.has_markov_head else "dflash"
+        if self.architecture == "eagle3":
+            return "eagle3"
         if self.is_projector or self.nextn_blocks is None:
             return None
         if self.mtp_tensors and self.has_first_block is False:
@@ -313,6 +321,38 @@ class GgufMetadata:
             # llama.cpp drafts with any file that has the head as `draft-mtp`.
             return "mtp" if self.mtp_tensors else "simple"
         return None
+
+    @property
+    def target_layers(self) -> list[int] | None:
+        value = self.arch_key("target_layers")
+        if (
+            not isinstance(value, list)
+            or not 1 <= len(value) <= _INLINE_ARRAY_LIMIT
+            or any(not _is_int(layer) or layer < 0 for layer in value)
+        ):
+            return None
+        return value
+
+    @property
+    def target_hidden_size(self) -> int | None:
+        value = self.arch_key("target_hidden_size")
+        return value if _is_int(value) and value > 0 else None
+
+    @property
+    def draft_target_problem(self) -> str | None:
+        if self.target_hidden_size is None:
+            return f"missing or invalid {self.architecture}.target_hidden_size"
+        layers = self.target_layers
+        if layers is None:
+            return f"missing or invalid {self.architecture}.target_layers (1 to 512 layer ids)"
+        if self.architecture == "eagle3" and len(layers) != 3:
+            return "eagle3.target_layers must name exactly 3 target layers"
+        return None
+
+    @property
+    def target_min_layers(self) -> int | None:
+        layers = self.target_layers
+        return max(layers) + (self.architecture != "eagle3") if layers else None
 
     def arch_key(self, suffix: str) -> Any:
         """Read an architecture-prefixed key, e.g. `context_length` ->
@@ -537,7 +577,9 @@ class _Reader:
         count = self.length(limit=_MAX_ARRAY, what="array")
         lengths[key] = count
 
-        if count <= _INLINE_ARRAY_LIMIT or key in self.keep:
+        if (count <= _INLINE_ARRAY_LIMIT or key in self.keep) and (
+            key not in _TARGET_ARRAYS or count <= _INLINE_ARRAY_LIMIT
+        ):
             return [self.value(element_tag, key=key, lengths={}) for _ in range(count)]
 
         # Too big to keep. Step over it — see the module docstring for
@@ -631,6 +673,7 @@ class _TensorTable:
     classifier: bool
     nextn_blocks: frozenset[int]
     has_first_block: bool
+    has_markov_head: bool
 
 
 def is_expert_tensor(name: str) -> bool:
@@ -646,10 +689,12 @@ def _read_tensor_table(reader: _Reader, count: int) -> _TensorTable:
     classifier = False
     nextn: set[int] = set()
     first_block = False
+    markov_head = False
     for _ in range(min(count, _MAX_TENSORS)):
         name = reader.string()
         classifier |= name.startswith("cls.")
         first_block |= name.startswith("blk.0.")
+        markov_head |= name == "markov_w1.weight"
         head = _NEXTN_RE.match(name)
         if head is not None:
             nextn.add(int(head.group(1)))
@@ -675,6 +720,7 @@ def _read_tensor_table(reader: _Reader, count: int) -> _TensorTable:
         classifier,
         frozenset(nextn),
         first_block,
+        markov_head,
     )
 
 
@@ -696,7 +742,7 @@ def read_metadata_stream(
     of guessing a window size.
     """
     reader = _Reader(fh, Path(name))
-    reader.keep = keep_arrays
+    reader.keep = keep_arrays | _TARGET_ARRAYS
 
     magic = reader.raw(4)
     if magic != MAGIC:
@@ -727,11 +773,13 @@ def read_metadata_stream(
     classifier = False
     nextn_blocks: frozenset[int] | None = None
     first_block: bool | None = None
+    markov_head = False
     architecture = kv.get("general.architecture")
     non_causal = kv.get(f"{architecture}.attention.causal") is False
     if tensors or non_causal:
         table = _read_tensor_table(reader, tensor_count)
         classifier = table.classifier
+        markov_head = table.has_markov_head
         if tensors:
             tensor_bytes, expert_bytes = table.total, table.experts
             nextn_blocks, first_block = table.nextn_blocks, table.has_first_block
@@ -748,6 +796,7 @@ def read_metadata_stream(
         has_classifier_tensors=classifier,
         nextn_blocks=nextn_blocks,
         has_first_block=first_block,
+        has_markov_head=markov_head,
     )
 
 
