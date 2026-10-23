@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ._generated.models import (
     Download,
@@ -28,30 +28,39 @@ from ._generated.models import (
     EngineKind,
     LibraryModel,
     ModelProfile,
-    PreparationVisionMode,
     PreparedProvenance,
+    StrataGpuSelectionItem,
+)
+from ._generated.models import (
+    PreparationIntent as ContractPreparationIntent,
 )
 
 TERMINAL = {"ready", "skipped", "failed", "cancelled"}
 LEASE_SECONDS = 120
 
 
-class PreparationIntent(BaseModel):
-    """Prepare the model for an engine before running it (LS5). Asked for,
-    never implied: Run without it picks an engine that runs the model as it is."""
+class PreparationIntent(ContractPreparationIntent):
+    # Retain the shared schema's explanation in the exported run protocol.
+    __doc__ = ContractPreparationIntent.__doc__
+    model_config = ConfigDict(validate_default=True)
 
-    model_config = ConfigDict(extra="forbid")
-    engine: EngineKind
-    contextSize: int | None = Field(
-        default=None,
-        gt=0,
-        description="The context the engine prepares for. Absent: the engine's own "
-        "recommendation for the node.",
-    )
-    vision: PreparationVisionMode = Field(
-        default=PreparationVisionMode.off,
-        description="Image encoder placement. Off preserves text-only preparation.",
-    )
+    @field_validator("gpus", mode="before")
+    @classmethod
+    def strict_gpus(cls, value: object) -> object:
+        if value is not None and (
+            not isinstance(value, list) or any(type(i) is not int for i in value)
+        ):
+            raise ValueError("gpus must contain whole card ordinals")
+        return value
+
+    @field_validator("gpus")
+    @classmethod
+    def unique_gpus(
+        cls, value: list[StrataGpuSelectionItem] | None
+    ) -> list[StrataGpuSelectionItem] | None:
+        if value is not None and len({i.root for i in value}) != len(value):
+            raise ValueError("gpus contains duplicate card ordinals")
+        return value
 
 
 class Intent(BaseModel):
