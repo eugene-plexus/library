@@ -59,6 +59,7 @@ from ._generated.models import (
     RecommendedSampling,
 )
 from .catalogue import quant_label
+from .chat_templates import fallback_for
 from .formats import gguf, safetensors
 from .hub import HubClient, HubError
 
@@ -246,6 +247,7 @@ _MLA_ARCHITECTURES = frozenset(
         "bailingmoe3",
         "deepseek2",
         "deepseek32",
+        "deepseek4",
         "dots3note",
         "glm-dsa",
         "glm5-next",
@@ -566,6 +568,7 @@ async def preflight(
                 else filename_quant.endswith(metadata_quant)
             ),
             architecture=meta.architecture,
+            chatTemplateFallback=fallback_for(meta),
             blockCount=shape.block_count,
             attentionLayers=shape.attention_layers,
             contextLength=meta.context_length,
