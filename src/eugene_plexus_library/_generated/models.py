@@ -7,7 +7,7 @@ from datetime import date
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
+from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
 class ModelRole(StrEnum):
@@ -1921,7 +1921,7 @@ class ModelCapabilities(BaseModel):
     )
     chatTemplate: bool | None = Field(
         None,
-        description='The file embeds its own chat template. When false, something\nhas to supply one at launch, and a model answering strangely\nwith no template is a common and confusing failure.\n',
+        description='The file embeds its own chat template. When false, something\nhas to supply one at launch, and a model answering strangely\nwith no template is a common and confusing failure.\n\nAn available Eugene fallback (`GgufDetail.chatTemplateFallback`\nor `CataloguePreflight.chatTemplateFallback`) never changes\nthis to true. Unknown metadata leaves this field absent.\n',
     )
     decision: bool | None = Field(
         None,
@@ -2033,6 +2033,51 @@ class ModelFileRole(StrEnum):
     tokenizer = 'tokenizer'
     index = 'index'
     other = 'other'
+
+
+class ChatTemplateFallback(BaseModel):
+    """
+    A reviewed template Eugene can supply for this model family when
+    its header confirms both the architecture and that it has no
+    embedded chat template. Absent when that evidence is unknown,
+    when the file embeds a template, or when Eugene has no reviewed
+    fallback for this variant. A filename or a catalogue name alone
+    is not evidence.
+
+    This is availability, not the template in effect. The model page
+    can say "This model ships no chat template; Eugene supplies
+    DeepSeek V4's" and name the engines below, while keeping
+    `ModelCapabilities.chatTemplate` false. The running agent reports
+    the effective template separately as `Runtime.chatTemplate`.
+
+    Default precedence is an explicit operator override, then the
+    file's embedded template, then this fallback on an engine listed
+    below, then the engine's own behaviour. The override is exposed
+    through the engine's GUI flag schema. Missing fallback information
+    does not block a launch: engine eligibility is still decided by
+    the existing eligibility API, and untested engines remain eligible
+    under that API's rules.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Eugene's template identifier; distinct variants have distinct ids.",
+        min_length=1,
+    )
+    name: str = Field(
+        ...,
+        description='Human-readable template name for the model page.',
+        min_length=1,
+    )
+    engines: list[EngineKind] = Field(
+        ...,
+        description='Engines whose Eugene adapters can apply this fallback. This\nis not a list of engines proved to load the model; consult\neligibility for that. No engine is rejected because it is\nabsent from this list.\n',
+        min_length=1,
+    )
+    sourceUrl: AnyUrl = Field(
+        ..., description='Published upstream format or template used for the review.'
+    )
 
 
 class DraftKind(StrEnum):
@@ -4429,6 +4474,7 @@ class CataloguePreflight(BaseModel):
     dtype: str | None = None
     vocabSize: int | None = Field(None, ge=0)
     capabilities: ModelCapabilities | None = None
+    chatTemplateFallback: ChatTemplateFallback | None = None
     recommendedSampling: RecommendedSampling | None = None
     fit: Fit | None = None
     shardCount: int | None = Field(
@@ -4572,6 +4618,7 @@ class GgufDetail(BaseModel):
         description='Absolute path to the vision projector found beside this\nmodel, if any. Becomes `--mmproj` on the launch line.\nllama-server can also find it unaided, but it is reported\nbecause "this model can see" is a fact the browser should\nshow and a profile should be able to override.\n',
     )
     speculation: GgufSpeculation | None = None
+    chatTemplateFallback: ChatTemplateFallback | None = None
     recommendedSampling: RecommendedSampling | None = None
     metadata: dict[str, Any] | None = Field(
         None,
