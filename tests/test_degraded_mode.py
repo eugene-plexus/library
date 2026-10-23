@@ -131,6 +131,7 @@ def test_safe_mode_ignores_the_config_file(settings_at: Settings, models_dir: Pa
         # No roots were loaded, so nothing was scanned.
         assert client.get("/v1/models").json()["models"] == []
         assert client.get("/v1/config").json()["modelRoots"] == []
+        assert client.get("/v1/folders").json()["safeMode"] is True
 
 
 def test_safe_mode_still_writes_repairs_through_to_disk(

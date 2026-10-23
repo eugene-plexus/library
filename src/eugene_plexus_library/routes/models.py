@@ -57,7 +57,9 @@ async def list_folders(request: Request) -> LibraryFolderList:
     the same paths are on every model below.
     """
     config: ConfigStore = request.app.state.config_store
-    return LibraryFolderList(folders=config.library_folders())
+    return LibraryFolderList(
+        folders=config.library_folders(), safeMode=True if request.app.state.safe_mode else None
+    )
 
 
 def _problem(status_code: int, title: str, detail: str) -> HTTPException:
