@@ -91,6 +91,39 @@ def test_the_intent_carries_the_engine_and_context():
         Intent(modelId="m", preparation={"engine": "strata", "contextSize": 0})
 
 
+def test_strata_choices_survive_a_durable_intent(prepared_client):
+    preparation = {"engine": "strata", "speedProjection": "on", "gpus": [2, 0], "layerSplit": "24"}
+    record = _submit(prepared_client, preparation=preparation)
+    assert record["intent"]["preparation"] == {**preparation, "contextSize": None, "vision": "off"}
+    assert prepared_client.get("/v1/run-operations/p").json()["intent"] == record["intent"]
+    assert [g.root for g in Operation.model_validate(record).intent.preparation.gpus] == [2, 0]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"speedProjection": "yes"},
+        {"gpus": []},
+        {"gpus": [0, 0]},
+        {"gpus": [True]},
+        {"gpus": [-1]},
+        {"layerSplit": ""},
+    ],
+)
+def test_strata_intent_rejects_invalid_shared_shapes(change):
+    with pytest.raises(ValueError):
+        Intent(modelId="m", preparation={"engine": "strata", **change})
+
+
+def test_strata_intent_defaults_follow_the_pinned_contract():
+    intent = Intent(modelId="m", preparation={"engine": "strata"}).preparation
+    assert (
+        intent.speedProjection.value == "off"
+        and intent.gpus is None
+        and intent.layerSplit == "auto"
+    )
+
+
 @pytest.mark.parametrize("vision", ["off", "cpu", "gpu"])
 def test_image_mode_survives_a_durable_intent(prepared_client, vision):
     record = _submit(prepared_client, preparation={"engine": "strata", "vision": vision})
