@@ -993,7 +993,35 @@ class Scanner:
                 cached is not None
                 and not _lacks_expert_bytes(cached)
                 and not _lacks_speculation(cached)
+                # V4's head can live in another shard. Old cached scans
+                # recorded only the first shard's drafting tensors.
+                and not (cached.architecture == "deepseek4" and shards)
             ):
+                # Earlier scans kept the complete header's scalar metadata.
+                # Refresh the observation without re-reading a large vocabulary.
+                if (
+                    cached.architecture == "deepseek4"
+                    and cached.gguf is not None
+                    and cached.capabilities is not None
+                    and cached.capabilities.chatTemplate is False
+                ):
+                    from .chat_templates import fallback_for
+
+                    raw = cached.gguf.metadata or {}
+                    observed = gguf.GgufMetadata(
+                        version=cached.gguf.ggufVersion or 0,
+                        tensor_count=0,
+                        kv_count=len(raw),
+                        header_bytes=0,
+                        kv=raw,
+                    )
+                    cached = cached.model_copy(
+                        update={
+                            "gguf": cached.gguf.model_copy(
+                                update={"chatTemplateFallback": fallback_for(observed)}
+                            )
+                        }
+                    )
                 cached_models.append(cached)
                 return
 
@@ -1011,6 +1039,18 @@ class Scanner:
                     if metadata.expert_bytes is not None and part.expert_bytes is not None
                     else None
                 )
+                if metadata.architecture == "deepseek4":
+                    metadata.nextn_blocks = (
+                        metadata.nextn_blocks | part.nextn_blocks
+                        if metadata.nextn_blocks is not None
+                        and part.nextn_blocks is not None
+                        and part.architecture == metadata.architecture
+                        and part.arch_key("block_count") == metadata.arch_key("block_count")
+                        else None
+                    )
+                    metadata.has_first_block = bool(
+                        metadata.has_first_block or part.has_first_block
+                    )
             if metadata.is_projector:
                 projectors.append((entry, metadata))
                 return
@@ -1114,6 +1154,8 @@ class Scanner:
         metadata: gguf.GgufMetadata,
         projectors: list[tuple[os.DirEntry[str], gguf.GgufMetadata]],
     ) -> LibraryModel | None:
+        from .chat_templates import fallback_for
+
         try:
             stat = path.stat()
         except OSError as exc:
@@ -1179,6 +1221,7 @@ class Scanner:
                 shardCount=len(shards) + 1,
                 vocabSize=metadata.vocab_size,
                 expertBytes=expert_bytes,
+                chatTemplateFallback=fallback_for(metadata),
                 projectorPath=projector.path if projector is not None else None,
                 speculation=GgufSpeculation(mtpHead=metadata.mtp_head, draftFiles=[]),
                 recommendedSampling=(
