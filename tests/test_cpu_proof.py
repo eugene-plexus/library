@@ -4,7 +4,7 @@ import asyncio
 import io
 import json
 import subprocess
-import zipfile
+import tarfile
 from datetime import date
 from pathlib import Path
 
@@ -97,10 +97,21 @@ def test_invalid_bench_rates_are_rejected(bad_speed):
 def test_cpu_build_download_keeps_shared_libraries(monkeypatch, tmp_path):
     from eugene_plexus_library import cpu_proof
 
+    # Upstream ships the Linux builds as .tar.gz (never .zip), with each
+    # shared library's soname as a symlink beside it.
     archive = io.BytesIO()
-    with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr("build/bin/llama-bench", b"recorded executable")
-        bundle.writestr("build/bin/libggml-cpu.so", b"recorded library")
+    with tarfile.open(fileobj=archive, mode="w:gz") as bundle:
+        for name, data in (
+            ("llama-b10948/llama-bench", b"recorded executable"),
+            ("llama-b10948/libggml-cpu.so.0", b"recorded library"),
+        ):
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            bundle.addfile(member, io.BytesIO(data))
+        link = tarfile.TarInfo("llama-b10948/libggml-cpu.so")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "libggml-cpu.so.0"
+        bundle.addfile(link)
     urls = []
 
     def response(request):
@@ -114,11 +125,12 @@ def test_cpu_build_download_keeps_shared_libraries(monkeypatch, tmp_path):
     )
     bench = asyncio.run(cpu_proof.download_engine("b10948", tmp_path))
     assert bench.read_bytes() == b"recorded executable"
+    assert (bench.parent / "libggml-cpu.so.0").read_bytes() == b"recorded library"
     assert (bench.parent / "libggml-cpu.so").read_bytes() == b"recorded library"
     assert urls == [
-        "https://github.com/ggml-org/llama.cpp/releases/download/b10948/llama-b10948-bin-ubuntu-x64.zip"
+        "https://github.com/ggml-org/llama.cpp/releases/download/b10948/llama-b10948-bin-ubuntu-x64.tar.gz"
     ]
-    assert not (tmp_path / "engine.zip").exists()
+    assert not (tmp_path / "engine.tar.gz").exists()
 
 
 def test_bench_timeout_keeps_its_last_lines(monkeypatch, tmp_path):

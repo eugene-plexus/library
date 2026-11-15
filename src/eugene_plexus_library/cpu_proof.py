@@ -7,7 +7,7 @@ import json
 import math
 import os
 import subprocess
-import zipfile
+import tarfile
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -15,9 +15,7 @@ from typing import Any
 from ._generated.models import CpuProof
 from ._http import egress_client
 
-CPU_BUILD_URL = (
-    "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/llama-{tag}-bin-ubuntu-x64.zip"
-)
+CPU_BUILD_URL = "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/llama-{tag}-bin-ubuntu-x64.tar.gz"
 MAX_MODEL_BYTES = 8 * 1024**3
 
 
@@ -158,8 +156,10 @@ def measure(
 
 
 def _unpack(archive: Path, directory: Path) -> Path:
-    with zipfile.ZipFile(archive) as bundle:
-        bundle.extractall(directory)
+    # The "data" filter refuses members that leave the directory and keeps
+    # the sonames' symlinks that point inside it.
+    with tarfile.open(archive, "r:gz") as bundle:
+        bundle.extractall(directory, filter="data")
     bench = next(directory.rglob("llama-bench"), None)
     if bench is None:
         raise CpuProofError("The CPU build archive contains no llama-bench executable.")
@@ -170,7 +170,7 @@ def _unpack(archive: Path, directory: Path) -> Path:
 
 async def download_engine(tag: str, directory: Path) -> Path:
     """Fetch one pinned CPU build, including the libraries beside the executable."""
-    archive = directory / "engine.zip"
+    archive = directory / "engine.tar.gz"
     try:
         async with (
             egress_client(timeout=120, follow_redirects=True) as client,
