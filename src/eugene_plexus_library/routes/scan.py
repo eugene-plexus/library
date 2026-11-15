@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from .._generated.models import Problem, Scan, ScanRequest
-from ..dependencies import require_operator
+from ..operations import MODELS, operation
 from ..scan_manager import ScanManager
 
 router = APIRouter(tags=["scan"])
@@ -42,7 +42,7 @@ async def get_scan(request: Request) -> Scan:
     "/v1/scan",
     response_model=Scan,
     status_code=202,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def start_scan(request: Request, body: ScanRequest | None = None) -> Scan:
     """Start a walk and return immediately; poll `GET /v1/scan`.
@@ -70,7 +70,7 @@ async def start_scan(request: Request, body: ScanRequest | None = None) -> Scan:
 @router.delete(
     "/v1/scan",
     response_model=Scan,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def cancel_scan(request: Request) -> Scan:
     """Stop the walk.

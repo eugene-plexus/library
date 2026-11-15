@@ -38,6 +38,7 @@ from ..config import ConfigStore
 from ..dependencies import require_operator
 from ..formats import gguf
 from ..model_pages import ModelPages
+from ..operations import MODELS, operation
 from ..paths import is_within, real_within, same_path
 from ..scan_manager import ScanManager
 from ..store import RelocateRefused, StateStore
@@ -341,7 +342,7 @@ def _refuse_ollama(model: LibraryModel, stores: list[Path]) -> None:
     "/v1/models/{model_id}/deletion",
     response_model=ModelDeletion,
     response_model_exclude_none=True,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def plan_model_deletion(request: Request, model_id: str) -> ModelDeletion:
     """What Delete would remove, keep and refuse, read now (LS8). Nothing
@@ -361,7 +362,7 @@ async def plan_model_deletion(request: Request, model_id: str) -> ModelDeletion:
 @router.post(
     "/v1/models/{model_id}/delete",
     response_model=ModelDeleted,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def delete_model(request: Request, model_id: str, body: ModelDeleteRequest) -> ModelDeleted:
     """Delete a model's files and the model, all or nothing (LS8): what
@@ -562,7 +563,7 @@ async def get_model_special_tokens(request: Request, model_id: str) -> SpecialTo
 @router.delete(
     "/v1/models/{model_id}",
     status_code=204,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def forget_model(request: Request, model_id: str) -> None:
     """Forget a missing entry and the profiles saved against it.

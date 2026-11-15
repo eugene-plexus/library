@@ -12,7 +12,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import __version__
+from . import __version__, operations
 from ._causes import plain_cause
 from .auth_state import load_auth_state
 from .catalogue_sources import HubClients
@@ -22,6 +22,7 @@ from .downloads import DownloadManager
 from .keep import KeepError, Keeps
 from .model_pages import ModelPages
 from .node_ollama import NodeStores
+from .operations import MODELS, operation
 from .profile_storage import StorageUnavailable
 from .routes import admin as admin_routes
 from .routes import catalogue as catalogue_routes
@@ -228,6 +229,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=_lifespan,
     )
     app.state.settings = settings
+    # Row 39: each change on a route the operations table names is reported
+    # to this machine's agent, with the person read from the token.
+    operations.install(app)
 
     @app.exception_handler(KeepError)
     async def keep_error(request: Request, exc: KeepError) -> JSONResponse:
@@ -274,7 +278,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # searching a model catalogue.
     app.include_router(guidance_routes.router, dependencies=authorized)
 
-    operator_catalogue = [Depends(require_operator)]
+    # Row 39: the Models power searches the catalogue too, to find what to
+    # download; nothing else reaches it but the owner.
+    operator_catalogue = [Depends(operation(MODELS))]
     app.include_router(catalogue_routes.router, dependencies=operator_catalogue)
 
     # Downloads mix reads and mutations; the mutations are declared on

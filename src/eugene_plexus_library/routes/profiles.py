@@ -13,7 +13,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from .._generated.models import ModelProfile, ModelProfileList, ModelProfileSpec, Problem
-from ..dependencies import require_operator
+from ..operations import MODELS, operation
 from ..store import StateStore
 
 router = APIRouter(tags=["profiles"])
@@ -52,7 +52,7 @@ async def list_profiles(request: Request, model_id: str) -> ModelProfileList:
     "/v1/models/{model_id}/profiles",
     response_model=ModelProfile,
     status_code=201,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def create_profile(request: Request, model_id: str, body: ModelProfileSpec) -> ModelProfile:
     store = _require_model(request, model_id)
@@ -78,7 +78,7 @@ async def get_profile(request: Request, model_id: str, profile_id: str) -> Model
 @router.put(
     "/v1/models/{model_id}/profiles/{profile_id}",
     response_model=ModelProfile,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def replace_profile(
     request: Request, model_id: str, profile_id: str, body: ModelProfileSpec
@@ -106,7 +106,7 @@ async def replace_profile(
 @router.delete(
     "/v1/models/{model_id}/profiles/{profile_id}",
     status_code=204,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def delete_profile(request: Request, model_id: str, profile_id: str) -> None:
     """Deleting the default promotes the oldest survivor.

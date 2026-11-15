@@ -10,9 +10,9 @@ from .._generated.models import (
     DownloadSpec,
     Problem,
 )
-from ..dependencies import require_operator
 from ..downloads import DownloadError, DownloadManager
 from ..hub import HubError
+from ..operations import MODELS, operation
 from .run_operations import set_download_pause
 
 router = APIRouter(tags=["downloads"])
@@ -74,7 +74,7 @@ async def list_downloads(request: Request) -> DownloadList:
     "/v1/downloads",
     response_model=Download,
     status_code=202,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def start_download(request: Request, spec: DownloadSpec) -> Download:
     """Fetch a model into a directory you chose.
@@ -108,7 +108,7 @@ async def get_download(request: Request, download_id: str) -> Download:
 @router.delete(
     "/v1/downloads/{download_id}",
     status_code=204,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def cancel_download(request: Request, download_id: str) -> None:
     """Cancel in flight, or forget a finished record.
@@ -131,7 +131,7 @@ async def cancel_download(request: Request, download_id: str) -> None:
 @router.post(
     "/v1/downloads/{download_id}/pause",
     response_model=Download,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def pause_download(request: Request, download_id: str) -> Download:
     """Stop transferring; keep the partial file.
@@ -150,7 +150,7 @@ async def pause_download(request: Request, download_id: str) -> Download:
 @router.post(
     "/v1/downloads/{download_id}/resume",
     response_model=Download,
-    dependencies=[Depends(require_operator)],
+    dependencies=[Depends(operation(MODELS))],
 )
 async def resume_download(request: Request, download_id: str) -> Download:
     """Continue a paused or failed download.

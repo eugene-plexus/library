@@ -12,6 +12,10 @@ agent on a GPU node resolving a model it is about to launch, the
 gateway reading a model's profile. **No `service:*` wildcard**: a
 driver's token from another machine reads nothing here.
 
+A person with an operations power (row 39, `operations.py`) reads and
+writes exactly the routes that module's table names, with the power its
+token carries.
+
 General writes, including profile edits, are operator-only. The run-operation
 router separately grants the assigned agent a leased checkpoint and creation
 of a default profile for an existing operator intent. That grant cannot edit
@@ -62,6 +66,12 @@ def _validate(
             "Missing token",
             "Provide a bearer token via the Authorization: Bearer header.",
         )
+    if reads:
+        # Row 39: an operations token, only on the routes its table names.
+        from .operations import admit, is_operations
+
+        if is_operations(creds.credentials):
+            return admit(request, creds.credentials)
     classes = (tokens.TYP_SESSION, tokens.TYP_SERVICE) if reads else (tokens.TYP_SESSION,)
     try:
         claims = auth.verify(creds.credentials, classes=classes)
