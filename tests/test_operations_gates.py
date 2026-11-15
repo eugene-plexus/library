@@ -171,7 +171,10 @@ def test_config_patch_stays_owner_only(client: TestClient, install: FakeInstall)
     answer = client.patch(
         "/v1/config", json={}, headers=_bearer(_operations(install, MODELS, MACHINES))
     )
-    assert answer.status_code in (401, 403)
+    assert answer.status_code == 403
+    assert "Only the owner" in answer.json()["detail"]["detail"]
+    far = _bearer(_operations(install, MODELS, machine="far"))
+    assert client.patch("/v1/config", json={}, headers=far).status_code == 401
 
 
 def test_download_with_operate_models(

@@ -66,12 +66,20 @@ def _validate(
             "Missing token",
             "Provide a bearer token via the Authorization: Bearer header.",
         )
-    if reads:
-        # Row 39: an operations token, only on the routes its table names.
-        from .operations import admit, is_operations
+    # Row 39: an operations token, only on the routes its table names; on
+    # any other route a valid one is told the route is the owner's.
+    from .operations import admit, is_operations, only_the_owner
 
-        if is_operations(creds.credentials):
+    if is_operations(creds.credentials):
+        if reads:
             return admit(request, creds.credentials)
+        try:
+            auth.verify(creds.credentials, classes=(tokens.TYP_OPERATIONS,))
+        except tokens.TokenError as e:
+            raise _problem(
+                status.HTTP_401_UNAUTHORIZED, "Invalid token", f"Bearer token rejected: {e}"
+            ) from e
+        raise only_the_owner()
     classes = (tokens.TYP_SESSION, tokens.TYP_SERVICE) if reads else (tokens.TYP_SESSION,)
     try:
         claims = auth.verify(creds.credentials, classes=classes)
