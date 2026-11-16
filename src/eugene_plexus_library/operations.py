@@ -19,6 +19,7 @@ person comes from the token verified here, never from a header.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from typing import Annotated, Any
 
@@ -26,6 +27,7 @@ import httpx
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import tokens
@@ -76,6 +78,9 @@ OPERATIONS_ROUTES: dict[tuple[str, str], tuple[str, str]] = {
 
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 STATE_KEY = "ep_operation"
+CLAIMS_KEY = "ep_operations_claims"
+#: Review S3: what a power may do that is a question, not a change.
+NOT_RECORDED = frozenset({("POST", "/v1/catalogue/search")})
 _TARGET_PARAMS = ("model_id", "download_id", "profile_id")
 
 
@@ -115,6 +120,7 @@ def admit(request: Request, token: str) -> tokens.Claims:
         raise _invalid(exc) from exc
     route = _route_of(request)
     if route in OPERATIONS_READS:
+        setattr(request.state, CLAIMS_KEY, claims)
         return claims
     listed = OPERATIONS_ROUTES.get(route)  # type: ignore[arg-type]
     if listed is None:
@@ -132,6 +138,8 @@ def admit(request: Request, token: str) -> tokens.Claims:
 def _mark(request: Request, claims: tokens.Claims, power: str, action: str) -> None:
     holder = getattr(request.state, STATE_KEY, None)
     if not isinstance(holder, dict) or request.method.upper() in READ_METHODS:
+        return
+    if _route_of(request) in NOT_RECORDED:
         return
     owner = not claims.is_operations
     params = request.path_params
@@ -160,6 +168,7 @@ def operation(power: str) -> Callable[..., tokens.Claims | None]:
             if listed is None or listed[0] != power:
                 raise only_the_owner()
             _mark(request, claims, power, listed[1])
+            setattr(request.state, CLAIMS_KEY, claims)
             return claims
         owner = require_operator(request, creds)
         if owner is not None and listed is not None:
@@ -167,6 +176,64 @@ def operation(power: str) -> Callable[..., tokens.Claims | None]:
         return owner
 
     return require_operation
+
+
+def note_target(request: Request, target: str) -> None:
+    """Name what a change with no target in its path is about (a download's
+    repository), for its row in the machine's operations log."""
+    holder = getattr(request.state, STATE_KEY, None)
+    if isinstance(holder, dict) and holder.get("action"):
+        holder["target"] = target[:256]
+
+
+def operations_claims(request: Any) -> tokens.Claims | None:
+    found = getattr(getattr(request, "state", None), CLAIMS_KEY, None)
+    return found if isinstance(found, tokens.Claims) else None
+
+
+PATH_FLAG = re.compile(r"(Path|File|Dir|Directory)$")
+OWNER_PROFILE_FIELDS = {"env": "environment variables", "extraArgs": "extra command-line arguments"}
+
+
+def refuse_owner_fields(request: Request, spec: Any, previous: Any = None) -> None:
+    """Review B1: a profile is what a runtime is later declared from, so with
+    an operations token its environment, extra arguments and any file
+    outside the Library's folders stay the owner's. A value the profile
+    already had is left alone."""
+    if operations_claims(request) is None:
+        return
+    from .paths import is_within
+
+    def kept(field: str) -> bool:
+        return previous is not None and getattr(previous, field, None) == getattr(spec, field)
+
+    for field, what in OWNER_PROFILE_FIELDS.items():
+        if getattr(spec, field, None) and not kept(field):
+            raise _owner_field(field, what)
+    roots = request.app.state.config_store.model_roots()
+    flags = getattr(spec, "flags", None) or {}
+    before = (getattr(previous, "flags", None) or {}) if previous is not None else {}
+    for key, value in flags.items():
+        if not PATH_FLAG.search(key) or value in (None, "") or before.get(key) == value:
+            continue
+        if not isinstance(value, str) or not any(is_within(value, root) for root in roots):
+            raise _owner_field(f"flags.{key}", "a file outside the Library's folders")
+
+
+def _owner_field(field: str, what: str) -> HTTPException:
+    return _problem(
+        status.HTTP_403_FORBIDDEN,
+        "Owner only",
+        f"Only the owner can set {what} ({field}). Leave it as it was, or ask the owner.",
+    )
+
+
+def scrub_profile[M: BaseModel](request: Request, profile: M) -> M:
+    """Review S6: a profile read with an operations token carries no
+    environment values and no extra arguments; either can hold a key."""
+    if operations_claims(request) is None:
+        return profile
+    return profile.model_copy(update={"env": None, "extraArgs": None})
 
 
 class ReportOperations:

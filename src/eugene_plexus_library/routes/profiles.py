@@ -13,7 +13,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from .._generated.models import ModelProfile, ModelProfileList, ModelProfileSpec, Problem
-from ..operations import MODELS, operation
+from ..operations import MODELS, operation, refuse_owner_fields, scrub_profile
 from ..store import StateStore
 
 router = APIRouter(tags=["profiles"])
@@ -45,7 +45,9 @@ def _require_model(request: Request, model_id: str) -> StateStore:
 @router.get("/v1/models/{model_id}/profiles", response_model=ModelProfileList)
 async def list_profiles(request: Request, model_id: str) -> ModelProfileList:
     store = _require_model(request, model_id)
-    return ModelProfileList(profiles=store.list_profiles(model_id))
+    return ModelProfileList(
+        profiles=[scrub_profile(request, p) for p in store.list_profiles(model_id)]
+    )
 
 
 @router.post(
@@ -56,6 +58,7 @@ async def list_profiles(request: Request, model_id: str) -> ModelProfileList:
 )
 async def create_profile(request: Request, model_id: str, body: ModelProfileSpec) -> ModelProfile:
     store = _require_model(request, model_id)
+    refuse_owner_fields(request, body)
     try:
         return store.create_profile(model_id, body)
     except ValueError as exc:
@@ -72,7 +75,7 @@ async def get_profile(request: Request, model_id: str, profile_id: str) -> Model
             "Unknown profile",
             f"No profile {profile_id!r} for model {model_id!r}.",
         )
-    return profile
+    return scrub_profile(request, profile)
 
 
 @router.put(
@@ -90,6 +93,7 @@ async def replace_profile(
     line after I deleted it" is a bug report nobody should have to file.
     """
     store = _require_model(request, model_id)
+    refuse_owner_fields(request, body, store.get_profile(model_id, profile_id))
     try:
         updated = store.replace_profile(model_id, profile_id, body)
     except ValueError as exc:

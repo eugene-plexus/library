@@ -12,7 +12,7 @@ from .._generated.models import (
 )
 from ..downloads import DownloadError, DownloadManager
 from ..hub import HubError
-from ..operations import MODELS, operation
+from ..operations import MODELS, note_target, operation
 from .run_operations import set_download_pause
 
 router = APIRouter(tags=["downloads"])
@@ -89,6 +89,7 @@ async def start_download(request: Request, spec: DownloadSpec) -> Download:
     `GET /v1/downloads/{id}`.
     """
     manager = _manager(request)
+    note_target(request, spec.repo)
     try:
         return await manager.start(spec)
     except (DownloadError, HubError) as exc:

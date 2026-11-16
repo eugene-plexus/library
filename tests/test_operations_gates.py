@@ -225,3 +225,99 @@ def test_a_token_for_another_machine_or_a_revoked_one_is_refused(
     answer = client.get("/v1/models", headers=_bearer(token))
     assert answer.status_code == 401
     assert "signed out" in answer.json()["detail"]["detail"]
+
+
+# ------------------------------------------------------------ review findings
+
+
+@pytest.fixture
+def stocked(
+    tmp_path: Path, install: FakeInstall, reports: list[dict[str, Any]]
+) -> Iterator[tuple[TestClient, str, Path]]:
+    """A library with one folder and one model in it, and auth on."""
+    from .conftest import qwen_like_kv, wait_for_scan, write_gguf
+
+    models = tmp_path / "models"
+    models.mkdir()
+    write_gguf(models / "a.gguf", qwen_like_kv())
+    settings = Settings(
+        config_file=tmp_path / "config.yaml",
+        state_file=tmp_path / "state.json",
+        agent_url="http://127.0.0.1:9/",
+    )
+    settings.config_file.write_text(
+        f"modelRoots:\n  - path: {models.as_posix()}\n    mounts: []\nscanOnStartup: true\n",
+        encoding="utf-8",
+    )
+    made = create_app(settings=settings)
+    made.state.auth_state = install.auth_state()
+    owner = _bearer(install.session())
+    with TestClient(made) as c:
+        c.headers.update(owner)
+        wait_for_scan(c)
+        model_id = c.get("/v1/models").json()["models"][0]["id"]
+        c.headers.pop("Authorization")
+        reports.clear()
+        yield c, model_id, models
+
+
+@pytest.mark.parametrize(
+    ("extra", "field"),
+    [
+        ({"env": {"LD_PRELOAD": "/tmp/x.so"}}, "env"),
+        ({"extraArgs": ["--api-key", "x"]}, "extraArgs"),
+        ({"flags": {"chatTemplateFile": "/home/me/.eugene/node.yaml"}}, "flags.chatTemplateFile"),
+        ({"flags": {"projectorPath": "/elsewhere/mmproj.gguf"}}, "flags.projectorPath"),
+    ],
+)
+def test_models_cannot_write_a_profile_that_reaches_past_running_a_model(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall, extra: Any, field: str
+) -> None:
+    """Review B1: a profile is what a runtime is later declared from."""
+    client, model_id, _ = stocked
+    dana = _bearer(_operations(install, MODELS))
+    body = {"name": "dana", "engine": "llama_cpp", **extra}
+    refused = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
+    assert refused.status_code == 403, refused.text
+    assert f"({field})" in refused.json()["detail"]["detail"]
+
+
+def test_models_writes_a_plain_profile_and_reads_no_environment_values(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall
+) -> None:
+    client, model_id, models = stocked
+    dana = _bearer(_operations(install, MODELS))
+    owner = _bearer(install.session())
+    inside = {"chatTemplateFile": str(models / "template.jinja"), "contextSize": 4096}
+    made = client.post(
+        f"/v1/models/{model_id}/profiles",
+        json={"name": "dana", "engine": "llama_cpp", "flags": inside},
+        headers=dana,
+    )
+    assert made.status_code == 201, made.text
+    secret = {"name": "owner", "engine": "llama_cpp", "env": {"HF_TOKEN": "hf-secret"}}
+    owned = client.post(f"/v1/models/{model_id}/profiles", json=secret, headers=owner)
+    assert owned.status_code == 201
+    listed = client.get(f"/v1/models/{model_id}/profiles", headers=dana).json()
+    one = client.get(f"/v1/models/{model_id}/profiles/{owned.json()['id']}", headers=dana)
+    assert "hf-secret" not in str(listed) and "hf-secret" not in one.text
+    # Dana changes the owner's profile and keeps its environment as it is.
+    kept = {**secret, "flags": {"contextSize": 8192}}
+    path = f"/v1/models/{model_id}/profiles/{owned.json()['id']}"
+    assert client.put(path, json=kept, headers=dana).status_code == 200
+    assert client.get(path, headers=owner).json()["env"] == {"HF_TOKEN": "hf-secret"}
+
+
+def test_a_search_is_not_a_change_and_a_download_names_its_repository(
+    client: TestClient, install: FakeInstall, reports: list[dict[str, Any]]
+) -> None:
+    """Review S3: a question leaves no row; a download row says what."""
+    dana = _bearer(_operations(install, MODELS))
+    client.post("/v1/catalogue/search", json={}, headers=dana)
+    assert reports == []
+    client.post(
+        "/v1/downloads",
+        json={"repo": "org/model", "files": ["a.gguf"], "root": "/not-a-library-folder"},
+        headers=dana,
+    )
+    assert [(r["action"], r["target"]) for r in reports] == [("download model", "org/model")]
