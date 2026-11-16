@@ -19,6 +19,7 @@ person comes from the token verified here, never from a header.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Callable
 from typing import Annotated, Any
@@ -202,7 +203,6 @@ def refuse_owner_fields(request: Request, spec: Any, previous: Any = None) -> No
     already had is left alone."""
     if operations_claims(request) is None:
         return
-    from .paths import is_within
 
     def kept(field: str) -> bool:
         return previous is not None and getattr(previous, field, None) == getattr(spec, field)
@@ -216,8 +216,25 @@ def refuse_owner_fields(request: Request, spec: Any, previous: Any = None) -> No
     for key, value in flags.items():
         if not PATH_FLAG.search(key) or value in (None, "") or before.get(key) == value:
             continue
-        if not isinstance(value, str) or not any(is_within(value, root) for root in roots):
+        if not inside_a_folder(value, roots):
             raise _owner_field(f"flags.{key}", "a file outside the Library's folders")
+
+
+_SEPARATORS = re.compile(r"[\\/]")
+
+
+def inside_a_folder(value: Any, roots: list[Any]) -> bool:
+    """Review B1, second pass: an absolute path with no `..` under either
+    separator that lies in one of `roots` both as written and after this
+    machine resolves its links, so a link inside a folder that points out
+    is outside."""
+    from .paths import is_within, real_within
+
+    if not isinstance(value, str) or not os.path.isabs(value):
+        return False
+    if ".." in _SEPARATORS.split(value):
+        return False
+    return any(is_within(value, root) and real_within(value, root) for root in roots)
 
 
 def _owner_field(field: str, what: str) -> HTTPException:

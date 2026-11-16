@@ -9,6 +9,7 @@ is reported to this machine's agent, the person read from the token.
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -321,3 +322,41 @@ def test_a_search_is_not_a_change_and_a_download_names_its_repository(
         headers=dana,
     )
     assert [(r["action"], r["target"]) for r in reports] == [("download model", "org/model")]
+
+
+@pytest.mark.parametrize("sep", ["/", "\\"], ids=["posix", "windows"])
+def test_a_profile_path_that_climbs_out_of_the_library_is_refused(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall, sep: str
+) -> None:
+    """Review B1, second pass: no `..`, under either separator."""
+    client, model_id, models = stocked
+    climbing = sep.join([str(models), "sub", "..", "..", "outside", "secret.txt"])
+    body = {"name": "dana", "engine": "llama_cpp", "flags": {"chatTemplateFile": climbing}}
+    dana = _bearer(_operations(install, MODELS))
+    refused = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
+    assert refused.status_code == 403, refused.text
+    assert "(flags.chatTemplateFile)" in refused.json()["detail"]["detail"]
+
+
+def test_a_profile_path_through_a_link_that_points_out_is_refused(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall, tmp_path: Path
+) -> None:
+    client, model_id, models = stocked
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "node.yaml").write_text("secret", encoding="utf-8")
+    try:
+        os.symlink(outside, models / "out", target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        if os.name != "nt":
+            pytest.skip(f"this machine cannot make a symlink here: {exc}")
+        # Windows without the symlink privilege: a junction, which needs none.
+        import _winapi
+
+        _winapi.CreateJunction(str(outside), str(models / "out"))
+    dana = _bearer(_operations(install, MODELS))
+    linked = {"chatTemplateFile": str(models / "out" / "node.yaml")}
+    body = {"name": "dana", "engine": "llama_cpp", "flags": linked}
+    refused = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
+    assert refused.status_code == 403, refused.text
+    assert "(flags.chatTemplateFile)" in refused.json()["detail"]["detail"]
