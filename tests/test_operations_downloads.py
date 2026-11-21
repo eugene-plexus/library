@@ -11,6 +11,7 @@ files. The owner is not restricted.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -201,6 +202,79 @@ def test_models_downloads_one_more_gguf_and_a_catalogue_download(
     assert _finished(client, started.json()["id"], dana)["state"] == "done"
 
 
+def test_models_cannot_bring_back_a_missing_model(
+    library: tuple[TestClient, Path, Hub], install: FakeInstall
+) -> None:
+    """Second review: the owner moved a trusted folder away; the Library lists
+    it missing, with its profiles. Files at that path would come back as the
+    same model, with the owner's profiles on them."""
+    client, models, fake = library
+    owner = _bearer(install.session())
+    listed = client.get("/v1/models", headers=owner).json()["models"]
+    trusted = next(m for m in listed if m["path"].endswith("trusted"))
+    profile = {"name": "o", "engine": "vllm", "flags": {"trustRemoteCode": True}}
+    made = client.post(f"/v1/models/{trusted['id']}/profiles", json=profile, headers=owner)
+    assert made.status_code == 201, made.text
+    (models / "org" / "trusted").rename(models.parent / "moved-away")
+    client.headers.update(owner)
+    client.post("/v1/scan", json={})
+    wait_for_scan(client)
+    client.headers.pop("Authorization")
+    listed = client.get("/v1/models", headers=owner).json()["models"]
+    missing = [m for m in listed if m["path"].endswith("trusted")]
+    assert [m["status"] for m in missing] == ["missing"], listed
+    fake.files["config.json"] = b"{}"
+    dana = _bearer(_operations(install, MODELS))
+    spec = {"repo": "evil/repo", "files": ["config.json"], "subdirectory": "org/trusted"}
+    refused = client.post("/v1/downloads", json=spec, headers=dana)
+    assert refused.status_code == 403, refused.text
+    assert str(models / "org" / "trusted") in refused.json()["detail"]["detail"]
+    assert not (models / "org" / "trusted").exists()
+
+
+STREAM = "::" + chr(36) + "DATA"
+
+
+@pytest.mark.parametrize(
+    ("spec", "part"),
+    [
+        ({"subdirectory": "p1", "filename": "x.eugene-prepared.json."}, "x.eugene-prepared.json."),
+        ({"subdirectory": "p2", "filename": "y.eugene-prepared.json "}, "y.eugene-prepared.json "),
+        ({"subdirectory": "p3", "filename": ".eugene-engine-files."}, ".eugene-engine-files."),
+        ({"subdirectory": "p4", "filename": "z.eugene-prepared.json" + STREAM}, "z.eugene"),
+        ({"subdirectory": "org/new "}, "new "),
+        ({"subdirectory": "org/new./x"}, "new."),
+    ],
+    ids=["dot", "space", "marker-dot", "stream", "folder-space", "folder-dot"],
+)
+def test_models_cannot_use_a_name_windows_writes_as_another(
+    library: tuple[TestClient, Path, Hub], install: FakeInstall, spec: dict[str, Any], part: str
+) -> None:
+    client, _, fake = library
+    fake.files["p.json"] = b"{}"
+    dana = _bearer(_operations(install, MODELS))
+    refused = client.post(
+        "/v1/downloads", json={"repo": "evil/p", "files": ["p.json"], **spec}, headers=dana
+    )
+    assert refused.status_code == 403, refused.text
+    detail = refused.json()["detail"]["detail"]
+    assert part in detail, detail
+    assert "Windows" in detail, detail
+    assert client.get("/v1/downloads", headers=dana).json()["downloads"] == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drops a trailing space; Linux keeps it")
+def test_a_folder_with_a_trailing_space_gets_its_cause_at_the_start(
+    library: tuple[TestClient, Path, Hub], install: FakeInstall
+) -> None:
+    client, _, _ = library
+    owner = _bearer(install.session())
+    spec = {"repo": "org/x", "files": ["b.gguf"], "subdirectory": "org/new "}
+    refused = client.post("/v1/downloads", json=spec, headers=owner)
+    assert refused.status_code == 400, refused.text
+    assert "dot or a space" in refused.json()["detail"]["detail"]
+
+
 def test_the_owner_is_not_restricted(
     library: tuple[TestClient, Path, Hub], install: FakeInstall
 ) -> None:
@@ -223,6 +297,7 @@ def _manager(tmp_path: Path, fake: Hub) -> tuple[downloads.DownloadManager, Stat
     client = hub.HubClient(client=inner)
     client.configure(base_url="https://hub.example", token=None, enabled=True)
     store = StateStore(tmp_path / "state.json")
+    store.load()  # a second call is a restart: what the state file kept
     manager = downloads.DownloadManager(
         client=client,
         store=store,
@@ -286,6 +361,60 @@ async def test_a_file_that_appears_meanwhile_is_not_replaced(tmp_path: Path) -> 
         assert finished.state is DownloadState.failed
         assert "already there" in (finished.error or ""), finished.error
         assert target.read_bytes() == b"GGUF the owner put here"
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_after_a_restart_the_owners_resume_does_not_replace_a_file(tmp_path: Path) -> None:
+    """Second review: who started a download is kept with its record. The
+    owner resuming a Models person's download never replaces a file."""
+    fake = Hub({"modeling_x.py": EVIL})
+    fake.failing.add("modeling_x.py")
+    manager, _, root = _manager(tmp_path, fake)
+    spec = DownloadSpec(repo="evil/repo", files=["modeling_x.py"], subdirectory="org/trusted")
+    record = await manager.start(spec, restricted=True)
+    assert (await _drain(manager, record.id)).state is DownloadState.failed
+    await manager.shutdown()
+    target = root / "org" / "trusted" / "modeling_x.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("# reviewed by the owner", encoding="utf-8")
+    fake.failing.clear()
+    again, _, _ = _manager(tmp_path, fake)
+    try:
+        await again.resume(record.id)  # the owner
+        ended = await _drain(again, record.id)
+        assert ended.state is DownloadState.failed
+        assert "Models power started this download" in (ended.error or ""), ended.error
+        assert "owner can start the download again" in (ended.error or ""), ended.error
+        assert target.read_text(encoding="utf-8") == "# reviewed by the owner"
+    finally:
+        await again.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_the_owners_download_is_the_owners_after_a_models_resume(tmp_path: Path) -> None:
+    fake = Hub({"big.gguf": b"GGUF the newer upstream file"})
+    fake.failing.add("big.gguf")
+    manager, _, root = _manager(tmp_path, fake)
+    record = await manager.start(DownloadSpec(repo="org/own", files=["big.gguf"]))
+    assert (await _drain(manager, record.id)).state is DownloadState.failed
+    target = root / "org" / "own" / "big.gguf"
+    target.write_bytes(b"GGUF old")
+    fake.failing.clear()
+    await manager.shutdown()
+    manager, _, _ = _manager(tmp_path, fake)  # after a restart, still the owner's
+    try:
+        # A Models person resumes it: for that run, no file is replaced.
+        await manager.resume(record.id, restricted=True)
+        ended = await _drain(manager, record.id)
+        assert ended.state is DownloadState.failed
+        assert "Only the owner can download over" in (ended.error or ""), ended.error
+        assert target.read_bytes() == b"GGUF old"
+        # Then the owner resumes it: not restricted.
+        await manager.resume(record.id)
+        assert (await _drain(manager, record.id)).state is DownloadState.done
+        assert target.read_bytes() == b"GGUF the newer upstream file"
     finally:
         await manager.shutdown()
 

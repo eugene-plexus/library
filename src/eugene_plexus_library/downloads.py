@@ -124,30 +124,82 @@ class OwnerOnly(DownloadError):
         super().__init__(message, status=403, code="OwnerOnly")
 
 
-def _already_there(path: Path) -> OwnerOnly:
+def _already_there(path: Path, *, started_by_operations: bool = False) -> OwnerOnly:
+    if started_by_operations:
+        return OwnerOnly(
+            f"{path} is already there, and a person with the Models power started this "
+            "download, so it does not replace the file. Nothing was written. The owner can "
+            "start the download again to replace it."
+        )
     return OwnerOnly(
         f"Only the owner can download over {path}: a file is already there. "
         "Nothing was written. Choose another folder, or ask the owner."
     )
 
 
+def trailing_part(path: Path, root: Path) -> tuple[str, str] | None:
+    """The first part of `path` below `root` that Windows would write under
+    another name, and why: one that ends in a dot or a space (Windows drops
+    them, so `x.eugene-prepared.json.` lands as `x.eugene-prepared.json` and
+    `trusted ` as `trusted`), or one with a colon (Windows reads
+    `a.gguf::$DATA` as the file `a.gguf` itself)."""
+    # As written: `os.path.relpath` would make it absolute first, and on
+    # Windows that drops the very dots and spaces looked for here.
+    text, base = str(path), str(root)
+    relative = text[len(base) :] if text.startswith(base) else text
+    for part in relative.replace("\\", "/").split("/"):
+        if not part:
+            continue
+        if part in (".", ".."):
+            continue
+        if part != part.rstrip(". "):
+            return part, "it ends in a dot or a space, which Windows drops"
+        if ":" in part:
+            return part, "it has a colon, which Windows reads as a part of another file"
+    return None
+
+
+def refuse_trailing(path: Path, root: Path, *, restricted: bool) -> None:
+    """A destination Windows would write under another name: refused for an
+    operations token on every platform, and for anyone on Windows, before a
+    byte moves and with that cause."""
+    found = trailing_part(path, root)
+    if found is None:
+        return
+    part, cause = found
+    if restricted:
+        raise OwnerOnly(
+            f"Only the owner can download to {part!r} ({path}): {cause}, so the file "
+            "could land under another name. Nothing was written."
+        )
+    if os.name == "nt":
+        raise DownloadError(
+            f"{part!r}: {cause}, so the file would land under another name ({path}). "
+            "Change the name, and start the download again.",
+            code="TrailingDotOrSpace",
+        )
+
+
 def refuse_for_operations(
     entries: list[DownloadFile], models: list[LibraryModel], root: Path
 ) -> None:
     """library#25: a download started with an operations token never replaces
-    a file that is already there, never writes at or inside the folder of a
-    folder-format model the Library lists or of an engine's own prepared
-    files, and never writes a file the Library would list as a prepared
-    model (a provenance file names what the owner later runs) or the marker
-    that hides a folder's models. Raises `OwnerOnly` naming the first."""
+    a file that is already there, never writes at or inside the path of a
+    model the Library lists that is not a file there now (a folder model, or
+    a model listed missing or unreadable, which a scan would bring back with
+    the owner's profiles), nor inside an engine's own prepared files, and
+    never writes a file the Library would list as a prepared model (a
+    provenance file names what the owner later runs) or the marker that hides
+    a folder's models. Raises `OwnerOnly` naming the first."""
     folders = [
         (Path(model.path), model.displayName or model.name)
         for model in models
-        if model.path and os.path.isdir(model.path)
+        if model.path and not os.path.isfile(model.path)
     ]
     for entry in entries:
         destination = Path(entry.destinationPath)
-        name = destination.name
+        refuse_trailing(destination, root, restricted=True)
+        name = destination.name.rstrip(". ")
         if prepared.is_provenance(name) or name.lower() == prepared.ENGINE_FILES_MARKER:
             raise OwnerOnly(
                 f"Only the owner can download {name}: the Library lists such a file as a "
@@ -161,9 +213,9 @@ def refuse_for_operations(
                 destination, folder
             ):
                 raise OwnerOnly(
-                    f"Only the owner can download into {folder}: it is the folder of the "
-                    f"model {model_name}. Nothing was written. Choose another folder, or "
-                    "ask the owner."
+                    f"Only the owner can download into {folder}: it is the place of the "
+                    f"model {model_name} in the Library. Nothing was written. Choose another "
+                    "folder, or ask the owner."
                 )
         for parent in destination.parents:
             if not path_utils.is_within(parent, root):
@@ -432,11 +484,13 @@ class DownloadJob:
         self._store = store
         self._scan_manager = scan_manager
         self._guard = guard or (lambda path: None)
-        #: library#25: started or resumed with an operations token, so a file
-        #: that is already at a destination is never replaced. In memory: a
-        #: record that comes back after a restart is resumed by a route,
-        #: which sets it again for an operations token.
-        self.restricted = False
+        #: library#25: a person with the Models power started it. Stored with
+        #: the record (`StateStore.started_by_operations`), so it holds after
+        #: a restart and whoever resumes it: it never replaces a file.
+        self.started_by_operations = False
+        #: Resumed with an operations token: the run that resume starts. Every
+        #: resume sets it, so the owner's next resume is the owner's again.
+        self.restricted_run = False
         self.task: asyncio.Task[None] | None = None
         self._samples: list[tuple[float, int]] = []
 
@@ -768,9 +822,10 @@ class DownloadJob:
         if part is not None:
             self._guard(part)
             self._guard(destination)
-            if self.restricted and os.path.lexists(destination):
+            restricted = self.started_by_operations or self.restricted_run
+            if restricted and os.path.lexists(destination):
                 # Appeared since the download started (library#25).
-                raise _already_there(destination)
+                raise _already_there(destination, started_by_operations=self.started_by_operations)
             os.replace(part, destination)
         entry.state = DownloadState.done
 
@@ -865,7 +920,7 @@ class DownloadManager:
         self._lock = asyncio.Lock()
 
         for record in store.list_downloads():
-            self._jobs[record.id] = DownloadJob(
+            job = DownloadJob(
                 record=record,
                 files=[],
                 client=self._client_of(record.source),
@@ -873,6 +928,8 @@ class DownloadManager:
                 scan_manager=scan_manager,
                 guard=self._guard_path,
             )
+            job.started_by_operations = store.started_by_operations(record.id)
+            self._jobs[record.id] = job
 
     def _resolve(self, source: str | None) -> tuple[str | None, HubClient]:
         """The hub a download names (LS4), or the default, and its id; raises
@@ -959,6 +1016,12 @@ class DownloadManager:
             read_only=self._read_only_roots(),
         )
 
+        # Before the network: a folder or a name Windows writes under another
+        # name gets that cause now, not "outside a writable folder" later.
+        refuse_trailing(directory, root, restricted=restricted)
+        if spec.filename:
+            refuse_trailing(directory / spec.filename, root, restricted=restricted)
+
         if spec.filename and len(spec.files) > 1:
             raise DownloadError(
                 "`filename` renames a single file, and this download has "
@@ -1010,6 +1073,8 @@ class DownloadManager:
 
         if restricted:
             refuse_for_operations(entries, self._store.list_models(), root)
+        for entry in entries:
+            refuse_trailing(Path(entry.destinationPath), root, restricted=False)
         total = sum(e.sizeBytes or 0 for e in entries)
         self._check_disk(directory, total)
 
@@ -1038,13 +1103,13 @@ class DownloadManager:
             scan_manager=self._scan_manager,
             guard=self._guard_path,
         )
-        job.restricted = restricted
+        job.started_by_operations = restricted
         async with self._lock:
             if download_id is not None and (existing := self.get(download_id)) is not None:
                 return existing
             self._check_conflicts(entries)
             self._jobs[record.id] = job
-            self._persist(record)
+            self._store.put_download(record, operations=restricted)
             self._maybe_start_locked()
         return record
 
@@ -1182,10 +1247,10 @@ class DownloadManager:
     async def resume(self, download_id: str, *, restricted: bool = False) -> Download:
         """`restricted`: resumed with an operations token. The download may
         finish its own files, even in a folder the Library has listed as a
-        model since; it still never replaces a file (library#25)."""
+        model since; for this run it never replaces a file (library#25). One
+        a person with the Models power started never does, whoever resumes
+        it (`DownloadJob.started_by_operations`)."""
         job = self._require(download_id)
-        if restricted:
-            job.restricted = True
         if job.record.state not in (
             DownloadState.paused,
             DownloadState.failed,
@@ -1218,6 +1283,8 @@ class DownloadManager:
         job.record.finishedAt = None
         job.record.message = "resuming"
         async with self._lock:
+            # Set under the lock that starts runs, for the run this starts.
+            job.restricted_run = restricted
             self._maybe_start_locked()
         self._persist(job.record)
         return job.record

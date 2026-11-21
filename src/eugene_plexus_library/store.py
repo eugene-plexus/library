@@ -175,6 +175,9 @@ class StateStore:
         self._kept: dict[str, OllamaKept] = {}
         self._profiles: dict[str, list[ModelProfile]] = {}
         self._downloads: dict[str, Download] = {}
+        #: library#25: the downloads a person with the Models power started.
+        #: Kept beside the records in the state file, not in the contract.
+        self._operations_downloads: set[str] = set()
         self._by_path: dict[str, LibraryModel] = {}
         self._last_scan_at: datetime | None = None
 
@@ -207,6 +210,7 @@ class StateStore:
             self._models = {}
             self._profiles = {}
             self._downloads = {}
+            self._operations_downloads = set()
             raw: dict[str, Any] = {}
             if self._path.exists():
                 try:
@@ -294,6 +298,11 @@ class StateStore:
                         "paused: the process restarted while transferring; resume to continue."
                     )
                 self._downloads[record.id] = record
+            started = raw.get("operationsDownloads")
+            if isinstance(started, list):
+                self._operations_downloads = {
+                    d for d in started if isinstance(d, str) and d in self._downloads
+                }
             stamp = raw.get("lastScanAt")
             if isinstance(stamp, str):
                 try:
@@ -356,6 +365,7 @@ class StateStore:
             "downloads": [
                 d.model_dump(mode="json", exclude_none=True) for d in self._downloads.values()
             ],
+            "operationsDownloads": sorted(self._operations_downloads & set(self._downloads)),
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
         write_private_text(self._path, json.dumps(payload, indent=2))
@@ -859,22 +869,33 @@ class StateStore:
         with self._lock:
             return self._downloads.get(download_id)
 
-    def put_download(self, record: Download) -> None:
+    def put_download(self, record: Download, *, operations: bool = False) -> None:
         """Insert or update one record and flush the state file.
 
         Called at phase transitions, not per chunk: writing the state
         file on every megabyte of a 40 GB transfer would be forty
         thousand rewrites of a file whose other contents did not change.
+
+        `operations`: a person with the Models power started it (library#25);
+        set once, with the first write, and never cleared while the record
+        lives.
         """
         with self._lock:
             self._writable()
             self._downloads[record.id] = record
+            if operations:
+                self._operations_downloads.add(record.id)
             self._write_locked()
+
+    def started_by_operations(self, download_id: str) -> bool:
+        with self._lock:
+            return download_id in self._operations_downloads
 
     def delete_download(self, download_id: str) -> bool:
         with self._lock:
             self._writable()
             if self._downloads.pop(download_id, None) is None:
                 return False
+            self._operations_downloads.discard(download_id)
             self._write_locked()
             return True
