@@ -60,6 +60,28 @@ jobs:
       - name: Pytest
         run: pytest
 
+  # Deleting files is a destructive operation: where a model's files may be
+  # read and removed is also checked on real Windows, where drive letters,
+  # UNC paths and junctions are the ways out of a folder (library#20).
+  paths-windows:
+    name: Model file paths and Delete (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install package + dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Pytest (paths, prepared models, Delete, uploads)
+        run: >-
+          pytest tests/test_paths_stay_in_the_library.py tests/test_deletion.py
+          tests/test_prepared.py tests/test_prepared_uploads.py tests/test_paths.py
+
   codegen-freshness:
     name: Codegen freshness
     runs-on: ubuntu-latest

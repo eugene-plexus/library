@@ -25,6 +25,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import secrets
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -43,7 +44,7 @@ from ._generated.models import (
     ModelStatus,
     PreparedDependent,
 )
-from .paths import is_within, real_within
+from .paths import is_within, real_within, same_path
 
 #: Downloads still writing files.
 WRITING = {
@@ -59,11 +60,53 @@ MOVED_ASIDE = ".eugene-deleting-"
 
 
 class DeleteRefused(Exception):
-    """Nothing was deleted, and why."""
+    """Nothing was deleted, and why; `title` says it in a few words."""
+
+    def __init__(self, detail: str, *, title: str = "A file is in use") -> None:
+        super().__init__(detail)
+        self.title = title
+
+
+class _Escaped(Exception):
+    """A path left its Library folder between the check and the move."""
 
 
 def _key(path: str) -> str:
     return os.path.normcase(os.path.normpath(path))
+
+
+_SEPARATORS = re.compile(r"[\\/]")
+
+
+def held_by(path: str, roots: Sequence[Path]) -> Path | None:
+    """The Library folder `path` may be removed from, or None (library#20).
+
+    The path must be absolute, with no `..`, and lie below a folder in
+    `roots` as written and once this machine resolves the links and
+    junctions of its folders, so a linked folder inside a Library folder
+    that points out is outside. The file itself is removed as an entry, so
+    a link there goes and its target stays; a folder is never removed by
+    this call, and the Library folder least of all."""
+    if not os.path.isabs(path) or ".." in _SEPARATORS.split(path):
+        return None
+    if os.path.isdir(path):
+        return None
+    folder = os.path.dirname(path)
+    for root in roots:
+        if (
+            is_within(path, root)
+            and not same_path(path, root)
+            and is_within(folder, root)
+            and real_within(folder, root)
+        ):
+            return root
+    return None
+
+
+def _outside(path: str, roots: Sequence[Path]) -> str:
+    named = ", ".join(str(r) for r in roots) or "none configured"
+    what = "a folder" if os.path.isdir(path) else "outside the Library folders"
+    return f"{path} is {what} ({named}), and the Library deletes only a model's files there."
 
 
 def own_files(model: LibraryModel) -> list[ModelFile]:
@@ -172,16 +215,25 @@ def plan(
     downloads: Iterable[Any] = (),
     operations: Iterable[dict[str, Any]] = (),
     also: Iterable[str] = (),
+    roots: Sequence[Path] | None = None,
 ) -> Plan:
     """What deleting `model` (and the models in `also` with it) would
-    remove and keep. A file is kept when a model not being deleted names it."""
+    remove and keep. A file is kept when a model not being deleted names it.
+
+    With `roots` (the writable Library folders), a file outside them is
+    neither removed nor kept: it is left out of the plan, and the plan is
+    refused naming it (library#20)."""
     downloads = list(downloads)
     operations = list(operations)
     skip = {model.id, *also}
     users = _users(listed, skip)
     files: list[ModelFile] = []
     kept: list[KeptModelFile] = []
+    stray: str | None = None
     for f in own_files(model):
+        if roots is not None and held_by(f.path, roots) is None:
+            stray = stray or f.path
+            continue
         others = users.get(_key(f.path))
         if others:
             kept.append(
@@ -199,6 +251,11 @@ def plan(
         if m.id != model.id and m.prepared is not None and m.prepared.sourceModelId == model.id
     ]
     why = refusal(model, files, downloads=downloads, operations=operations)
+    if why is None and stray is not None and roots is not None:
+        why = (
+            f"It lists a file outside the Library folders ({stray}), so the Library deletes "
+            "none of its files. Scan the Library again, then delete it."
+        )
     if why is None and model.status is not ModelStatus.present:
         why = "Its files are not there: Forget removes it from the Library."
     return Plan(
@@ -239,13 +296,20 @@ def remove(
     refuse, naming the file that could not be moved. Folders left empty go,
     up to the Library folder holding them.
 
-    A file inside a `protected` folder (an Ollama store, CX9) is never touched:
-    the whole call is refused before anything moves."""
+    A file inside a `protected` folder (an Ollama store, CX9) is never touched,
+    nor one that is not inside a folder in `roots` (`held_by`, library#20):
+    the whole call is refused before anything moves. This holds whatever list
+    a caller builds."""
     for path in paths:
         if any(is_within(path, store) or real_within(path, store) for store in protected):
             raise DeleteRefused(
                 f"{path} is in an Ollama model store. It is Ollama's file and the Library "
-                "does not delete it. Nothing was deleted."
+                "does not delete it. Nothing was deleted.",
+                title="Ollama manages this model",
+            )
+        if held_by(path, roots) is None:
+            raise DeleteRefused(
+                f"{_outside(path, roots)} Nothing was deleted.", title="Outside the Library"
             )
     moved: list[tuple[str, str]] = []
     tag = secrets.token_hex(4)
@@ -254,7 +318,18 @@ def remove(
             continue
         aside = os.path.join(os.path.dirname(path), f"{MOVED_ASIDE}{tag}-{os.path.basename(path)}")
         try:
+            # Again just before it moves: a folder on a share can become a link
+            # after the first check.
+            if held_by(path, roots) is None:
+                raise _Escaped(path)
             os.replace(path, aside)
+        except _Escaped:
+            for original, hidden in reversed(moved):
+                with contextlib.suppress(OSError):
+                    os.replace(hidden, original)
+            raise DeleteRefused(
+                f"{_outside(path, roots)} Nothing was deleted.", title="Outside the Library"
+            ) from None
         except OSError as exc:
             for original, hidden in reversed(moved):
                 with contextlib.suppress(OSError):

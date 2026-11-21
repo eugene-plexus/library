@@ -95,7 +95,13 @@ def target(folder: Path, path: str, protected: tuple[Path, ...] = ()) -> Target:
         )
     parts = path.split("/")
     for part in parts:
-        if part in ("", ".", "..") or part != part.strip() or len(part) > 255:
+        # Windows drops a trailing dot or space, so `x.` would land on `x`.
+        if (
+            part in ("", ".", "..")
+            or part != part.strip()
+            or part.endswith((".", " "))
+            or len(part) > 255
+        ):
             raise UploadRefused(400, f"{path!r} has a part the Library will not write: {part!r}.")
         if any(ord(c) < 32 for c in part) or part.split(".")[0].upper() in _RESERVED:
             raise UploadRefused(400, f"{path!r} has a part the Library will not write: {part!r}.")

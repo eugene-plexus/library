@@ -49,6 +49,11 @@ def _sha(data: bytes) -> str:
         "Strata-data/.eugene-engine-files",
         "Strata-data/CON.txt",
         "Strata-data/ x",
+        # Windows drops a part's trailing dot or space: refused, as site-host does.
+        "Strata-data/x.",
+        "Strata-data/sub./x.bin",
+        "Strata-data/...",
+        "Strata-data/x ",
     ],
 )
 def test_a_preparation_writes_only_inside_an_engines_own_folder(tmp_path: Path, path: str):

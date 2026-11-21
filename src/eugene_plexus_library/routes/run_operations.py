@@ -272,6 +272,13 @@ def _adopt(
             f"The prepared entry {entry} is not inside a Library folder "
             f"({', '.join(str(r) for r in roots) or 'none configured'}).",
         )
+    if not prepared.inside(entry, root):
+        # Through a linked folder that points out (library#20).
+        raise HTTPException(
+            400,
+            f"The prepared entry {entry} is not inside the Library folder {root} once its "
+            "links are followed. Nothing was written.",
+        )
     folder = FilePath(entry).parent
     if any(is_within(folder, store) or real_within(folder, store) for store in stores or []):
         raise HTTPException(
@@ -293,6 +300,12 @@ def _adopt(
             "preparedAt": body.provenance.preparedAt or datetime.now(tz=UTC),
         }
     )
+    # Every file the node lists is in the Library folder (library#20): a list
+    # that leaves it is refused, so no such provenance file is ever written.
+    try:
+        prepared.listed_files(target, provenance, root)
+    except prepared.PreparedError as exc:
+        raise HTTPException(400, f"Nothing was written: {exc}") from None
     replace = target.exists()
     if replace and not prepared.replaces(target, provenance, written):
         raise HTTPException(

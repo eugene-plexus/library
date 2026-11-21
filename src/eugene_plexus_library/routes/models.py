@@ -229,12 +229,23 @@ def _write_provenance(
     # The Library is the home of a model's files (Troy, LS7: B19/B20 amended),
     # so an entry is in the Library folder its provenance goes into, never a
     # path on one node's own disk; and being here, it is checked now.
-    if prepared.is_absolute(written) and not is_within(written, root):
+    if prepared.is_absolute(written) and not prepared.inside(written, root):
         raise _problem(
             status.HTTP_400_BAD_REQUEST,
             "Entry outside the Library",
             f"{written} is not in the Library folder {root}. {prepared.OUTSIDE_LIBRARY}",
         )
+    if not prepared.is_absolute(written):
+        # Relative to the provenance file: it must stay in the Library folder too
+        # (library#20), or the file would list a model that is unreadable.
+        try:
+            prepared.contained(target, written, root, "entry file")
+        except prepared.PreparedError as exc:
+            raise _problem(
+                status.HTTP_400_BAD_REQUEST,
+                "Entry outside the Library",
+                f"Nothing was written: {exc}",
+            ) from None
     if not os.path.isfile(resolved):
         raise _problem(
             status.HTTP_400_BAD_REQUEST,
@@ -248,6 +259,16 @@ def _write_provenance(
             "preparedAt": body.provenance.preparedAt or datetime.now(tz=UTC),
         }
     )
+    # Every file it lists is in the Library folder (library#20): a list that
+    # leaves it is refused here, so no such provenance file is ever written.
+    try:
+        prepared.listed_files(target, provenance, root)
+    except prepared.PreparedError as exc:
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST,
+            "File outside the Library",
+            f"Nothing was written: {exc}",
+        ) from None
     try:
         folder.mkdir(parents=True, exist_ok=True)
         prepared.write(target, provenance)
@@ -303,12 +324,15 @@ async def add_prepared_model(request: Request, body: PreparedModelRequest) -> Li
 
 def _deletion_context(request: Request) -> dict[str, Any]:
     """What can hold a model back from deletion: the downloads writing
-    files, and the run operations still working on a model."""
+    files, the run operations still working on a model, and the folders
+    its files must be in."""
     manager = getattr(request.app.state, "download_manager", None)
     journal = getattr(request.app.state, "run_operations", None)
     return {
         "downloads": manager.records() if manager is not None else [],
         "operations": journal.list(pending_only=True) if journal is not None else [],
+        # A file outside them is never planned or deleted (library#20).
+        "roots": request.app.state.config_store.writable_roots(),
     }
 
 
@@ -416,7 +440,7 @@ async def delete_model(request: Request, model_id: str, body: ModelDeleteRequest
                 paths, config.writable_roots(), protected=config.ollama_roots()
             )
         except deletion.DeleteRefused as exc:
-            raise _problem(status.HTTP_409_CONFLICT, "A file is in use", str(exc)) from exc
+            raise _problem(status.HTTP_409_CONFLICT, exc.title, str(exc)) from exc
         for p in plans:
             store.forget_model(p.model.id)
         kept = list(dict.fromkeys(k.path for p in plans for k in p.kept))

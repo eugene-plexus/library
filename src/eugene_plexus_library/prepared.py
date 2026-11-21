@@ -40,7 +40,7 @@ from ._generated.models import (
     PreparedFile,
     PreparedProvenance,
 )
-from .paths import is_within, model_id
+from .paths import is_within, model_id, real_within
 
 SUFFIX = ".eugene-prepared.json"
 #: A folder holding this file is an engine's own (LS5, B44): a preparation
@@ -112,24 +112,77 @@ OUTSIDE_LIBRARY = (
 )
 
 
+def inside(path: str, root: Path) -> bool:
+    """`path` is in the Library folder `root` as written and after this
+    machine resolves its links and junctions (library#20)."""
+    return is_within(path, root) and real_within(path, root)
+
+
+def contained(provenance: Path, text: str, root: Path, what: str) -> str:
+    """`text`, a path the provenance file at `provenance` gives relative to
+    its own folder, as a path on this host; or `PreparedError` naming it
+    when it is not a file's place inside the Library folder `root`.
+
+    Refused: an absolute path under either convention, a drive or UNC
+    prefix, a path naming a folder, and one that lands outside `root` as
+    written or once links resolve (lexically, and as the OS walks it, where
+    a `..` after a linked folder climbs out of the link's target). A `..`
+    that climbs out and back in is kept: LS7 writes `../` paths when a
+    provenance file goes in another folder than its engine's."""
+    if not text or not text.strip():
+        raise PreparedError(f"its {what} is empty, so it names no file")
+    if is_absolute(text) or PureWindowsPath(text).drive or text.startswith(("/", "\\")):
+        raise PreparedError(
+            f"its {what} {text} is not a path relative to its provenance file. {OUTSIDE_LIBRARY}"
+        )
+    walked = os.path.join(str(provenance.parent), text)
+    on_disk = os.path.normpath(walked)
+    if not (inside(on_disk, root) and real_within(walked, root)):
+        raise PreparedError(
+            f"its {what} {on_disk} is outside the Library folder {root}. {OUTSIDE_LIBRARY}"
+        )
+    if os.path.isdir(on_disk):
+        raise PreparedError(f"its {what} {text} names the folder {on_disk}, not a file")
+    return on_disk
+
+
+def listed_files(provenance_path: Path, provenance: PreparedProvenance, root: Path) -> list[str]:
+    """Each file the provenance lists, on this host, all inside `root`; or
+    `PreparedError` naming the first that is not."""
+    return [contained(provenance_path, f.path, root, "file") for f in provenance.files or []]
+
+
 def model_from(path: Path, root: Path) -> LibraryModel:
     """One prepared model from its provenance file, or an unreadable entry
     naming why. Never cached: the file is a few hundred bytes, and whether
-    its entry is there can change without the provenance changing."""
+    its entry is there can change without the provenance changing.
+
+    No path it lists leaves the Library folder (library#20): such a model is
+    unreadable, naming the path, and lists no file, so nothing outside can
+    be measured, planned or deleted as one of its files."""
     try:
         stat = path.stat()
         provenance = read(path)
     except (OSError, PreparedError) as exc:
         return unreadable(path, root, str(exc))
     entry = provenance.entry
-    resolved = entry_path(path, entry)
-    if is_absolute(entry) and not is_within(resolved, root):
-        return unreadable(
-            path,
-            root,
-            f"its entry file {resolved} is outside the Library folder {root}. {OUTSIDE_LIBRARY}",
-            provenance=provenance,
-        )
+    if is_absolute(entry):
+        resolved = entry
+        if not inside(resolved, root):
+            return unreadable(
+                path,
+                root,
+                f"its entry file {resolved} is outside the Library folder {root}. "
+                f"{OUTSIDE_LIBRARY}",
+                provenance=provenance,
+                refused=True,
+            )
+    try:
+        if not is_absolute(entry):
+            resolved = contained(path, entry, root, "entry file")
+        on_disk_files = listed_files(path, provenance, root)
+    except PreparedError as exc:
+        return unreadable(path, root, str(exc), provenance=provenance, refused=True)
     found = os.path.isfile(resolved)
     if not found and not is_absolute(entry):
         # Relative means it travels with this folder, so it should be here.
@@ -141,8 +194,7 @@ def model_from(path: Path, root: Path) -> LibraryModel:
         files.append(ModelFile(path=resolved, role=ModelFileRole.config, sizeBytes=_size(resolved)))
     about = detail(provenance, resolved, found=found, provenance_path=path)
     seen = {os.path.normcase(f.path) for f in files}
-    for item in about.files or []:
-        on_disk = os.path.normpath(path.parent / item.path)
+    for item, on_disk in zip(about.files or [], on_disk_files, strict=True):
         if os.path.normcase(on_disk) in seen:
             continue
         seen.add(os.path.normcase(on_disk))
@@ -260,8 +312,23 @@ def _measured(
 
 
 def unreadable(
-    path: Path, root: Path, error: str, *, provenance: PreparedProvenance | None = None
+    path: Path,
+    root: Path,
+    error: str,
+    *,
+    provenance: PreparedProvenance | None = None,
+    refused: bool = False,
 ) -> LibraryModel:
+    """`refused`: a path it lists is not in the Library folder, so its file
+    list is not repeated as the model's (`error` names the path)."""
+    about = (
+        detail(provenance, entry_path(path, provenance.entry), found=False)
+        if provenance is not None
+        else None
+    )
+    if about is not None and refused:
+        kept = [m for m in about.missing or [] if m.fact != "files"]
+        about = about.model_copy(update={"files": None, "missing": kept or None})
     return LibraryModel(
         id=model_id(path),
         path=str(path),
@@ -270,11 +337,7 @@ def unreadable(
         name=name_of(path),
         status=ModelStatus.unreadable,
         error=error,
-        prepared=(
-            detail(provenance, entry_path(path, provenance.entry), found=False)
-            if provenance is not None
-            else None
-        ),
+        prepared=about,
         displayName=provenance.title if provenance is not None else None,
     )
 
