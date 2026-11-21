@@ -305,7 +305,14 @@ ENGINE_NAMES = {
     "kev": "Kev",
     "strata": "Strata",
 }
-_NUMBER = re.compile(r"-\d")
+#: A negative number written as text (`tensorSplit: "-1"`), as the agent
+#: reads one: the whole value, after spaces.
+_NEGATIVE_NUMBER = re.compile(r"-(\d+(\.\d*)?|\.\d+)")
+#: Flags that choose which program a kept owner flag applies to: vLLM's
+#: `source` (this release's container or the owner's own vLLM on the host).
+#: Like a path flag, changing it needs the owner again while an owner flag
+#: stays on; removing it is a change too.
+SOURCE_FLAGS: frozenset[tuple[str, str]] = frozenset({("vllm", "source")})
 
 
 def _engine(value: Any) -> str:
@@ -335,8 +342,8 @@ def _dash_value(value: Any) -> str | None:
     with "-" (after spaces) and is not a negative number."""
     for item in value if isinstance(value, list) else [value]:
         if isinstance(item, str):
-            text = item.lstrip()
-            if text.startswith("-") and not _NUMBER.match(text):
+            text = item.strip()
+            if text.startswith("-") and not _NEGATIVE_NUMBER.fullmatch(text):
                 return item
     return None
 
@@ -347,8 +354,8 @@ def refuse_owner_fields(request: Request, spec: Any, previous: Any = None) -> No
     its environment, its extra arguments, an engine flag only the owner
     sets, a file outside the Library's folders, and a flag on no list stay
     the owner's. A value the profile already had is left alone, for the
-    same engine only; a kept owner flag does not follow a changed file. The
-    owner is never checked here."""
+    same engine only; a kept owner flag does not follow a changed file or a
+    changed or removed `source`. The owner is never checked here."""
     if operations_claims(request) is None:
         return
     engine = _engine(getattr(spec, "engine", None))
@@ -371,6 +378,8 @@ def refuse_owner_fields(request: Request, spec: Any, previous: Any = None) -> No
         field = f"flags.{key}"
         kind = flag_class(engine, key)
         if kind == "path" and value not in (None, "") and before.get(key) != value:
+            changed_path = field
+        if (engine, key) in SOURCE_FLAGS and before.get(key) != value:
             changed_path = field
         if value in (None, "") or before.get(key) == value:
             continue
@@ -397,17 +406,21 @@ def refuse_owner_fields(request: Request, spec: Any, previous: Any = None) -> No
                 f"Only the owner can set {key} ({field}): it is not a setting the Models "
                 f"power may change for {name}. Leave it out, or ask the owner.",
             )
+    for source_engine, key in SOURCE_FLAGS:
+        if source_engine == engine and before.get(key) not in (None, "") and key not in flags:
+            changed_path = f"flags.{key}"  # removed
     if changed_path is not None:
-        # A kept owner flag was the owner's choice for these files.
+        # A kept owner flag was the owner's choice for these files and this
+        # program.
         for key, value in flags.items():
             owned = OWNER_FLAGS.get((engine, key))
             if owned is not None and _is_on(value):
                 raise _problem(
                     status.HTTP_403_FORBIDDEN,
                     "Owner only",
-                    f"Only the owner can keep {owned} (flags.{key}) with another file "
-                    f"({changed_path}). Turn it off, leave the file as it was, or ask "
-                    "the owner.",
+                    f"Only the owner can keep {owned} (flags.{key}) with another file or "
+                    f"program ({changed_path}). Turn it off, leave {changed_path} as it "
+                    "was, or ask the owner.",
                 )
 
 
@@ -418,7 +431,7 @@ def _refuse_outside(field: str, value: Any, roots: list[Any]) -> None:
     for item in values or [value]:
         if inside_a_folder(item, roots):
             continue
-        if not isinstance(item, str) or not os.path.isabs(item):
+        if not _full_path(item):
             raise _problem(
                 status.HTTP_403_FORBIDDEN,
                 "Owner only",
@@ -432,14 +445,23 @@ def _refuse_outside(field: str, value: Any, roots: list[Any]) -> None:
 _SEPARATORS = re.compile(r"[\\/]")
 
 
+def _full_path(value: Any) -> bool:
+    """An absolute path; on Windows also with a drive or a UNC share, since
+    Python 3.12 takes `\\models\\x.gguf` as absolute there, on whichever
+    drive is current."""
+    if not isinstance(value, str) or not os.path.isabs(value):
+        return False
+    return os.name != "nt" or bool(os.path.splitdrive(value)[0])
+
+
 def inside_a_folder(value: Any, roots: list[Any]) -> bool:
-    """Review B1, second pass: an absolute path with no `..` under either
-    separator that lies in one of `roots` both as written and after this
-    machine resolves its links, so a link inside a folder that points out
-    is outside."""
+    """Review B1, second pass: a full path (`_full_path`) with no `..` under
+    either separator that lies in one of `roots` both as written and after
+    this machine resolves its links, so a link inside a folder that points
+    out is outside."""
     from .paths import is_within, real_within
 
-    if not isinstance(value, str) or not os.path.isabs(value):
+    if not _full_path(value):
         return False
     if ".." in _SEPARATORS.split(value):
         return False
@@ -459,6 +481,33 @@ def _owner_field(field: str, what: str, *, moved: bool = False) -> HTTPException
         "Owner only",
         f"Only the owner can set {what} ({field}). Leave it as it was, or ask the owner.",
     )
+
+
+def carry_owner_fields[M: BaseModel](request: Request, spec: M, previous: Any) -> M:
+    """Review of library#22: an operations token reads a profile without its
+    environment and extra arguments (`scrub_profile`), so the console's save
+    sends them empty. On a replace with an operations token, the stored ones
+    are kept when the body omits or empties them; `refuse_owner_fields`
+    still refuses any other value. A move to another engine with them set
+    needs the owner, since they were set for this engine."""
+    if operations_claims(request) is None or previous is None:
+        return spec
+    missing = {
+        field: getattr(previous, field)
+        for field in OWNER_PROFILE_FIELDS
+        if getattr(previous, field, None) and not getattr(spec, field, None)
+    }
+    if not missing:
+        return spec
+    if _engine(getattr(spec, "engine", None)) != _engine(getattr(previous, "engine", None)):
+        what = " and ".join(OWNER_PROFILE_FIELDS[field] for field in missing)
+        raise _problem(
+            status.HTTP_403_FORBIDDEN,
+            "Owner only",
+            f"Only the owner can move this profile to another engine: the owner set {what} "
+            f"on it ({', '.join(missing)}). Keep the engine, or ask the owner.",
+        )
+    return spec.model_copy(update=missing)
 
 
 def scrub_profile[M: BaseModel](request: Request, profile: M) -> M:

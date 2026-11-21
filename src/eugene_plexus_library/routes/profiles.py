@@ -13,7 +13,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from .._generated.models import ModelProfile, ModelProfileList, ModelProfileSpec, Problem
-from ..operations import MODELS, operation, refuse_owner_fields, scrub_profile
+from ..operations import (
+    MODELS,
+    carry_owner_fields,
+    operation,
+    refuse_owner_fields,
+    scrub_profile,
+)
 from ..store import StateStore
 
 router = APIRouter(tags=["profiles"])
@@ -93,7 +99,9 @@ async def replace_profile(
     line after I deleted it" is a bug report nobody should have to file.
     """
     store = _require_model(request, model_id)
-    refuse_owner_fields(request, body, store.get_profile(model_id, profile_id))
+    previous = store.get_profile(model_id, profile_id)
+    body = carry_owner_fields(request, body, previous)
+    refuse_owner_fields(request, body, previous)
     try:
         updated = store.replace_profile(model_id, profile_id, body)
     except ValueError as exc:

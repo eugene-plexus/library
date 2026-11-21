@@ -302,11 +302,51 @@ def test_models_writes_a_plain_profile_and_reads_no_environment_values(
     listed = client.get(f"/v1/models/{model_id}/profiles", headers=dana).json()
     one = client.get(f"/v1/models/{model_id}/profiles/{owned.json()['id']}", headers=dana)
     assert "hf-secret" not in str(listed) and "hf-secret" not in one.text
-    # Dana changes the owner's profile and keeps its environment as it is.
-    kept = {**secret, "flags": {"contextSize": 8192}}
+    # Dana changes the owner's profile in the console. She read it without
+    # its environment, so the console's save sends what she saw: an empty
+    # environment and no extra arguments (ProfileEditor.tsx). The owner's
+    # values stay.
     path = f"/v1/models/{model_id}/profiles/{owned.json()['id']}"
-    assert client.put(path, json=kept, headers=dana).status_code == 200
+    seen = one.json()
+    console = {
+        "name": seen["name"],
+        "engine": seen["engine"],
+        "default": seen["default"],
+        "authorSampling": True,
+        "flags": {"contextSize": 8192},
+        "extraArgs": [],
+        "env": {},
+    }
+    assert client.put(path, json=console, headers=dana).status_code == 200
+    stored = client.get(path, headers=owner).json()
+    assert stored["env"] == {"HF_TOKEN": "hf-secret"}
+    assert stored["flags"] == {"contextSize": 8192}
+    # The body may also leave them out.
+    assert client.put(path, json={**console, "env": None, "extraArgs": None}, headers=dana)
     assert client.get(path, headers=owner).json()["env"] == {"HF_TOKEN": "hf-secret"}
+
+
+def test_models_keeps_the_owners_extra_arguments_and_cannot_change_them(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall
+) -> None:
+    client, model_id, _ = stocked
+    owner_set = {"extraArgs": ["--api-key", "k"], "env": {"A": "1"}}
+    path = _owner_profile(client, install, model_id, name="o", engine="vllm", **owner_set)
+    dana = _bearer(_operations(install, MODELS))
+    console = {"name": "o", "engine": "vllm", "flags": {"maxModelLen": 4096}}
+    answer = client.put(path, json={**console, "extraArgs": [], "env": {}}, headers=dana)
+    assert answer.status_code == 200, answer.text
+    stored = client.get(path, headers=_bearer(install.session())).json()
+    assert (stored["extraArgs"], stored["env"]) == (["--api-key", "k"], {"A": "1"})
+    other = client.put(path, json={**console, "extraArgs": ["--x"]}, headers=dana)
+    assert other.status_code == 403 and "(extraArgs)" in other.json()["detail"]["detail"]
+    # Another engine with the owner's environment needs the owner.
+    moved = client.put(path, json={**console, "engine": "mlx", "flags": {}}, headers=dana)
+    assert moved.status_code == 403, moved.text
+    detail = moved.json()["detail"]["detail"]
+    assert "another engine" in detail and "env" in detail and "extraArgs" in detail, detail
+    stored = client.get(path, headers=_bearer(install.session())).json()
+    assert stored["engine"] == "vllm" and stored["env"] == {"A": "1"}
 
 
 def test_a_search_is_not_a_change_and_a_download_names_its_repository(
@@ -441,7 +481,8 @@ def test_models_keeps_the_owners_settings_as_they_are(
     answer = client.put(path, json={"name": "o", "engine": "vllm", "flags": changed}, headers=dana)
     assert answer.status_code == 200, answer.text
     assert answer.json()["flags"] == changed
-    # Removing an owner's setting is no risk.
+    # Removing the trust, with the owner's other settings, is no risk. (Removing
+    # `source` while the trust stays is: see the test below.)
     fewer = {"maxModelLen": 16384}
     answer = client.put(path, json={"name": "o", "engine": "vllm", "flags": fewer}, headers=dana)
     assert answer.status_code == 200, answer.text
@@ -481,10 +522,69 @@ def test_a_kept_trust_does_not_follow_another_engine_or_file(
 
 
 @pytest.mark.parametrize(
+    "flags",
+    [
+        {"trustRemoteCode": True, "source": "binary"},
+        {"trustRemoteCode": True},
+        {"trustRemoteCode": True, "source": None},
+    ],
+    ids=["changed", "removed", "null"],
+)
+def test_a_kept_trust_does_not_follow_vllm_from_the_container_to_the_host(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall, flags: dict[str, Any]
+) -> None:
+    """Review of library#22: the owner trusted the model's code inside this
+    release's vLLM container; on the host it runs in the agent's account."""
+    client, model_id, _ = stocked
+    owners = {"trustRemoteCode": True, "source": "container"}
+    path = _owner_profile(client, install, model_id, name="o", engine="vllm", flags=owners)
+    dana = _bearer(_operations(install, MODELS))
+    answer = client.put(path, json={"name": "o", "engine": "vllm", "flags": flags}, headers=dana)
+    assert answer.status_code == 403, answer.text
+    detail = answer.json()["detail"]["detail"]
+    assert "(flags.trustRemoteCode)" in detail and "flags.source" in detail, detail
+    # Kept as it was, or without the trust, the change is Dana's.
+    for allowed in ({**owners, "maxModelLen": 1}, {"source": "binary"}):
+        body = {"name": "o", "engine": "vllm", "flags": allowed}
+        answer = client.put(path, json=body, headers=dana)
+        assert answer.status_code == 200, answer.text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a rooted path with no drive is a Windows form")
+@pytest.mark.parametrize("sep", ["\\", "/"], ids=["backslash", "slash"])
+def test_a_windows_path_with_no_drive_is_refused(
+    stocked: tuple[TestClient, str, Path],
+    install: FakeInstall,
+    sep: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of library#22: Python 3.12 takes `\\models\\x` as absolute on
+    Windows, on the current drive; it must name its drive or share."""
+    client, model_id, models = stocked
+    monkeypatch.chdir(models)  # the current drive is the folder's
+    rooted = sep + sep.join(os.path.splitdrive(str(models / "t.jinja"))[1].split(os.sep)[1:])
+    dana = _bearer(_operations(install, MODELS))
+    body = {"name": "dana", "engine": "llama_cpp", "flags": {"chatTemplateFile": rooted}}
+    refused = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
+    assert refused.status_code == 403, refused.text
+    detail = refused.json()["detail"]["detail"]
+    assert "(flags.chatTemplateFile)" in detail and "full path" in detail, detail
+    with_drive = {"chatTemplateFile": str(models / "t.jinja")}
+    body = {"name": "dana", "engine": "llama_cpp", "flags": with_drive}
+    assert (
+        client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana).status_code == 201
+    )
+
+
+@pytest.mark.parametrize(
     ("engine", "flags", "field"),
     [
         ("vllm", {"quantization": "--trust-remote-code"}, "flags.quantization"),
+        ("vllm", {"quantization": "-1 --trust-remote-code"}, "flags.quantization"),
+        ("vllm", {"quantization": "-9--trust-remote-code"}, "flags.quantization"),
+        ("vllm", {"quantization": "-1x"}, "flags.quantization"),
         ("mlx", {"chatTemplate": " -x"}, "flags.chatTemplate"),
+        ("mlx", {"chatTemplate": "\n--trust-remote-code"}, "flags.chatTemplate"),
         ("strata", {"gpus": ["0", "--x"]}, "flags.gpus"),
     ],
 )
@@ -511,11 +611,12 @@ def test_models_sets_reviewed_flags_and_paths_inside_the_library(
     dana = _bearer(_operations(install, MODELS))
     for engine, flags in [
         ("llama_cpp", {"tensorSplit": "-1", "mainGpu": -1, "contextSize": 4096}),
+        ("llama_cpp", {"tensorSplit": " -.5 ", "devices": "-1.25"}),
         ("mlx", {"draftModel": str(models / "draft"), "chatTemplate": "{{ messages }}"}),
         ("kev", {"fallback": str(models / "ckpt")}),
         ("strata", {"gpus": ["0", "1"]}),
         ("vllm", {"trustRemoteCode": False, "quantization": "awq"}),
     ]:
-        body = {"name": f"dana-{engine}", "engine": engine, "flags": flags}
+        body = {"name": f"dana-{engine}-{len(flags)}", "engine": engine, "flags": flags}
         made = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
         assert made.status_code == 201, (engine, made.text)

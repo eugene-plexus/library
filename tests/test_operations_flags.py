@@ -2,20 +2,16 @@
 
 `operations.refuse_owner_fields` decides from three explicit lists per
 engine (owner-only flags, path flags, and the flags an operations token may
-set), never from the spelling of a key. The Library holds no engine
-adapters, so `fixtures/engine_flags.json` records every flag the agent's
-adapters declare, per engine. The first test walks it: a flag on no list
-fails, so a new flag is classified here before an operations token can
-write it. The lists are the agent's (agent#53), duplicated: components
-share schemas, never code.
+set), never from the spelling of a key. The lists are the agent's (agent#53),
+duplicated: components share schemas, never code. The Library holds no
+engine adapters, so `fixtures/engine_flags.json` records, for every flag the
+agent's adapters declare, the class the agent gives it. The first test
+compares class with class: a flag the Library has on no list, or in another
+class than the agent's, fails.
 
-To refresh the fixture after the agent adds a flag, run this from an agent
-checkout with its own venv, put the output under `engines`, and name the
-agent commit in `source`:
-
-    python -c "import json; from eugene_plexus_agent.engines import ADAPTERS; \
-print(json.dumps({k.value: {f.key: f.valueType.value for f in a.flag_schema().fields} \
-for k, a in ADAPTERS.items()}, indent=2))"
+To regenerate the fixture after the agent adds or reclassifies a flag, run
+`python tests/fixtures/engine_flags.py <agent checkout>/src` with the
+agent's venv, and name the agent commit in the fixture's `source`.
 """
 
 from __future__ import annotations
@@ -29,30 +25,33 @@ from eugene_plexus_library import operations
 from eugene_plexus_library._generated.models import EngineKind
 
 FIXTURE = Path(__file__).parent / "fixtures" / "engine_flags.json"
-#: Declared value types that name files or folders on a machine.
-PATH_VALUE_TYPES = frozenset({"file_path", "path_list"})
 
 
-def _declared() -> dict[str, dict[str, str]]:
-    engines: dict[str, dict[str, str]] = json.loads(FIXTURE.read_text(encoding="utf-8"))["engines"]
+def _agent_classes() -> dict[str, dict[str, str | None]]:
+    engines: dict[str, dict[str, str | None]] = json.loads(FIXTURE.read_text(encoding="utf-8"))[
+        "engines"
+    ]
     return engines
 
 
 def _pairs() -> set[tuple[str, str]]:
-    return {(engine, key) for engine, flags in _declared().items() for key in flags}
+    return {(engine, key) for engine, flags in _agent_classes().items() for key in flags}
 
 
 def test_the_fixture_covers_every_engine_kind() -> None:
-    assert set(_declared()) == {kind.value for kind in EngineKind}
+    assert set(_agent_classes()) == {kind.value for kind in EngineKind}
 
 
-def test_every_engine_flag_is_classified_for_operations_tokens() -> None:
-    unclassified = sorted(
-        f"{engine}.{key}" for engine, key in _pairs() if operations.flag_class(engine, key) is None
+def test_every_engine_flag_has_the_agents_class() -> None:
+    differ = sorted(
+        f"{engine}.{key}: agent {agent!r}, library {operations.flag_class(engine, key)!r}"
+        for engine, flags in _agent_classes().items()
+        for key, agent in flags.items()
+        if agent is None or operations.flag_class(engine, key) != agent
     )
-    assert unclassified == [], (
+    assert differ == [], (
         "classify these engine flags in operations.py (OWNER_FLAGS, PATH_FLAGS or "
-        f"OPERATIONS_FLAGS): {unclassified}"
+        f"OPERATIONS_FLAGS) as the agent does: {differ}"
     )
 
 
@@ -70,13 +69,6 @@ def test_the_lists_name_only_declared_flags_and_no_flag_twice() -> None:
         for second in names[i + 1 :]:
             both = lists[first] & lists[second]
             assert not both, f"{both} is in both {first} and {second}"
-
-
-def test_a_flag_declared_as_a_path_is_a_path_flag() -> None:
-    for engine, flags in _declared().items():
-        for key, value_type in flags.items():
-            if value_type in PATH_VALUE_TYPES:
-                assert operations.flag_class(engine, key) == "path", f"{engine}.{key}"
 
 
 @pytest.mark.parametrize(
