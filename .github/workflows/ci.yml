@@ -79,7 +79,8 @@ jobs:
 
       - name: Pytest (paths, prepared models, Delete, uploads)
         run: >-
-          pytest tests/test_paths_stay_in_the_library.py tests/test_deletion.py
+          pytest tests/test_paths_stay_in_the_library.py tests/test_paths_stay_in_the_library_review.py
+          tests/test_deletion.py
           tests/test_prepared.py tests/test_prepared_uploads.py tests/test_paths.py
 
   codegen-freshness:
