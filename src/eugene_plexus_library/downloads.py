@@ -67,6 +67,7 @@ from ._generated.models import (
     DownloadState,
     LibraryModel,
     ModelFileRole,
+    ModelStatus,
 )
 from .catalogue_sources import HubClients
 from .hub import FileMetadata, HubClient, HubError, git_blob_sha1
@@ -137,19 +138,38 @@ def _already_there(path: Path, *, started_by_operations: bool = False) -> OwnerO
     )
 
 
+def _split(text: str) -> list[str]:
+    """`text`'s parts as written, without its drive or UNC share, which is
+    never a name (`C:` has a colon that is no stream)."""
+    _, rest = os.path.splitdrive(text)
+    return [part for part in rest.replace("\\", "/").split("/") if part]
+
+
+def _parts_below(path: Path, root: Path) -> list[str]:
+    """The parts of `path` below `root`, as written. Not `os.path.relpath`:
+    it makes both absolute first, and on Windows that drops the very dots
+    and spaces looked for. `root` is matched as written and normalized (a
+    folder configured as `...\\side\\..\\models`), part by part and with the
+    case folding paths use; a `path` under neither gives all its parts."""
+    parts = _split(str(path))
+    folded = [path_utils._case_fold(part) for part in parts]
+    drive = path_utils._case_fold(os.path.splitdrive(str(path))[0])
+    for base in (str(root), os.path.normpath(str(root))):
+        if path_utils._case_fold(os.path.splitdrive(base)[0]) != drive:
+            continue
+        prefix = [path_utils._case_fold(part) for part in _split(base)]
+        if folded[: len(prefix)] == prefix:
+            return parts[len(prefix) :]
+    return parts
+
+
 def trailing_part(path: Path, root: Path) -> tuple[str, str] | None:
     """The first part of `path` below `root` that Windows would write under
     another name, and why: one that ends in a dot or a space (Windows drops
     them, so `x.eugene-prepared.json.` lands as `x.eugene-prepared.json` and
     `trusted ` as `trusted`), or one with a colon (Windows reads
     `a.gguf::$DATA` as the file `a.gguf` itself)."""
-    # As written: `os.path.relpath` would make it absolute first, and on
-    # Windows that drops the very dots and spaces looked for here.
-    text, base = str(path), str(root)
-    relative = text[len(base) :] if text.startswith(base) else text
-    for part in relative.replace("\\", "/").split("/"):
-        if not part:
-            continue
+    for part in _parts_below(path, root):
         if part in (".", ".."):
             continue
         if part != part.rstrip(". "):
@@ -192,7 +212,7 @@ def refuse_for_operations(
     provenance file names what the owner later runs) or the marker that hides
     a folder's models. Raises `OwnerOnly` naming the first."""
     folders = [
-        (Path(model.path), model.displayName or model.name)
+        (Path(model.path), model.displayName or model.name, model.status is not ModelStatus.present)
         for model in models
         if model.path and not os.path.isfile(model.path)
     ]
@@ -208,14 +228,16 @@ def refuse_for_operations(
             )
         if os.path.lexists(destination):
             raise _already_there(destination)
-        for folder, model_name in folders:
+        for folder, model_name, gone in folders:
             if path_utils.is_within(destination, folder) or path_utils.real_within(
                 destination, folder
             ):
+                # The Models power may Forget a missing entry (and its profiles).
+                forget = " Or Forget the missing entry, then download again." if gone else ""
                 raise OwnerOnly(
                     f"Only the owner can download into {folder}: it is the place of the "
                     f"model {model_name} in the Library. Nothing was written. Choose another "
-                    "folder, or ask the owner."
+                    f"folder, or ask the owner.{forget}"
                 )
         for parent in destination.parents:
             if not path_utils.is_within(parent, root):

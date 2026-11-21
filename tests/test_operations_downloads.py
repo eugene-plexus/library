@@ -228,7 +228,8 @@ def test_models_cannot_bring_back_a_missing_model(
     spec = {"repo": "evil/repo", "files": ["config.json"], "subdirectory": "org/trusted"}
     refused = client.post("/v1/downloads", json=spec, headers=dana)
     assert refused.status_code == 403, refused.text
-    assert str(models / "org" / "trusted") in refused.json()["detail"]["detail"]
+    detail = refused.json()["detail"]["detail"]
+    assert str(models / "org" / "trusted") in detail and "Forget the missing entry" in detail
     assert not (models / "org" / "trusted").exists()
 
 
@@ -290,8 +291,10 @@ def test_the_owner_is_not_restricted(
 # ------------------------------------------------------- the manager itself
 
 
-def _manager(tmp_path: Path, fake: Hub) -> tuple[downloads.DownloadManager, StateStore, Path]:
-    root = tmp_path / "models"
+def _manager(
+    tmp_path: Path, fake: Hub, root: Path | None = None
+) -> tuple[downloads.DownloadManager, StateStore, Path]:
+    root = root or tmp_path / "models"
     root.mkdir(exist_ok=True)
     inner = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
     client = hub.HubClient(client=inner)
@@ -417,6 +420,38 @@ async def test_the_owners_download_is_the_owners_after_a_models_resume(tmp_path:
         assert target.read_bytes() == b"GGUF the newer upstream file"
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_library_folder_written_with_dot_dot_still_downloads(tmp_path: Path) -> None:
+    """Third review: a folder configured as `<tmp>/side/../models` held the
+    owner's every download at "'C:': it has a colon": the destination is
+    normalized and the folder as written is not."""
+    (tmp_path / "side").mkdir()
+    written = Path(str(tmp_path / "side") + os.sep + ".." + os.sep + "models")
+    fake = Hub({"b.gguf": b"GGUF b"})
+    manager, _, _ = _manager(tmp_path, fake, root=written)
+    try:
+        for restricted in (False, True):
+            spec = DownloadSpec(repo=f"org/m{int(restricted)}", files=["b.gguf"])
+            record = await manager.start(spec, restricted=restricted)
+            assert (await _drain(manager, record.id)).state is DownloadState.done
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drives and UNC shares are Windows forms")
+@pytest.mark.parametrize(
+    ("path", "root"),
+    [
+        (r"C:\models\org\b.gguf", r"D:\elsewhere"),
+        (r"\\server\share\org\b.gguf", r"C:\models"),
+        (r"C:\models\org\b.gguf", r"C:\other"),
+    ],
+)
+def test_a_drive_or_share_is_never_a_name(path: str, root: str) -> None:
+    assert downloads.trailing_part(Path(path), Path(root)) is None
+    assert downloads.trailing_part(Path(path + "."), Path(root)) is not None
 
 
 def _list_a_folder_model(store: StateStore, folder: Path) -> None:
