@@ -354,8 +354,9 @@ def refuse_owner_fields(request: Request, spec: Any, previous: Any = None) -> No
     its environment, its extra arguments, an engine flag only the owner
     sets, a file outside the Library's folders, and a flag on no list stay
     the owner's. A value the profile already had is left alone, for the
-    same engine only; a kept owner flag does not follow a changed file or a
-    changed or removed `source`. The owner is never checked here."""
+    same engine only; a kept owner flag, environment or extra arguments do
+    not follow a changed file or a changed or removed `source`. The owner is
+    never checked here."""
     if operations_claims(request) is None:
         return
     engine = _engine(getattr(spec, "engine", None))
@@ -421,6 +422,17 @@ def refuse_owner_fields(request: Request, spec: Any, previous: Any = None) -> No
                     f"Only the owner can keep {owned} (flags.{key}) with another file or "
                     f"program ({changed_path}). Turn it off, leave {changed_path} as it "
                     "was, or ask the owner.",
+                )
+        # So were the owner's environment and extra arguments, kept here (the
+        # body may say nothing of them: `carry_owner_fields`). Either can
+        # carry what an owner flag says (`--trust-remote-code`).
+        for field, what in OWNER_PROFILE_FIELDS.items():
+            if getattr(spec, field, None):
+                raise _problem(
+                    status.HTTP_403_FORBIDDEN,
+                    "Owner only",
+                    f"Only the owner can keep {what} ({field}) with another file or program "
+                    f"({changed_path}). Leave {changed_path} as it was, or ask the owner.",
                 )
 
 

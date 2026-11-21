@@ -550,6 +550,72 @@ def test_a_kept_trust_does_not_follow_vllm_from_the_container_to_the_host(
         assert answer.status_code == 200, answer.text
 
 
+@pytest.mark.parametrize(
+    ("owner_set", "change", "field", "flag"),
+    [
+        (
+            {"extraArgs": ["--trust-remote-code"], "flags": {"source": "container"}},
+            {"source": "binary", "tokenizer": "TOK"},
+            "extraArgs",
+            "flags.tokenizer",
+        ),
+        (
+            {"extraArgs": ["--trust-remote-code"], "flags": {"source": "container"}},
+            {},
+            "extraArgs",
+            "flags.source",
+        ),
+        ({"env": {"HF_TRUST": "1"}}, {"tokenizer": "TOK"}, "env", "flags.tokenizer"),
+    ],
+    ids=["new-file-and-host", "source-removed", "env-new-file"],
+)
+def test_the_owners_extra_arguments_do_not_follow_another_file_or_program(
+    stocked: tuple[TestClient, str, Path],
+    install: FakeInstall,
+    owner_set: dict[str, Any],
+    change: dict[str, Any],
+    field: str,
+    flag: str,
+) -> None:
+    """Second review of library#22: the owner's `--trust-remote-code` in the
+    extra arguments is the owner's choice for these files and this program,
+    like the flag. The body says nothing of them; they are kept, so refused."""
+    client, model_id, models = stocked
+    path = _owner_profile(client, install, model_id, name="o", engine="vllm", **owner_set)
+    dana = _bearer(_operations(install, MODELS))
+    flags = {k: (str(models / "evil" / "tok") if v == "TOK" else v) for k, v in change.items()}
+    answer = client.put(path, json={"name": "o", "engine": "vllm", "flags": flags}, headers=dana)
+    assert answer.status_code == 403, answer.text
+    detail = answer.json()["detail"]["detail"]
+    assert f"({field})" in detail and flag in detail and "ask the owner" in detail, detail
+    stored = client.get(path, headers=_bearer(install.session())).json()
+    assert stored["flags"] == owner_set.get("flags")
+
+
+def test_an_ordinary_edit_keeps_the_owners_extra_arguments(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall
+) -> None:
+    client, model_id, _ = stocked
+    owner_set = {"extraArgs": ["--trust-remote-code"], "env": {"A": "1"}}
+    path = _owner_profile(
+        client,
+        install,
+        model_id,
+        name="o",
+        engine="vllm",
+        flags={"source": "container"},
+        **owner_set,
+    )
+    dana = _bearer(_operations(install, MODELS))
+    edit = {"name": "renamed", "engine": "vllm", "default": True}
+    edit["flags"] = {"source": "container", "maxModelLen": 4096}
+    answer = client.put(path, json=edit, headers=dana)
+    assert answer.status_code == 200, answer.text
+    stored = client.get(path, headers=_bearer(install.session())).json()
+    assert (stored["name"], stored["default"]) == ("renamed", True)
+    assert (stored["extraArgs"], stored["env"]) == (owner_set["extraArgs"], owner_set["env"])
+
+
 @pytest.mark.skipif(os.name != "nt", reason="a rooted path with no drive is a Windows form")
 @pytest.mark.parametrize("sep", ["\\", "/"], ids=["backslash", "slash"])
 def test_a_windows_path_with_no_drive_is_refused(
