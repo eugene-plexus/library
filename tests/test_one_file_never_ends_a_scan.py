@@ -9,6 +9,7 @@ nested too deep raises the same error.
 
 from __future__ import annotations
 
+import json
 import struct
 import tracemalloc
 from pathlib import Path
@@ -28,6 +29,24 @@ from .conftest import (
 )
 
 T_UINT8 = 0
+DEEP = "[" * 5000 + "]" * 5000
+
+
+@pytest.fixture
+def deep_json_overflows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the JSON parser fail on `DEEP` as CPython does on Windows.
+
+    Whether 5,000 levels overflows depends on the platform's C stack (it parses
+    on Linux CI), so the failure is made, not hoped for.
+    """
+    real = json.loads
+
+    def loads(text: str | bytes, *args: object, **kwargs: object) -> object:
+        if (text.decode() if isinstance(text, bytes) else text) == DEEP:
+            raise RecursionError("maximum recursion depth exceeded while decoding")
+        return real(text, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(json, "loads", loads)
 
 
 def _header(key: str, kv_count: int = 1) -> bytes:
@@ -202,11 +221,11 @@ def test_a_reader_failure_the_reader_did_not_expect_is_that_files_skip(
 
 
 def test_a_config_nested_past_the_json_limit_is_that_models_skip_not_the_scans(
-    models_dir: Path,
+    models_dir: Path, deep_json_overflows: None
 ) -> None:
     write_hf_model(models_dir / "healthy")
     hostile = write_hf_model(models_dir / "hostile")
-    (hostile / "config.json").write_text("[" * 5000 + "]" * 5000, encoding="utf-8")
+    (hostile / "config.json").write_text(DEEP, encoding="utf-8")
 
     result = Scanner().scan([models_dir])
 
@@ -216,8 +235,10 @@ def test_a_config_nested_past_the_json_limit_is_that_models_skip_not_the_scans(
     assert "nested" in (by_name["hostile"].error or "")
 
 
-def test_a_safetensors_header_nested_past_the_json_limit_is_refused() -> None:
-    raw = b"[" * 5000 + b"]" * 5000
+def test_a_safetensors_header_nested_past_the_json_limit_is_refused(
+    deep_json_overflows: None,
+) -> None:
+    raw = DEEP.encode()
 
     with pytest.raises(safetensors.SafetensorsError, match="nested"):
         safetensors.parse_header(raw, name="deep.safetensors")
@@ -247,19 +268,23 @@ def test_a_directory_the_scanner_could_not_read_for_any_reason_is_one_skip(
     assert "ZeroDivisionError" in (skipped[0].detail or "")
 
 
-def test_a_nested_generation_config_is_no_sampling_not_a_failed_scan(tmp_path: Path) -> None:
+def test_a_nested_generation_config_is_no_sampling_not_a_failed_scan(
+    tmp_path: Path, deep_json_overflows: None
+) -> None:
     from eugene_plexus_library.formats import generation_config
 
-    (tmp_path / "generation_config.json").write_text("[" * 5000 + "]" * 5000, encoding="utf-8")
+    (tmp_path / "generation_config.json").write_text(DEEP, encoding="utf-8")
 
     assert generation_config.read(tmp_path) is None
 
 
-def test_a_nested_ollama_manifest_is_a_named_manifest_error(tmp_path: Path) -> None:
+def test_a_nested_ollama_manifest_is_a_named_manifest_error(
+    tmp_path: Path, deep_json_overflows: None
+) -> None:
     from eugene_plexus_library.formats import ollama
 
     manifest = tmp_path / "manifest"
-    manifest.write_text("[" * 5000 + "]" * 5000, encoding="utf-8")
+    manifest.write_text(DEEP, encoding="utf-8")
 
     with pytest.raises(ollama.ManifestError, match="nested too deeply"):
         ollama._load(manifest)
