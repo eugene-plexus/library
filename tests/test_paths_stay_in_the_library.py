@@ -128,7 +128,9 @@ def test_an_absolute_entry_through_a_link_makes_the_model_unreadable(
     _provenance(models_dir, entry=str(models_dir / "linked" / "e.json"))
     model = _scanned(models_dir)
     assert model.status is ModelStatus.unreadable
-    assert "outside the Library folder" in (model.error or "")
+    # The link is named, with where it points (library#20 review).
+    assert f"is below {models_dir / 'linked'}, a link to" in (model.error or "")
+    assert "add the model from there" in (model.error or "")
 
 
 def test_a_file_reached_through_a_link_makes_the_model_unreadable(
@@ -217,7 +219,7 @@ def test_a_folder_that_becomes_a_link_mid_delete_puts_everything_back(
 
     def held_by(path: str, roots: Any) -> Path | None:
         calls.append(path)
-        # Both pass the first check and the first move; the second then escapes.
+        # Both pass the first check; the first file escapes just after its move.
         return None if len(calls) == 4 else real(path, roots)
 
     monkeypatch.setattr(deletion, "held_by", held_by)

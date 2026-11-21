@@ -109,6 +109,40 @@ def real_within(child: str | os.PathLike[str], parent: str | os.PathLike[str]) -
     return is_within(os.path.realpath(child), os.path.realpath(parent))
 
 
+def has_control(text: str) -> bool:
+    """A control character (NUL, a newline, DEL...), which no file name has."""
+    return any(ord(c) < 32 or ord(c) == 127 for c in text)
+
+
+def shown(text: str) -> str:
+    """`text` with its control characters written out (`\\x00`), for a message."""
+    return "".join(f"\\x{ord(c):02x}" if ord(c) < 32 or ord(c) == 127 else c for c in text)
+
+
+def link_on_the_way(
+    path: str | os.PathLike[str], root: str | os.PathLike[str]
+) -> tuple[str, str] | None:
+    """The first link or junction below `root` on the way to `path` (`path`
+    included), and where it points; None when there is none or `path` is not
+    below `root` as written. Says why a path inside a folder as text is
+    outside it once links resolve (the `followSymlinks` setting lists such
+    models)."""
+    if has_control(os.fspath(path)) or not is_within(path, root):
+        return None
+    try:
+        relative = os.path.relpath(os.path.normpath(os.path.abspath(path)), os.path.abspath(root))
+    except ValueError:
+        return None
+    current = os.path.abspath(root)
+    for part in PurePath(relative).parts:
+        if part in ("", "."):
+            continue
+        current = os.path.join(current, part)
+        if os.path.islink(current) or os.path.isjunction(current):
+            return current, os.path.realpath(current)
+    return None
+
+
 def display_name(path: Path) -> str:
     """The name an operator calls this model.
 

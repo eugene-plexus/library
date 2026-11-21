@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -40,7 +41,7 @@ from ._generated.models import (
     PreparedFile,
     PreparedProvenance,
 )
-from .paths import is_within, model_id, real_within
+from .paths import has_control, is_within, link_on_the_way, model_id, real_within, shown
 
 SUFFIX = ".eugene-prepared.json"
 #: A folder holding this file is an engine's own (LS5, B44): a preparation
@@ -118,29 +119,63 @@ def inside(path: str, root: Path) -> bool:
     return is_within(path, root) and real_within(path, root)
 
 
+def outside_message(what: str, path: str, root: Path) -> str:
+    """Why `path` is not in `root`: below a link that points out (the
+    `followSymlinks` setting lists such models), or plainly outside."""
+    link = link_on_the_way(path, root)
+    if link is not None:
+        return (
+            f"its {what} {path} is below {link[0]}, a link to {link[1]}, which is not in the "
+            f"Library folder {root}. Add that folder as a Library folder, then add the model "
+            "from there."
+        )
+    return f"its {what} {path} is outside the Library folder {root}. {OUTSIDE_LIBRARY}"
+
+
+def plain(text: str, what: str) -> None:
+    """`PreparedError` when `text` holds a control character."""
+    if has_control(text):
+        raise PreparedError(
+            f"its {what} {shown(text)} has a control character in it, which no file name has"
+        )
+
+
+_SEPARATORS = re.compile(r"[\\/]")
+
+
 def contained(provenance: Path, text: str, root: Path, what: str) -> str:
     """`text`, a path the provenance file at `provenance` gives relative to
     its own folder, as a path on this host; or `PreparedError` naming it
     when it is not a file's place inside the Library folder `root`.
 
-    Refused: an absolute path under either convention, a drive or UNC
-    prefix, a path naming a folder, and one that lands outside `root` as
-    written or once links resolve (lexically, and as the OS walks it, where
-    a `..` after a linked folder climbs out of the link's target). A `..`
-    that climbs out and back in is kept: LS7 writes `../` paths when a
-    provenance file goes in another folder than its engine's."""
+    Refused: a control character; an absolute path under either convention,
+    a drive or UNC prefix; a part that ends in a dot or a space, or holds a
+    colon (Windows drops the first two and reads a colon as a stream, so
+    each is another spelling of some other file); a path naming a folder;
+    and one that lands outside `root` as written or once links resolve
+    (lexically, and as the OS walks it, where a `..` after a linked folder
+    climbs out of the link's target). A `..` that climbs out and back in is
+    kept: LS7 writes `../` paths when a provenance file goes in another
+    folder than its engine's."""
+    plain(text, what)
     if not text or not text.strip():
         raise PreparedError(f"its {what} is empty, so it names no file")
     if is_absolute(text) or PureWindowsPath(text).drive or text.startswith(("/", "\\")):
         raise PreparedError(
             f"its {what} {text} is not a path relative to its provenance file. {OUTSIDE_LIBRARY}"
         )
+    for part in _SEPARATORS.split(text):
+        if part in ("", ".", ".."):
+            continue
+        if part.endswith((".", " ")) or ":" in part:
+            raise PreparedError(
+                f"its {what} {text} has a part, {part!r}, that ends in a dot or a space or "
+                "holds a colon, so it can name another file than it says"
+            )
     walked = os.path.join(str(provenance.parent), text)
     on_disk = os.path.normpath(walked)
     if not (inside(on_disk, root) and real_within(walked, root)):
-        raise PreparedError(
-            f"its {what} {on_disk} is outside the Library folder {root}. {OUTSIDE_LIBRARY}"
-        )
+        raise PreparedError(outside_message(what, on_disk, root))
     if os.path.isdir(on_disk):
         raise PreparedError(f"its {what} {text} names the folder {on_disk}, not a file")
     return on_disk
@@ -166,14 +201,17 @@ def model_from(path: Path, root: Path) -> LibraryModel:
     except (OSError, PreparedError) as exc:
         return unreadable(path, root, str(exc))
     entry = provenance.entry
+    try:
+        plain(entry, "entry file")
+    except PreparedError as exc:
+        return unreadable(path, root, str(exc), provenance=provenance, refused=True)
     if is_absolute(entry):
         resolved = entry
         if not inside(resolved, root):
             return unreadable(
                 path,
                 root,
-                f"its entry file {resolved} is outside the Library folder {root}. "
-                f"{OUTSIDE_LIBRARY}",
+                outside_message("entry file", resolved, root),
                 provenance=provenance,
                 refused=True,
             )

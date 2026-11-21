@@ -256,6 +256,10 @@ def _adopt(
     files were received into the first writable folder (`_preparing_folder`): the
     entry is that folder's, at the same place under it."""
     entry = body.provenance.entry
+    try:
+        prepared.plain(entry, "entry file")
+    except prepared.PreparedError as exc:
+        raise HTTPException(400, f"Nothing was written: {exc}") from None
     for store in stores or []:
         if prepared.is_absolute(entry) and is_within(entry, store):
             if not roots:

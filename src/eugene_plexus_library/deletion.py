@@ -44,7 +44,7 @@ from ._generated.models import (
     ModelStatus,
     PreparedDependent,
 )
-from .paths import is_within, real_within, same_path
+from .paths import has_control, is_within, link_on_the_way, real_within, same_path, shown
 
 #: Downloads still writing files.
 WRITING = {
@@ -87,7 +87,7 @@ def held_by(path: str, roots: Sequence[Path]) -> Path | None:
     that points out is outside. The file itself is removed as an entry, so
     a link there goes and its target stays; a folder is never removed by
     this call, and the Library folder least of all."""
-    if not os.path.isabs(path) or ".." in _SEPARATORS.split(path):
+    if has_control(path) or not os.path.isabs(path) or ".." in _SEPARATORS.split(path):
         return None
     if os.path.isdir(path):
         return None
@@ -103,10 +103,43 @@ def held_by(path: str, roots: Sequence[Path]) -> Path | None:
     return None
 
 
+def _below_a_link(path: str, roots: Sequence[Path]) -> tuple[str, str] | None:
+    """The link inside a Library folder that `path` is below, and its target,
+    when that is why `path` is not held (the `followSymlinks` setting lists
+    models below such links)."""
+    for root in roots:
+        found = link_on_the_way(os.path.dirname(path), root)
+        if found is not None:
+            return found
+    return None
+
+
 def _outside(path: str, roots: Sequence[Path]) -> str:
+    link = _below_a_link(path, roots)
+    if link is not None:
+        return (
+            f"{shown(path)} is below {link[0]}, a link to {link[1]}, which is not in a Library "
+            "folder. To delete it here, add that folder as a Library folder."
+        )
     named = ", ".join(str(r) for r in roots) or "none configured"
     what = "a folder" if os.path.isdir(path) else "outside the Library folders"
-    return f"{path} is {what} ({named}), and the Library deletes only a model's files there."
+    return f"{shown(path)} is {what} ({named}), and the Library deletes only a model's files there."
+
+
+def _marks(path: str) -> list[tuple[Any, ...]]:
+    """What makes two spellings one file: its text, and where it can be
+    statted, its file identity (device and file number), which another
+    spelling (case, a short name, a link, a hard link) shares."""
+    marks: list[tuple[Any, ...]] = [("path", _key(path))]
+    try:
+        # lstat: a link as the last part is removed as a link, its target
+        # untouched, so it is not the file it points to.
+        stat = os.lstat(path)
+    except (OSError, ValueError):
+        return marks
+    if stat.st_ino:
+        marks.append(("file", stat.st_dev, stat.st_ino))
+    return marks
 
 
 def own_files(model: LibraryModel) -> list[ModelFile]:
@@ -130,15 +163,30 @@ def own_files(model: LibraryModel) -> list[ModelFile]:
     return files
 
 
-def _users(listed: Sequence[LibraryModel], skip: set[str]) -> dict[str, list[LibraryModel]]:
-    """Each file another model (not in `skip`) names, and who names it."""
-    out: dict[str, list[LibraryModel]] = {}
+def _users(
+    listed: Sequence[LibraryModel], skip: set[str]
+) -> dict[tuple[Any, ...], list[LibraryModel]]:
+    """Each file another model (not in `skip`) names, by each of its
+    `_marks`, and who names it."""
+    out: dict[tuple[Any, ...], list[LibraryModel]] = {}
     for other in listed:
         if other.id in skip:
             continue
         for f in own_files(other):
-            out.setdefault(_key(f.path), []).append(other)
+            for mark in _marks(f.path):
+                named = out.setdefault(mark, [])
+                if all(m.id != other.id for m in named):
+                    named.append(other)
     return out
+
+
+def _used_by(path: str, users: dict[tuple[Any, ...], list[LibraryModel]]) -> list[LibraryModel]:
+    found: list[LibraryModel] = []
+    for mark in _marks(path):
+        for model in users.get(mark, []):
+            if all(m.id != model.id for m in found):
+                found.append(model)
+    return found
 
 
 def refusal(
@@ -234,7 +282,7 @@ def plan(
         if roots is not None and held_by(f.path, roots) is None:
             stray = stray or f.path
             continue
-        others = users.get(_key(f.path))
+        others = _used_by(f.path, users)
         if others:
             kept.append(
                 KeptModelFile(
@@ -252,10 +300,18 @@ def plan(
     ]
     why = refusal(model, files, downloads=downloads, operations=operations)
     if why is None and stray is not None and roots is not None:
-        why = (
-            f"It lists a file outside the Library folders ({stray}), so the Library deletes "
-            "none of its files. Scan the Library again, then delete it."
-        )
+        link = _below_a_link(stray, roots)
+        if link is not None:
+            why = (
+                f"It has a file below {link[0]}, a link to {link[1]}, which is not in a "
+                "Library folder, so the Library deletes none of its files. To delete it "
+                "here, add that folder as a Library folder."
+            )
+        else:
+            why = (
+                f"It lists a file outside the Library folders ({shown(stray)}), so the Library "
+                "deletes none of its files. Scan the Library again, then delete it."
+            )
     if why is None and model.status is not ModelStatus.present:
         why = "Its files are not there: Forget removes it from the Library."
     return Plan(
@@ -313,32 +369,44 @@ def remove(
             )
     moved: list[tuple[str, str]] = []
     tag = secrets.token_hex(4)
+
+    def put_back() -> None:
+        for original, hidden in reversed(moved):
+            with contextlib.suppress(OSError):
+                os.replace(hidden, original)
+
+    # A folder on a share can become a link after the first check. Each file
+    # is checked again just before it moves and where it lies just after,
+    # and every moved file once more before any is removed. That narrows the
+    # window between a check and the move; it does not close it.
     for path in paths:
         if not os.path.exists(path):
             continue
         aside = os.path.join(os.path.dirname(path), f"{MOVED_ASIDE}{tag}-{os.path.basename(path)}")
         try:
-            # Again just before it moves: a folder on a share can become a link
-            # after the first check.
             if held_by(path, roots) is None:
                 raise _Escaped(path)
             os.replace(path, aside)
+            moved.append((path, aside))
+            if held_by(aside, roots) is None:
+                raise _Escaped(path)
         except _Escaped:
-            for original, hidden in reversed(moved):
-                with contextlib.suppress(OSError):
-                    os.replace(hidden, original)
+            put_back()
             raise DeleteRefused(
                 f"{_outside(path, roots)} Nothing was deleted.", title="Outside the Library"
             ) from None
         except OSError as exc:
-            for original, hidden in reversed(moved):
-                with contextlib.suppress(OSError):
-                    os.replace(hidden, original)
+            put_back()
             raise DeleteRefused(
                 f"{path} is in use ({exc.strerror or exc}): stop the model on every machine "
                 "running it, then delete it again. Nothing was deleted."
             ) from exc
-        moved.append((path, aside))
+    for original, hidden in moved:
+        if held_by(hidden, roots) is None:
+            put_back()
+            raise DeleteRefused(
+                f"{_outside(original, roots)} Nothing was deleted.", title="Outside the Library"
+            )
     deleted = []
     for original, hidden in moved:
         try:

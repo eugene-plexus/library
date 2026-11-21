@@ -187,6 +187,12 @@ def _write_provenance(
     `roots` are the folders that may be written; `stores` the Ollama stores,
     which never are (CX9)."""
     entry = body.provenance.entry
+    try:
+        prepared.plain(entry, "entry file")
+    except prepared.PreparedError as exc:
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST, "Not a file name", f"Nothing was written: {exc}"
+        ) from None
     if body.root is not None and (refused := _read_only_folder(body.root, stores)):
         raise refused
     if body.root is None and body.subdirectory is None:
@@ -210,11 +216,13 @@ def _write_provenance(
                 )
             root = match
         folder = (root / body.subdirectory).expanduser() if body.subdirectory else root
-        if not is_within(folder, root):
+        # As written and once links resolve (library#20): the folders and the
+        # file are made below it.
+        if not is_within(folder, root) or not real_within(folder, root):
             raise _problem(
                 status.HTTP_400_BAD_REQUEST,
                 "Outside the Library folder",
-                f"{body.subdirectory!r} resolves outside {root}.",
+                f"{body.subdirectory!r} resolves outside {root}. Nothing was written.",
             )
     # Where it comes to, not the folder named: a store can sit inside a writable
     # folder, and the entry's own folder is where the file goes.
