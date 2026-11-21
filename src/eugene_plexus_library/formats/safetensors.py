@@ -210,6 +210,8 @@ def parse_header(raw: bytes, *, name: str = "<stream>") -> SafetensorsHeader:
         header = json.loads(raw)
     except ValueError as exc:
         raise SafetensorsError(f"{name}: header is not valid JSON ({exc})") from exc
+    except RecursionError as exc:
+        raise SafetensorsError(f"{name}: header JSON is nested too deeply to read") from exc
     if not isinstance(header, dict):
         raise SafetensorsError(f"{name}: header is not a JSON object")
 
@@ -262,7 +264,7 @@ def has_chat_template(directory: Path, config: dict[str, Any]) -> bool:
         return True
     try:
         tokenizer = json.loads((directory / "tokenizer_config.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return False
     return isinstance(tokenizer, dict) and bool(tokenizer.get("chat_template"))
 
@@ -311,6 +313,9 @@ class ModelConfig:
 
 def read_config(path: Path) -> ModelConfig:
     """Read a `config.json`. Raises `SafetensorsError` if unparseable."""
+    size = path.stat().st_size
+    if size > _MAX_HEADER:
+        raise SafetensorsError(f"{path.name}: {size} bytes is too large for a config file")
     return parse_config(path.read_bytes(), name=path.name)
 
 
@@ -321,6 +326,8 @@ def parse_config(data: bytes, *, name: str = "config.json") -> ModelConfig:
         raw = json.loads(data.decode("utf-8"))
     except ValueError as exc:
         raise SafetensorsError(f"{name}: not valid JSON ({exc})") from exc
+    except RecursionError as exc:
+        raise SafetensorsError(f"{name}: JSON is nested too deeply to read") from exc
     if not isinstance(raw, dict):
         raise SafetensorsError(f"{name}: not a JSON object")
 

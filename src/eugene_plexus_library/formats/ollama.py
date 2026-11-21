@@ -203,6 +203,8 @@ def _load(path: Path) -> dict[str, Any]:
         raise ManifestError(f"it cannot be read ({exc.strerror or exc})") from exc
     except ValueError as exc:
         raise ManifestError("it is not JSON") from exc
+    except RecursionError as exc:
+        raise ManifestError("it is nested too deeply to read") from exc
     if not isinstance(data, dict):
         raise ManifestError("it is not a manifest")
     return data

@@ -120,6 +120,19 @@ _TARGET_ARRAYS = frozenset({"dflash.target_layers", "eagle3.target_layers"})
 _MAX_KV = 1 << 16
 _MAX_STRING = 1 << 24
 _MAX_ARRAY = 1 << 28
+#: A key is at most 65,535 bytes in the GGUF spec; real ones are under 100.
+_MAX_KEY = 1 << 16
+#: How deep arrays nest inside arrays. Real metadata is one or two deep. Each
+#: level costs 12 bytes of file, so a hostile file buys a level for almost
+#: nothing; without a limit a few thousand levels raise `RecursionError`
+#: (library#21).
+_MAX_ARRAY_DEPTH = 4
+#: Array elements one file may make this reader hold, counted over every array
+#: and every level. Each array is under `_INLINE_ARRAY_LIMIT` or a named
+#: vocabulary, but 512 arrays of 512 arrays multiply, and an empty array is 12
+#: bytes of file but ~56 bytes of memory. Real use is a few thousand; a
+#: 1M-token vocabulary read whole (`special_tokens`, two arrays) is 2M.
+_MAX_ARRAY_ELEMENTS = 1 << 23
 
 # `general.file_type`. These are llama.cpp's LLAMA_FTYPE_MOSTLY_* values.
 # 14/15/32/0 are verified against real files whose names agree; the rest
@@ -516,11 +529,22 @@ class _Reader:
         #: Arrays read whole whatever their size: only what a caller asks
         #: for by key (the vocabulary, for `special_tokens`).
         self.keep: frozenset[str] = frozenset()
+        self._elements_left = _MAX_ARRAY_ELEMENTS
 
     def _fail(self, message: str) -> GgufError:
         return GgufError(f"{self._path.name}: {message}")
 
     def raw(self, count: int) -> bytes:
+        if self._pos + count > self._end:
+            # Before the read: `read(n)` allocates n bytes first, so a length
+            # field that claims 16 MiB in a 40-byte file would cost 16 MiB
+            # for nothing, once per claim.
+            got = max(0, self._end - self._pos)
+            raise GgufTruncated(
+                f"{self._path.name}: truncated: wanted {count} bytes at offset "
+                f"{self._pos}, got {got}",
+                needed=self._pos + count,
+            )
         data = self._fh.read(count)
         if len(data) != count:
             raise GgufTruncated(
@@ -545,6 +569,10 @@ class _Reader:
         size = self.length(limit=_MAX_STRING, what="string")
         return self.raw(size).decode("utf-8", errors="replace")
 
+    def key(self) -> str:
+        size = self.length(limit=_MAX_KEY, what="key")
+        return self.raw(size).decode("utf-8", errors="replace")
+
     def skip(self, count: int) -> None:
         """Step over a value without reading it.
 
@@ -563,16 +591,21 @@ class _Reader:
         self._fh.seek(target)
         self._pos = target
 
-    def value(self, tag: int, *, key: str, lengths: dict[str, int]) -> Any:
+    def value(self, tag: int, *, key: str, lengths: dict[str, int], depth: int = 0) -> Any:
         if tag == T_STRING:
             return self.string()
         if tag == T_ARRAY:
-            return self._array(key=key, lengths=lengths)
+            return self._array(key=key, lengths=lengths, depth=depth + 1)
         if tag not in _SCALAR:
             raise self._fail(f"unknown value type {tag} for key {key!r}")
         return self.scalar(tag)
 
-    def _array(self, *, key: str, lengths: dict[str, int]) -> Any:
+    def _array(self, *, key: str, lengths: dict[str, int], depth: int) -> Any:
+        if depth > _MAX_ARRAY_DEPTH:
+            raise self._fail(
+                f"key {key!r} has arrays nested more than {_MAX_ARRAY_DEPTH} deep "
+                f"(at offset {self._pos})"
+            )
         element_tag = int(self.scalar(T_UINT32))
         count = self.length(limit=_MAX_ARRAY, what="array")
         lengths[key] = count
@@ -580,7 +613,15 @@ class _Reader:
         if (count <= _INLINE_ARRAY_LIMIT or key in self.keep) and (
             key not in _TARGET_ARRAYS or count <= _INLINE_ARRAY_LIMIT
         ):
-            return [self.value(element_tag, key=key, lengths={}) for _ in range(count)]
+            # Spent on the count, before any element is read, so a claim of
+            # millions in a short file is refused on its face.
+            self._elements_left -= count
+            if self._elements_left < 0:
+                raise self._fail(
+                    f"key {key!r} makes too many array elements for one file "
+                    f"(more than {_MAX_ARRAY_ELEMENTS}, at offset {self._pos})"
+                )
+            return [self.value(element_tag, key=key, lengths={}, depth=depth) for _ in range(count)]
 
         # Too big to keep. Step over it — see the module docstring for
         # why a string array costs one read per element.
@@ -698,7 +739,7 @@ def _read_tensor_table(reader: _Reader, count: int) -> _TensorTable:
     data_end = 0
     last_tensor = ""
     for _ in range(min(count, _MAX_TENSORS)):
-        name = reader.string()
+        name = reader.key()
         classifier |= name.startswith("cls.")
         first_block |= name.startswith("blk.0.")
         markov_head |= name == "markov_w1.weight"
@@ -773,7 +814,7 @@ def read_metadata_stream(
     kv: dict[str, Any] = {}
     lengths: dict[str, int] = {}
     for _ in range(kv_count):
-        key = reader.string()
+        key = reader.key()
         tag = int(reader.scalar(T_UINT32))
         kv[key] = reader.value(tag, key=key, lengths=lengths)
     header_bytes = reader.tell()

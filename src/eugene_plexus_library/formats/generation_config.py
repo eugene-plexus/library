@@ -56,7 +56,7 @@ def read(directory: Path) -> RecommendedSampling | None:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         log.warning("Cannot read author sampling from %s: %s", path, exc)
         return None
     if not isinstance(raw, dict):

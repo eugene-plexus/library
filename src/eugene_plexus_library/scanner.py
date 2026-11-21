@@ -143,6 +143,12 @@ def cache_key(path: Path, stat: os.stat_result) -> CacheKey:
     return (normalize(path), stat.st_size, stat.st_mtime_ns)
 
 
+def _cause(exc: BaseException) -> str:
+    """What went wrong, named by type: some of these have an empty message."""
+    text = str(exc)
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 def _mlx_quantization(config: safetensors.ModelConfig) -> MlxQuantization | None:
     """The MLX conversion marker, when `config.json` carries one.
 
@@ -383,12 +389,35 @@ class Scanner:
         files_before = result.files_scanned
 
         if store:
-            self._scan_ollama_store(root, result, seen)
+            try:
+                self._scan_ollama_store(root, result, seen)
+            except Exception as exc:
+                log.exception("scanning the Ollama store %s failed", root)
+                result.skipped.append(
+                    SkippedPath(
+                        path=text,
+                        reason=SkipReason.unreadable_header,
+                        detail=f"cannot read: {_cause(exc)}",
+                    )
+                )
         else:
             for directory in self._walk(root, result):
                 if self._should_cancel():
                     break
-                self._scan_directory(directory, root, result, seen)
+                try:
+                    self._scan_directory(directory, root, result, seen)
+                except Exception as exc:
+                    # The last net. Each reader names its own failures; this
+                    # is for the one nobody foresaw, so a bad folder is listed
+                    # with its cause and the scan goes on (library#21).
+                    log.exception("scanning %s failed", directory)
+                    result.skipped.append(
+                        SkippedPath(
+                            path=str(directory),
+                            reason=SkipReason.unreadable_header,
+                            detail=f"cannot read: {_cause(exc)}",
+                        )
+                    )
 
         return RootResult(
             path=text,
@@ -835,7 +864,7 @@ class Scanner:
             raw = json.loads(
                 (directory / safetensors.ADAPTER_CONFIG_NAME).read_text(encoding="utf-8")
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             raw = {}
         base_model = raw.get("base_model_name_or_path") if isinstance(raw, dict) else None
 
@@ -1141,6 +1170,12 @@ class Scanner:
             detail = str(exc)
         except OSError as exc:
             detail = f"cannot read: {exc}"
+        except Exception as exc:
+            # The reader bounds its own work (`GgufError`); this is the net
+            # beside it for what it did not foresee, `RecursionError` and
+            # `MemoryError` included (library#21).
+            log.exception("reading the GGUF header of %s failed", path)
+            detail = f"cannot read: {_cause(exc)}"
         result.skipped.append(
             SkippedPath(path=str(path), reason=SkipReason.unreadable_header, detail=detail)
         )
