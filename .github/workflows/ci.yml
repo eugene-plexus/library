@@ -82,7 +82,7 @@ jobs:
           pytest tests/test_paths_stay_in_the_library.py tests/test_paths_stay_in_the_library_review.py
           tests/test_deletion.py
           tests/test_prepared.py tests/test_prepared_uploads.py tests/test_paths.py
-          tests/test_operations_gates.py tests/test_operations_flags.py
+          tests/test_operations_gates.py tests/test_operations_flags.py tests/test_operations_downloads.py
 
   codegen-freshness:
     name: Codegen freshness

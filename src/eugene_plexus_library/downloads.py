@@ -59,11 +59,13 @@ from pathlib import Path, PurePosixPath
 import httpx
 
 from . import paths as path_utils
+from . import prepared
 from ._generated.models import (
     Download,
     DownloadFile,
     DownloadSpec,
     DownloadState,
+    LibraryModel,
     ModelFileRole,
 )
 from .catalogue_sources import HubClients
@@ -113,6 +115,65 @@ class DownloadError(Exception):
         super().__init__(message)
         self.status = status
         self.code = code
+
+
+class OwnerOnly(DownloadError):
+    """library#25: what a download with an operations token may not write."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status=403, code="OwnerOnly")
+
+
+def _already_there(path: Path) -> OwnerOnly:
+    return OwnerOnly(
+        f"Only the owner can download over {path}: a file is already there. "
+        "Nothing was written. Choose another folder, or ask the owner."
+    )
+
+
+def refuse_for_operations(
+    entries: list[DownloadFile], models: list[LibraryModel], root: Path
+) -> None:
+    """library#25: a download started with an operations token never replaces
+    a file that is already there, never writes at or inside the folder of a
+    folder-format model the Library lists or of an engine's own prepared
+    files, and never writes a file the Library would list as a prepared
+    model (a provenance file names what the owner later runs) or the marker
+    that hides a folder's models. Raises `OwnerOnly` naming the first."""
+    folders = [
+        (Path(model.path), model.displayName or model.name)
+        for model in models
+        if model.path and os.path.isdir(model.path)
+    ]
+    for entry in entries:
+        destination = Path(entry.destinationPath)
+        name = destination.name
+        if prepared.is_provenance(name) or name.lower() == prepared.ENGINE_FILES_MARKER:
+            raise OwnerOnly(
+                f"Only the owner can download {name}: the Library lists such a file as a "
+                "prepared model, or as a folder of an engine's own files. Nothing was "
+                "written. Ask the owner."
+            )
+        if os.path.lexists(destination):
+            raise _already_there(destination)
+        for folder, model_name in folders:
+            if path_utils.is_within(destination, folder) or path_utils.real_within(
+                destination, folder
+            ):
+                raise OwnerOnly(
+                    f"Only the owner can download into {folder}: it is the folder of the "
+                    f"model {model_name}. Nothing was written. Choose another folder, or "
+                    "ask the owner."
+                )
+        for parent in destination.parents:
+            if not path_utils.is_within(parent, root):
+                break
+            if (parent / prepared.ENGINE_FILES_MARKER).is_file():
+                raise OwnerOnly(
+                    f"Only the owner can download into {parent}: it holds an engine's own "
+                    "prepared files. Nothing was written. Choose another folder, or ask "
+                    "the owner."
+                )
 
 
 def _now() -> datetime:
@@ -371,6 +432,11 @@ class DownloadJob:
         self._store = store
         self._scan_manager = scan_manager
         self._guard = guard or (lambda path: None)
+        #: library#25: started or resumed with an operations token, so a file
+        #: that is already at a destination is never replaced. In memory: a
+        #: record that comes back after a restart is resumed by a route,
+        #: which sets it again for an operations token.
+        self.restricted = False
         self.task: asyncio.Task[None] | None = None
         self._samples: list[tuple[float, int]] = []
 
@@ -702,6 +768,9 @@ class DownloadJob:
         if part is not None:
             self._guard(part)
             self._guard(destination)
+            if self.restricted and os.path.lexists(destination):
+                # Appeared since the download started (library#25).
+                raise _already_there(destination)
             os.replace(part, destination)
         entry.state = DownloadState.done
 
@@ -864,12 +933,17 @@ class DownloadManager:
 
     # -- starting -----------------------------------------------------------
 
-    async def start(self, spec: DownloadSpec, *, download_id: str | None = None) -> Download:
+    async def start(
+        self, spec: DownloadSpec, *, download_id: str | None = None, restricted: bool = False
+    ) -> Download:
         """Create a record, resolve its destination, and queue it.
 
         The destination is resolved and reported **before a byte
         moves** — the operator can see where their model is going while
         there is still time to change it.
+
+        `restricted`: started with an operations token (library#25,
+        `refuse_for_operations`).
         """
         if download_id is not None and (existing := self.get(download_id)) is not None:
             return existing
@@ -934,6 +1008,8 @@ class DownloadManager:
                 )
             )
 
+        if restricted:
+            refuse_for_operations(entries, self._store.list_models(), root)
         total = sum(e.sizeBytes or 0 for e in entries)
         self._check_disk(directory, total)
 
@@ -962,6 +1038,7 @@ class DownloadManager:
             scan_manager=self._scan_manager,
             guard=self._guard_path,
         )
+        job.restricted = restricted
         async with self._lock:
             if download_id is not None and (existing := self.get(download_id)) is not None:
                 return existing
@@ -1102,8 +1179,13 @@ class DownloadManager:
         self._persist(job.record)
         return job.record
 
-    async def resume(self, download_id: str) -> Download:
+    async def resume(self, download_id: str, *, restricted: bool = False) -> Download:
+        """`restricted`: resumed with an operations token. The download may
+        finish its own files, even in a folder the Library has listed as a
+        model since; it still never replaces a file (library#25)."""
         job = self._require(download_id)
+        if restricted:
+            job.restricted = True
         if job.record.state not in (
             DownloadState.paused,
             DownloadState.failed,

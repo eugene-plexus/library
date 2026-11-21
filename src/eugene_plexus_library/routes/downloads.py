@@ -10,9 +10,9 @@ from .._generated.models import (
     DownloadSpec,
     Problem,
 )
-from ..downloads import DownloadError, DownloadManager
+from ..downloads import DownloadError, DownloadManager, OwnerOnly
 from ..hub import HubError
-from ..operations import MODELS, note_target, operation
+from ..operations import MODELS, note_target, operation, operations_claims
 from .run_operations import set_download_pause
 
 router = APIRouter(tags=["downloads"])
@@ -35,6 +35,8 @@ def _problem(
 
 
 def _translate(exc: DownloadError | HubError) -> HTTPException:
+    if isinstance(exc, OwnerOnly):
+        return _problem(exc.status, "Owner only", str(exc))
     titles = {
         400: "Bad download request",
         403: "Access restricted upstream",
@@ -87,11 +89,14 @@ async def start_download(request: Request, spec: DownloadSpec) -> Download:
 
     Returns 202 with the record in `queued`; poll
     `GET /v1/downloads/{id}`.
+
+    With an operations token a download never replaces a file and never
+    writes into a listed model's folder (library#25).
     """
     manager = _manager(request)
     note_target(request, spec.repo)
     try:
-        return await manager.start(spec)
+        return await manager.start(spec, restricted=operations_claims(request) is not None)
     except (DownloadError, HubError) as exc:
         raise _translate(exc) from exc
 
@@ -169,7 +174,9 @@ async def resume_download(request: Request, download_id: str) -> Download:
     """
     try:
         async with request.app.state.run_download_lock:
-            result = await _manager(request).resume(download_id)
+            result = await _manager(request).resume(
+                download_id, restricted=operations_claims(request) is not None
+            )
             await set_download_pause(request, download_id, paused=False)
             return result
     except DownloadError as exc:
