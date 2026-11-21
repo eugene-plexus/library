@@ -360,3 +360,162 @@ def test_a_profile_path_through_a_link_that_points_out_is_refused(
     refused = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
     assert refused.status_code == 403, refused.text
     assert "(flags.chatTemplateFile)" in refused.json()["detail"]["detail"]
+
+
+# ------------------------------------------- library#22: engine flags by list
+
+
+def _owner_profile(client: TestClient, install: FakeInstall, model_id: str, **body: Any) -> str:
+    owner = _bearer(install.session())
+    made = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=owner)
+    assert made.status_code == 201, made.text
+    return f"/v1/models/{model_id}/profiles/{made.json()['id']}"
+
+
+#: The reviewer's probe on agent#53: settings that ran when the owner next
+#: ran the profile.
+PROBE = [
+    ("vllm", {"trustRemoteCode": True}, "flags.trustRemoteCode", "code that comes with a model"),
+    ("mlx", {"trustRemoteCode": True}, "flags.trustRemoteCode", "code that comes with a model"),
+    ("mlx", {"draftModel": "Qwen/Qwen3-0.6B"}, "flags.draftModel", "Hugging Face"),
+    ("vllm", {"tokenizer": "Qwen/Qwen3-0.6B"}, "flags.tokenizer", "Hugging Face"),
+    ("kev", {"fallback": "/elsewhere/checkpoint"}, "flags.fallback", "Library"),
+]
+
+
+@pytest.mark.parametrize(("engine", "flags", "field", "said"), PROBE)
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+def test_models_cannot_write_an_owner_setting_into_a_profile(
+    stocked: tuple[TestClient, str, Path],
+    install: FakeInstall,
+    method: str,
+    engine: str,
+    flags: dict[str, Any],
+    field: str,
+    said: str,
+) -> None:
+    client, model_id, _ = stocked
+    dana = _bearer(_operations(install, MODELS))
+    body = {"name": "dana", "engine": engine, "flags": flags}
+    if method == "PUT":
+        path = _owner_profile(client, install, model_id, name="dana", engine=engine)
+        refused = client.put(path, json=body, headers=dana)
+    else:
+        refused = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
+    assert refused.status_code == 403, refused.text
+    detail = refused.json()["detail"]["detail"]
+    assert f"({field})" in detail and said in detail, detail
+
+
+@pytest.mark.parametrize(
+    ("engine", "key"),
+    [("llama_cpp", "notAFlag"), ("vllm", "chatTemplate"), ("llama_cpp", "trustRemoteCode")],
+)
+def test_models_cannot_write_a_flag_on_no_list(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall, engine: str, key: str
+) -> None:
+    """A flag nobody classified for this engine is the owner's, even when
+    another engine has a flag of that name."""
+    client, model_id, _ = stocked
+    dana = _bearer(_operations(install, MODELS))
+    body = {"name": "dana", "engine": engine, "flags": {key: "x"}}
+    refused = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
+    assert refused.status_code == 403, refused.text
+    detail = refused.json()["detail"]["detail"]
+    assert f"(flags.{key})" in detail and "not a setting" in detail, detail
+
+
+def test_models_keeps_the_owners_settings_as_they_are(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall
+) -> None:
+    client, model_id, _ = stocked
+    owners = {
+        "trustRemoteCode": True,
+        "tokenizer": "Qwen/Qwen3-0.6B",
+        "kvCacheOffload": "x",  # on no list: the owner's to set
+        "maxModelLen": 8192,
+    }
+    path = _owner_profile(client, install, model_id, name="o", engine="vllm", flags=owners)
+    dana = _bearer(_operations(install, MODELS))
+    changed = {**owners, "maxModelLen": 16384, "enforceEager": True}
+    answer = client.put(path, json={"name": "o", "engine": "vllm", "flags": changed}, headers=dana)
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["flags"] == changed
+    # Removing an owner's setting is no risk.
+    fewer = {"maxModelLen": 16384}
+    answer = client.put(path, json={"name": "o", "engine": "vllm", "flags": fewer}, headers=dana)
+    assert answer.status_code == 200, answer.text
+
+
+def test_the_owner_is_not_restricted(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall
+) -> None:
+    client, model_id, _ = stocked
+    for engine, flags, _, _ in PROBE:
+        name = f"o-{engine}-{next(iter(flags))}"
+        _owner_profile(
+            client, install, model_id, name=name, engine=engine, flags={**flags, "notAFlag": "-x"}
+        )
+
+
+def test_a_kept_trust_does_not_follow_another_engine_or_file(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall
+) -> None:
+    client, model_id, models = stocked
+    dana = _bearer(_operations(install, MODELS))
+    trusted = {"trustRemoteCode": True}
+    path = _owner_profile(client, install, model_id, name="o", engine="vllm", flags=trusted)
+    moved = client.put(path, json={"name": "o", "engine": "mlx", "flags": trusted}, headers=dana)
+    assert moved.status_code == 403, moved.text
+    detail = moved.json()["detail"]["detail"]
+    assert "(flags.trustRemoteCode)" in detail and "another engine" in detail, detail
+    other = {**trusted, "tokenizer": str(models / "tokenizer")}
+    swapped = client.put(path, json={"name": "o", "engine": "vllm", "flags": other}, headers=dana)
+    assert swapped.status_code == 403, swapped.text
+    detail = swapped.json()["detail"]["detail"]
+    assert "(flags.trustRemoteCode)" in detail and "flags.tokenizer" in detail, detail
+    # Without the trust, a tokenizer inside a Library folder is Dana's to set.
+    inside = {"tokenizer": str(models / "tokenizer")}
+    answer = client.put(path, json={"name": "o", "engine": "vllm", "flags": inside}, headers=dana)
+    assert answer.status_code == 200, answer.text
+
+
+@pytest.mark.parametrize(
+    ("engine", "flags", "field"),
+    [
+        ("vllm", {"quantization": "--trust-remote-code"}, "flags.quantization"),
+        ("mlx", {"chatTemplate": " -x"}, "flags.chatTemplate"),
+        ("strata", {"gpus": ["0", "--x"]}, "flags.gpus"),
+    ],
+)
+def test_a_value_that_starts_with_a_dash_is_the_owners(
+    stocked: tuple[TestClient, str, Path],
+    install: FakeInstall,
+    engine: str,
+    flags: dict[str, Any],
+    field: str,
+) -> None:
+    client, model_id, _ = stocked
+    dana = _bearer(_operations(install, MODELS))
+    body = {"name": "dana", "engine": engine, "flags": flags}
+    refused = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
+    assert refused.status_code == 403, refused.text
+    detail = refused.json()["detail"]["detail"]
+    assert f"({field})" in detail and 'starts with "-"' in detail, detail
+
+
+def test_models_sets_reviewed_flags_and_paths_inside_the_library(
+    stocked: tuple[TestClient, str, Path], install: FakeInstall
+) -> None:
+    client, model_id, models = stocked
+    dana = _bearer(_operations(install, MODELS))
+    for engine, flags in [
+        ("llama_cpp", {"tensorSplit": "-1", "mainGpu": -1, "contextSize": 4096}),
+        ("mlx", {"draftModel": str(models / "draft"), "chatTemplate": "{{ messages }}"}),
+        ("kev", {"fallback": str(models / "ckpt")}),
+        ("strata", {"gpus": ["0", "1"]}),
+        ("vllm", {"trustRemoteCode": False, "quantization": "awq"}),
+    ]:
+        body = {"name": f"dana-{engine}", "engine": engine, "flags": flags}
+        made = client.post(f"/v1/models/{model_id}/profiles", json=body, headers=dana)
+        assert made.status_code == 201, (engine, made.text)

@@ -192,32 +192,241 @@ def operations_claims(request: Any) -> tokens.Claims | None:
     return found if isinstance(found, tokens.Claims) else None
 
 
-PATH_FLAG = re.compile(r"(Path|File|Dir|Directory)$")
 OWNER_PROFILE_FIELDS = {"env": "environment variables", "extraArgs": "extra command-line arguments"}
+
+# library#22: a profile's engine flags become a runtime's arguments when the
+# owner next runs it, so with an operations token each flag is judged by three
+# explicit lists, keyed by (engine, flag), never by the key's spelling. They
+# are the agent's lists (agent#53), duplicated: components share schemas,
+# never code. The Library holds no engine adapters; `tests/fixtures/
+# engine_flags.json` records every flag the agent's adapters declare, and
+# `tests/test_operations_flags.py` fails on a flag on no list, so a new flag
+# is classified here before an operations token can write it.
+
+#: Flags only the owner turns on, with what each is, for the refusal.
+OWNER_FLAGS: dict[tuple[str, str], str] = {
+    # MLX and vLLM `--trust-remote-code`: a model folder's own Python runs in
+    # the agent's account.
+    ("mlx", "trustRemoteCode"): "running code that comes with a model",
+    ("vllm", "trustRemoteCode"): "running code that comes with a model",
+}
+#: Flags that name a file, a folder or a model: for an operations token each
+#: must lie inside a Library folder, so a Hugging Face Hub id is refused too.
+PATH_FLAGS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("llama_cpp", "chatTemplateFile"),  # --chat-template-file
+        ("llama_cpp", "draftModelPath"),  # --model-draft
+        ("llama_cpp", "projectorPath"),  # --mmproj
+        ("vllm", "draftModelPath"),  # the speculative model
+        ("vllm", "tokenizer"),  # --tokenizer: a folder or a Hub id
+        ("mlx", "draftModel"),  # --draft-model: a folder or a Hub id
+        ("mlx", "adapterPath"),  # --adapter-path: LoRA weights
+        ("kev", "fallback"),  # --fallback: a checkpoint folder
+    }
+)
+_RUN = (
+    "sameAnswerEveryTime",
+    "reuseRepeatedText",
+    "draftWith",
+    "draftTokens",
+    "missingCard",
+)
+#: The reviewed flags an operations token may set: sizes, counts, choices and
+#: switches that change how a model runs on this machine, and nothing that
+#: names a file, a program, an address or a secret.
+OPERATIONS_FLAGS: frozenset[tuple[str, str]] = frozenset(
+    [("llama_cpp", key) for key in _RUN]
+    + [("vllm", key) for key in _RUN]
+    + [
+        ("llama_cpp", key)
+        for key in (
+            "projectorOnCpu",
+            "contextSize",
+            "gpuLayers",
+            "parallelSlots",
+            "batchSize",
+            "ubatchSize",
+            "threads",
+            "flashAttention",
+            "cacheType",
+            "memoryMargin",
+            "cacheRam",
+            "cacheReuse",
+            "ctxCheckpoints",
+            "continuousBatching",
+            "slotPinning",
+            "mainGpu",
+            "devices",  # GPU names, checked against this machine's cards
+            "splitMode",
+            "tensorSplit",
+            "mlock",
+            "noMmap",
+        )
+    ]
+    + [
+        ("vllm", key)
+        for key in (
+            "source",  # this release's pinned image or the owner's own vLLM
+            "shmSizeGiB",
+            "maxModelLen",
+            "gpuMemoryUtilization",
+            "kvCacheDtype",
+            "tensorParallelSize",
+            "pipelineParallelSize",
+            "maxNumSeqs",
+            "maxNumBatchedTokens",
+            "dtype",
+            "enforceEager",
+            "quantization",  # a method name from vLLM's own closed list
+            "kvOffloadGb",
+        )
+    ]
+    + [
+        ("mlx", key)
+        for key in (
+            "maxTokens",
+            "promptCacheSize",
+            "promptCacheBytes",
+            "decodeConcurrency",
+            "promptConcurrency",
+            "prefillStepSize",
+            "numDraftTokens",
+            # mlx-lm passes --chat-template to the tokenizer as the
+            # template's own text, never as a file name.
+            "chatTemplate",
+        )
+    ]
+    + [("strata", key) for key in ("speedProjection", "gpus", "layerSplit")]
+)
+ENGINE_NAMES = {
+    "llama_cpp": "llama.cpp",
+    "vllm": "vLLM",
+    "mlx": "MLX",
+    "kev": "Kev",
+    "strata": "Strata",
+}
+_NUMBER = re.compile(r"-\d")
+
+
+def _engine(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
+
+
+def flag_class(engine: Any, key: str) -> str | None:
+    """What `engine`'s flag `key` is for an operations token: `owner`,
+    `path`, `operations` (reviewed as safe), or None when nobody has
+    classified it for that engine."""
+    pair = (_engine(engine), key)
+    if pair in OWNER_FLAGS:
+        return "owner"
+    if pair in PATH_FLAGS:
+        return "path"
+    if pair in OPERATIONS_FLAGS:
+        return "operations"
+    return None
+
+
+def _is_on(value: Any) -> bool:
+    return value not in (None, False, "")
+
+
+def _dash_value(value: Any) -> str | None:
+    """A text value an engine could read as another option: one that starts
+    with "-" (after spaces) and is not a negative number."""
+    for item in value if isinstance(value, list) else [value]:
+        if isinstance(item, str):
+            text = item.lstrip()
+            if text.startswith("-") and not _NUMBER.match(text):
+                return item
+    return None
 
 
 def refuse_owner_fields(request: Request, spec: Any, previous: Any = None) -> None:
-    """Review B1: a profile is what a runtime is later declared from, so with
-    an operations token its environment, extra arguments and any file
-    outside the Library's folders stay the owner's. A value the profile
-    already had is left alone."""
+    """Review B1 and library#22: a profile is what a runtime is later
+    declared from, under the owner's authority. With an operations token,
+    its environment, its extra arguments, an engine flag only the owner
+    sets, a file outside the Library's folders, and a flag on no list stay
+    the owner's. A value the profile already had is left alone, for the
+    same engine only; a kept owner flag does not follow a changed file. The
+    owner is never checked here."""
     if operations_claims(request) is None:
         return
+    engine = _engine(getattr(spec, "engine", None))
+    moved = previous is not None and _engine(getattr(previous, "engine", None)) != engine
+    if moved:
+        # What the owner set for one engine does not carry over to another.
+        previous = None
 
     def kept(field: str) -> bool:
         return previous is not None and getattr(previous, field, None) == getattr(spec, field)
 
     for field, what in OWNER_PROFILE_FIELDS.items():
         if getattr(spec, field, None) and not kept(field):
-            raise _owner_field(field, what)
+            raise _owner_field(field, what, moved=moved)
     roots = request.app.state.config_store.model_roots()
     flags = getattr(spec, "flags", None) or {}
     before = (getattr(previous, "flags", None) or {}) if previous is not None else {}
+    changed_path: str | None = None
     for key, value in flags.items():
-        if not PATH_FLAG.search(key) or value in (None, "") or before.get(key) == value:
+        field = f"flags.{key}"
+        kind = flag_class(engine, key)
+        if kind == "path" and value not in (None, "") and before.get(key) != value:
+            changed_path = field
+        if value in (None, "") or before.get(key) == value:
             continue
-        if not inside_a_folder(value, roots):
-            raise _owner_field(f"flags.{key}", "a file outside the Library's folders")
+        if kind == "owner":
+            if _is_on(value):
+                raise _owner_field(field, OWNER_FLAGS[(engine, key)], moved=moved)
+        elif kind == "path":
+            _refuse_outside(field, value, roots)
+        elif kind == "operations":
+            dash = _dash_value(value)
+            if dash is not None:
+                raise _problem(
+                    status.HTTP_403_FORBIDDEN,
+                    "Owner only",
+                    f'Only the owner can set a value that starts with "-" ({field}): '
+                    f"{dash!r} could reach the engine as another setting. Leave it as it "
+                    "was, or ask the owner.",
+                )
+        else:
+            name = ENGINE_NAMES.get(engine, engine)
+            raise _problem(
+                status.HTTP_403_FORBIDDEN,
+                "Owner only",
+                f"Only the owner can set {key} ({field}): it is not a setting the Models "
+                f"power may change for {name}. Leave it out, or ask the owner.",
+            )
+    if changed_path is not None:
+        # A kept owner flag was the owner's choice for these files.
+        for key, value in flags.items():
+            owned = OWNER_FLAGS.get((engine, key))
+            if owned is not None and _is_on(value):
+                raise _problem(
+                    status.HTTP_403_FORBIDDEN,
+                    "Owner only",
+                    f"Only the owner can keep {owned} (flags.{key}) with another file "
+                    f"({changed_path}). Turn it off, leave the file as it was, or ask "
+                    "the owner.",
+                )
+
+
+def _refuse_outside(field: str, value: Any, roots: list[Any]) -> None:
+    """A path flag's value, refused unless every path in it lies inside a
+    Library folder; the refusal says what was observed."""
+    values = value if isinstance(value, list) else [value]
+    for item in values or [value]:
+        if inside_a_folder(item, roots):
+            continue
+        if not isinstance(item, str) or not os.path.isabs(item):
+            raise _problem(
+                status.HTTP_403_FORBIDDEN,
+                "Owner only",
+                f"Only the owner can set {item!r} ({field}): it is not a full path to a "
+                "file or folder on this machine, and a Hugging Face model id is not one. "
+                "Use a file inside a Library folder, or ask the owner.",
+            )
+        raise _owner_field(field, f"a file outside the Library's folders ({item})")
 
 
 _SEPARATORS = re.compile(r"[\\/]")
@@ -237,7 +446,14 @@ def inside_a_folder(value: Any, roots: list[Any]) -> bool:
     return any(is_within(value, root) and real_within(value, root) for root in roots)
 
 
-def _owner_field(field: str, what: str) -> HTTPException:
+def _owner_field(field: str, what: str, *, moved: bool = False) -> HTTPException:
+    if moved:
+        return _problem(
+            status.HTTP_403_FORBIDDEN,
+            "Owner only",
+            f"Only the owner can set {what} ({field}) for another engine. "
+            "Remove it, or ask the owner.",
+        )
     return _problem(
         status.HTTP_403_FORBIDDEN,
         "Owner only",
